@@ -97,6 +97,8 @@ MCP 是"agent 主动来查"的通道，Hermes 需要的是"每轮自动送过去
 
 装法、token 来源、排查看该目录的 README。
 
+另外还有一个纯 UI 的桌面插件 [`integrations/hermes/diary-note/`](integrations/hermes/diary-note/)：日记写完后在会话里渲染一行 `📔 公账已记 16:11 · …`，用的是桌面端的 `transcript.directives` 贡献区（和核心 `::preview` 同一套机制），所以没有后端、不发请求、不轮询——一个单文件、100 行。内置那条金色「自我改进回顾」行属于核心的 `review.summary` 事件，插件无法写入，这里用 directive 在消息内复刻同样的观感。
+
 ## 检索是怎么排序的
 
 召回分三段，按价从高到低：
@@ -136,7 +138,7 @@ agentbrain/            内核与服务
 tests/                 单元与隔离性回归测试
 docs/                  架构图规格（architecture.json）与渲染产物
 examples/              配置样例
-integrations/          宿主侧接入（hermes/obsidian-broker：MemoryProvider 插件）
+integrations/          宿主侧接入（hermes/obsidian-broker 记忆 provider；hermes/diary-note 桌面插件）
 scripts/               Windows 计划任务自愈脚本
 ```
 
