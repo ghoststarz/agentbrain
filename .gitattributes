@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.html linguist-generated=true
+docs/architecture.json linguist-documentation=true

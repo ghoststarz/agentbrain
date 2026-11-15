@@ -1,0 +1,162 @@
+# AgentBrain · mem-broker
+
+跨端共享的本地记忆中枢：**Markdown 是唯一真源，SQLite FTS5 是可随时重建的索引，人格与热记忆按端预算注入。**
+
+Hermes、Codex、Antigravity 这类 CLI/agent 各自只有自己那份会话记忆——换个端就断片，同一件事还可能留下两份互相矛盾的结论。mem-broker 把长期记忆放进一个 Obsidian vault（人可读、可手改、能用 git 版本化），由一个本机 broker 统一负责解析、增量索引、检索与原子写入。客户端只问一句"这次对话相关的是哪几条"，拿到的是按预算裁剪过的片段，而不是整个知识库。
+
+![AgentBrain 架构图](docs/architecture.png)
+
+> 交互版（可搜索、聚焦节点、导出）：[`docs/architecture.html`](docs/architecture.html)。图由 [`docs/architecture.json`](docs/architecture.json) 生成。
+
+## 核心设计
+
+| 决定 | 理由 |
+|---|---|
+| 真源与索引分离 | Vault 里只有 Markdown。索引库、版本戳、审计、锁、日志全在 `%LOCALAPPDATA%/agentbrain/`，随时可删可重建，不进 vault、不进 git。 |
+| broker 是唯一中枢 | 各端不直接读写 vault 的索引结构，只走 HTTP / MCP。谁能读什么、注入多少预算，只在 broker 一处定义。 |
+| 中文用重叠二元组 | 不依赖 jieba 和外部词典：任意连续二字词（"幂等""幂等设计"）都确定性成词，没有版本漂移与冷加载开销。 |
+| 索引层排除，而不是接口层门控 | "能进检索"就等于"能进上下文"。日记与未审外来卡片在扫描阶段就被排除，不靠下游接口自觉。 |
+| 按端预算渲染 | 同一份记忆渲成 `boot` / `delta` / `prefetch` 三种块，每段有硬顶字数，超了先裁剪再注入。 |
+
+## 架构走一遍
+
+1. **接入层**：`server.py` 起标准库 HTTP 服务（默认 `127.0.0.1:18765`，只绑本地），`mcp_server.py` 起 MCP stdio 服务给 Codex / Antigravity 用；`agy_rules.py` 是第三条通道——把身份与热记忆渲染进 `~/.gemini/GEMINI.md`，因为 agy 每次会话都会读这个文件。
+2. **鉴权**：`tokens.json` 只存 token 的 sha256，`Bearer` → `client_id` → `memory.yaml` 里的 `domain` 与 `can_casual`。私账读取额外受 `diary.gate` 约束。
+3. **服务层** `BrokerService`：`boot` / `delta` / `search` / `read` / `write` / `handoff` / `diary` 七个动作，写入走"原子替换 + 重新索引"。
+4. **内核**：`parse.py` 解析 frontmatter 与 `[[wikilink]]`（含类型化关系），`segment.py` 做 CJK 重叠二元组，`index.py` 维护 FTS5 增量索引与事实键收敛，`retrieve.py` 做证据打分 + 1 跳图谱扩散 + 预算裁剪，`render.py` 负责三段渲染。
+
+## 快速开始
+
+前提：Python ≥ 3.11，一份 Markdown 目录（Obsidian vault 最佳）。
+
+```bash
+git clone https://github.com/ghoststarz/agentbrain.git
+cd agentbrain
+python -m venv .venv
+.venv/Scripts/activate          # POSIX: source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+两份配置，都在 vault 之外：
+
+```bash
+# 1) 机器配置：vault 根、SOUL 指针、运行时目录
+cp examples/broker.yaml.example "$LOCALAPPDATA/agentbrain/broker.yaml"
+# 2) 记忆域策略：ACL、注入预算、检索参数
+cp examples/memory.yaml.example "<vault_root>/profiles/<profile>/memory.yaml"
+```
+
+然后：
+
+```bash
+python -m agentbrain init       # 建运行时目录 + 索引库
+python -m agentbrain reindex    # 扫描 vault，增量建索引
+python -m agentbrain search "中文检索 二元组"
+python -m agentbrain status     # 笔记数、revision、索引年龄
+python -m agentbrain doctor     # 环境检查 + SOUL 漂移诊断
+```
+
+起服务：
+
+```bash
+python -m agentbrain serve --host 127.0.0.1 --port 18765   # HTTP
+python -m agentbrain mcp-stdio --client-id codex           # MCP over stdio
+python -m agentbrain sync-agy                              # 重渲染 ~/.gemini/GEMINI.md
+```
+
+配置路径可用环境变量覆盖：`AGENTBRAIN_BROKER_CONFIG`（broker.yaml）、`AGENTBRAIN_TOKENS_PATH`（tokens.json）、`AGENTBRAIN_CLIENT_ID` / `AGENTBRAIN_TOKEN`（stdio 进程身份）。
+
+## HTTP API
+
+除 `/healthz` 外都要求 `Authorization: Bearer <token>`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/healthz` | 存活探针，返回当前 revision（不鉴权） |
+| GET | `/v1/status` | 索引计数、revision、索引年龄 |
+| POST | `/v1/boot` | 启动块：人格摘要 + 协议 + 热记忆，按 `inject.<client>.boot_chars` 裁剪 |
+| POST | `/v1/delta` | 自某个 revision 以来的增量块 |
+| POST | `/v1/search` | FTS5 + 1 跳图谱扩散检索 |
+| POST | `/v1/read` | 读整篇笔记或指定标题块 |
+| POST | `/v1/write` | 原子写入笔记并重新索引 |
+| POST | `/v1/handoff` | 读/写结构化接力卡 |
+| POST | `/v1/diary` | 公账/私账日记追加与读取 |
+
+## MCP 工具
+
+`memory_boot`、`memory_delta`、`memory_search`、`memory_read`、`memory_write`、`memory_status`、`handoff_read`、`handoff_upsert`、`diary_append`、`diary_read`。
+
+## 检索是怎么排序的
+
+召回分三段，按价从高到低：
+
+- **第 0 段 常驻**：人格摘要 + 跨端仲裁协议 + `HOT.md` 热记忆，每轮必带，固定预算。
+- **第 1 段 触发**：笔记 frontmatter 自带的 `keys` / `keys2` 命中即注入——精确、可解释、不吃 FTS。
+- **第 2 段 检索**：FTS5 + CJK 二元组 + 标题加权兜底，命中带 `weak_evidence` 标记。
+
+打分组成：token IDF 稀有度 × 标题/键权重 × 时效衰减（半衰期默认 30 天）× 作废惩罚（`superseded_penalty`），低于 `min_evidence` 的命中不会伪装成强证据，客户端可以选择整段不注入。
+
+## 三条安全边界
+
+1. **索引层排除**：`30_Diary`（只写不读的账本，唯一读取路径是受 gate 控制的 `diary_read`）与 `50_Inbox/new`（不可信外来卡片，必须先人工处理进 `done`）在扫描阶段硬排除。
+2. **鉴权**：`tokens.json` 只存哈希，映射到 `client_id` 后按 `memory.yaml` 的 `domain` / `can_casual` 判权。
+3. **审计**：每次调用记 `client / tool / scope / allowed / digest`，落在运行时的 `audit/` 目录下。
+
+## 仓库结构
+
+```
+agentbrain/            内核与服务
+├── config.py          broker.yaml + memory.yaml 加载与路径解析
+├── parse.py           frontmatter 契约、Wikilink 与类型化关系提取
+├── segment.py         CJK 重叠二元组 / ASCII 小写分词
+├── index.py           SQLite FTS5 增量索引、事实键收敛、永不索引目录
+├── retrieve.py        证据打分、1 跳图谱扩散、预算裁剪
+├── render.py          boot / delta / prefetch 三段渲染
+├── server.py          BrokerService + 标准库 HTTP 服务
+├── mcp_server.py      MCP stdio 服务
+├── acl.py             Bearer → client_id → domain
+├── diary.py           公/私账日记（gate 门控）
+├── handoff.py         接力卡（handoff.json）读写
+├── agy_rules.py       渲染 ~/.gemini/GEMINI.md
+├── atomic.py          原子写 + 跨进程文件锁
+├── serve.py           serve / mcp-stdio 子命令
+└── cli.py             命令行入口
+
+tests/                 单元与隔离性回归测试
+docs/                  架构图规格（architecture.json）与渲染产物
+examples/              配置样例
+scripts/               Windows 计划任务自愈脚本
+```
+
+vault 侧约定（`<vault_root>/profiles/<profile>/`）：
+
+```
+memory.yaml            记忆域策略
+00_Identity/           USER.md 用户画像、RULES.md 跨端仲裁协议
+10_Working/            HOT.md 热记忆（硬顶字数）、.state/handoff.json 接力卡
+20_LongTerm/           Projects / Decisions / Facts / Entities / MOC
+30_Diary/              Public 公账、Private 私账（不进索引）
+50_Inbox/              new 待处理（不进索引）、done 已归档
+```
+
+## 测试
+
+```bash
+pip install -e ".[dev]"
+pytest -q                     # 58 passed, 4 skipped（插件测试默认跳过）
+```
+
+默认 58 项通过、4 项跳过——跳过的是 Hermes 插件侧的 prefetch 测试，插件不在本仓库。把 `AGENTBRAIN_PLUGIN_PATH` 指向插件的 `__init__.py` 后这 4 项也会跑，共 62 项。
+
+其中一组是隔离性回归：日记写入后检索 0 命中、启动块不含日记、`reindex` 后笔记数不因日记增长。
+
+## 已知边界
+
+- Windows 优先：文件锁走 `msvcrt`，脚本是计划任务；POSIX 分支有实现但未实测。
+- 单人单机单 vault：没有冲突合并协议，两个 broker 同时写同一 vault 没有保护。
+- Hermes 的每轮 prefetch provider 插件不在本仓库（它是宿主侧的适配层，走同一套 HTTP 接口）。
+- Codex 侧接线已就位，但受其自身模型配置限制。
+
+## License
+
+MIT

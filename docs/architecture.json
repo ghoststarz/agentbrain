@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "AgentBrain · mem-broker",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1140,
+      450
+    ]
+  },
+  "components": [
+    {
+      "id": "hermes",
+      "type": "external",
+      "label": "Hermes",
+      "sublabel": "desktop agent",
+      "pos": [
+        20,
+        70
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "codex",
+      "type": "external",
+      "label": "Codex CLI",
+      "pos": [
+        20,
+        190
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "agy",
+      "type": "external",
+      "label": "Antigravity agy",
+      "pos": [
+        20,
+        310
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "http",
+      "type": "backend",
+      "label": "HTTP 服务",
+      "sublabel": "127.0.0.1:18765",
+      "pos": [
+        265,
+        70
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "mcp",
+      "type": "backend",
+      "label": "MCP stdio",
+      "sublabel": "mcp_server.py",
+      "pos": [
+        265,
+        190
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "agyrules",
+      "type": "backend",
+      "label": "规则注入",
+      "sublabel": "→ GEMINI.md",
+      "pos": [
+        265,
+        310
+      ],
+      "size": [
+        160,
+        64
+      ]
+    },
+    {
+      "id": "acl",
+      "type": "security",
+      "label": "鉴权 ACL",
+      "sublabel": "token → domain",
+      "pos": [
+        510,
+        70
+      ],
+      "size": [
+        130,
+        184
+      ]
+    },
+    {
+      "id": "svc",
+      "type": "backend",
+      "label": "BrokerService",
+      "sublabel": "boot · search · write",
+      "pos": [
+        725,
+        112
+      ],
+      "size": [
+        150,
+        100
+      ]
+    },
+    {
+      "id": "kernel",
+      "type": "database",
+      "label": "记忆内核",
+      "sublabel": "parse · FTS5 · 检索",
+      "pos": [
+        960,
+        112
+      ],
+      "size": [
+        150,
+        100
+      ]
+    },
+    {
+      "id": "vault",
+      "type": "database",
+      "label": "Obsidian Vault",
+      "sublabel": "Markdown 真源",
+      "pos": [
+        725,
+        340
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "runtime",
+      "type": "database",
+      "label": "运行时目录",
+      "sublabel": "%LOCALAPPDATA%",
+      "pos": [
+        960,
+        340
+      ],
+      "size": [
+        150,
+        80
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "hermes-http",
+      "from": "hermes",
+      "to": "http",
+      "label": "HTTP /v1/*",
+      "variant": "emphasis"
+    },
+    {
+      "id": "codex-mcp",
+      "from": "codex",
+      "to": "mcp",
+      "label": "工具调用"
+    },
+    {
+      "id": "rules-agy",
+      "from": "agyrules",
+      "to": "agy",
+      "label": "启动时读取",
+      "variant": "dashed"
+    },
+    {
+      "id": "http-acl",
+      "from": "http",
+      "to": "acl",
+      "label": "Bearer token"
+    },
+    {
+      "id": "mcp-acl",
+      "from": "mcp",
+      "to": "acl",
+      "label": "本地信任"
+    },
+    {
+      "id": "acl-svc",
+      "from": "acl",
+      "to": "svc",
+      "label": "白名单 · 审计"
+    },
+    {
+      "id": "svc-kernel",
+      "from": "svc",
+      "to": "kernel",
+      "label": "读写 / 检索"
+    },
+    {
+      "id": "svc-vault",
+      "from": "svc",
+      "to": "vault",
+      "label": "原子写 Markdown",
+      "variant": "emphasis",
+      "labelDy": 52
+    },
+    {
+      "id": "kernel-runtime",
+      "from": "kernel",
+      "to": "runtime",
+      "label": "FTS5 索引",
+      "labelDy": 52
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "真源与索引分离",
+      "items": [
+        "Markdown 笔记是唯一真源",
+        "索引库可随时重建，不进 Vault"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "按端预算注入",
+      "items": [
+        "boot / delta / prefetch 三段渲染",
+        "每段有硬顶字数，超了先裁剪"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "隔离与审计",
+      "items": [
+        "token → client_id → domain 白名单",
+        "私账门控 + 全量调用审计"
+      ]
+    }
+  ]
+}

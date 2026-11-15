@@ -1,0 +1,35 @@
+# 记忆域策略：放在 <vault_root>/profiles/<profile>/memory.yaml
+# 这份文件跟着 vault 走（可进 git），机器相关的路径写在上层 broker.yaml。
+
+schema: 1
+profile: lily
+
+identity:
+  mode: pointer            # 人格只通过 broker.yaml 的 soul_path 指针引用，不复制进 vault
+
+# 客户端 → 权限域。client_id 由 tokens.json（HTTP）或 AGENTBRAIN_CLIENT_ID（stdio）确定。
+clients:
+  "hermes:lily":  {domain: work, can_casual: true}
+  "codex":        {domain: work}
+  "antigravity":  {domain: work}
+
+# 每端注入预算（字数上限）。prefetch 是每轮检索注入，boot/delta 是启动块与增量块。
+inject:
+  hermes:      {static_chars: 450, prefetch_chars: 1200}
+  antigravity: {boot_chars: 2400, delta_chars: 300}
+  codex:       {boot_chars: 2400, delta_chars: 300}
+
+retrieval:
+  seed_k: 5                # 首轮召回的种子条数
+  hops: 1                  # 图谱扩散跳数
+  max_chars: 1200          # 正常返回预算
+  hard_max_chars: 2400     # 硬顶，任何情况下不超
+  half_life_days: 30       # 时效衰减半衰期
+  superseded_penalty: 0.3  # 被取代笔记的乘子
+  min_evidence: 0.30       # 证据门槛，低于此值标 weak_evidence
+
+working:
+  hot_max_chars: 1500      # 10_Working/HOT.md 硬顶
+
+diary:
+  gate: false              # 开启后，非 can_casual 客户端读不到私账

@@ -1,0 +1,22 @@
+# 机器配置：AgentBrain broker 本机参数
+# 默认位置：%LOCALAPPDATA%/agentbrain/broker.yaml（可用 AGENTBRAIN_BROKER_CONFIG 覆盖）
+# 不要放进 vault，不要提交进 git。
+
+# Markdown 真源所在目录（Obsidian vault 或任意 Markdown 目录）
+vault_root: "D:/Notes/MyMemory"
+
+# 人格文件只读指针：不复制进 vault，每次渲染 boot 块时读取
+soul_path: "D:/Notes/SOUL.md"
+
+# HTTP 服务端口（只绑 127.0.0.1）
+port: 18765
+
+# 本机角色，预留给多机场景
+role: primary
+
+# 运行时目录：索引库、revision、状态、审计、日志都落在这里，可随时删除重建
+index_dir: "C:/Users/<you>/AppData/Local/agentbrain/index"
+rev_dir:   "C:/Users/<you>/AppData/Local/agentbrain/rev"
+state_dir: "C:/Users/<you>/AppData/Local/agentbrain/state"
+audit_dir: "C:/Users/<you>/AppData/Local/agentbrain/audit"
+log_dir:   "C:/Users/<you>/AppData/Local/agentbrain/logs"

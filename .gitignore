@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行时产物（索引库、锁、日志一律不进仓库）
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# 本地配置快照
+broker.yaml
+tokens.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# archify 截图中间产物
+docs/hero-raw.png
+docs/hero-shot.html
+docs/preview*.html
+docs/preview*.png
+docs/*.visual-check.*
