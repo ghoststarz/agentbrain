@@ -22,15 +22,17 @@ Hermes 的 `MemoryProvider` 接口允许插件在三个位置介入：系统提�
 Hermes 会扫描 `<hermes_home>/plugins/<name>/plugin.yaml` 并调用同目录 `__init__.py` 的 `register(ctx)`。
 
 ```bash
-# 方式一：软链/目录联接（推荐——仓库是唯一真源，改一处就生效）
-# Windows（无需管理员）：
-cmd //c mklink /J "%LOCALAPPDATA%\hermes\profiles\<profile>\plugins\obsidian-broker" "<repo>\integrations\hermes\obsidian-broker"
+# 方式一：目录联接 / 软链（推荐——仓库是唯一真源，改一处就生效）
+# Windows（PowerShell，无需管理员）：
+powershell -NoProfile -Command "New-Item -ItemType Junction -Path \"$env:LOCALAPPDATA\hermes\profiles\<profile>\plugins\obsidian-broker\" -Target \"<repo>\integrations\hermes\obsidian-broker\""
 # POSIX：
 ln -s <repo>/integrations/hermes/obsidian-broker ~/.hermes/profiles/<profile>/plugins/obsidian-broker
 
 # 方式二：复制（简单，但之后两边会漂移）
 cp -r integrations/hermes/obsidian-broker "%LOCALAPPDATA%\hermes\profiles\<profile>\plugins\"
 ```
+
+先建链接、确认能读到目标目录里的 `plugin.yaml`，再删旧副本。注意在 MSYS/Git-Bash 里 `cmd //c mklink /J` 可能被路径转换吃掉、静默不执行。
 
 装完重启 Hermes（新会话生效）。
 
