@@ -1,0 +1,3 @@
+name: obsidian-broker
+version: 0.1.0
+description: "AgentBrain mem-broker memory provider plugin (fail-open HTTP client)"

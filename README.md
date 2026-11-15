@@ -86,6 +86,17 @@ python -m agentbrain sync-agy                              # 重渲染 ~/.gemini
 
 `memory_boot`、`memory_delta`、`memory_search`、`memory_read`、`memory_write`、`memory_status`、`handoff_read`、`handoff_upsert`、`diary_append`、`diary_read`。
 
+## 宿主接入：Hermes MemoryProvider
+
+MCP 是"agent 主动来查"的通道，Hermes 需要的是"每轮自动送过去"。这两种语义不一样，所以仓库里另带一份 Hermes 插件：[`integrations/hermes/obsidian-broker/`](integrations/hermes/obsidian-broker/)——单文件、无第三方依赖的 `MemoryProvider` 实现：
+
+- `prefetch` 在每次用户输入前打 `POST /v1/search`，命中注入成 `[MEMORY_PREFETCH]` 块（1200 字硬顶，revision 变了多带一行 delta）；
+- `on_pre_compress` 在上下文压缩前把当前任务 upsert 成 `handoff` 槽位，压缩后不丢线；
+- `get_tool_schemas` 返回空——不往会话里塞额外工具面；
+- 每个钩子 fail-open，broker 没起时静默降级，对话不受影响。
+
+装法、token 来源、排查看该目录的 README。
+
 ## 检索是怎么排序的
 
 召回分三段，按价从高到低：
@@ -125,6 +136,7 @@ agentbrain/            内核与服务
 tests/                 单元与隔离性回归测试
 docs/                  架构图规格（architecture.json）与渲染产物
 examples/              配置样例
+integrations/          宿主侧接入（hermes/obsidian-broker：MemoryProvider 插件）
 scripts/               Windows 计划任务自愈脚本
 ```
 
@@ -154,7 +166,7 @@ pytest -q                     # 58 passed, 4 skipped（插件测试默认跳过�
 
 - Windows 优先：文件锁走 `msvcrt`，脚本是计划任务；POSIX 分支有实现但未实测。
 - 单人单机单 vault：没有冲突合并协议，两个 broker 同时写同一 vault 没有保护。
-- Hermes 的每轮 prefetch provider 插件不在本仓库（它是宿主侧的适配层，走同一套 HTTP 接口）。
+- `integrations/hermes/obsidian-broker/` 只依赖 HTTP 契约，不 import broker 的包；契约变了必须两边一起改，这是唯一的耦合点。本机是通过目录联接（junction）把 profile 的 plugins 目录指到这里的，删掉仓库那份插件就会一起消失。
 - Codex 侧接线已就位，但受其自身模型配置限制。
 
 ## License
