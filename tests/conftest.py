@@ -48,6 +48,9 @@ def isolated_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
         "soul_path": str(soul_path),
         "port": 18765,
         "role": "primary",
+        # 测试环境必须把 agy 规则文件也指到 tmp：否则服务级写入会覆盖真实的
+        # ~/.gemini/GEMINI.md（真发生过，代价是另一端人格变成测试夹具）。
+        "agy_rules_path": str(tmp_path / "gemini" / "GEMINI.md"),
         "index_dir": str(runtime_dir / "index"),
         "rev_dir": str(runtime_dir / "rev"),
         "state_dir": str(runtime_dir / "state"),

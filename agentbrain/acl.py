@@ -24,6 +24,14 @@ def default_tokens_path() -> Path:
     return Path.home() / "AppData" / "Local" / "agentbrain" / "tokens.json"
 
 
+def display_client_id(client_id: str) -> str:
+    """将内部鉴权 client_id 映射为对外展示来源（例如 hermes:lily -> hermes）。"""
+    clean = str(client_id or "").strip()
+    if clean == "hermes" or clean.startswith("hermes:"):
+        return "hermes"
+    return clean
+
+
 @dataclass(frozen=True)
 class AuthIdentity:
     """已鉴权调用方身份与服务端映射域。"""
@@ -31,6 +39,11 @@ class AuthIdentity:
     client_id: str
     domain: str
     can_casual: bool = False
+
+    @property
+    def display_source(self) -> str:
+        """用于笔记 source、日记作者与接力 updated_by 的展示来源名。"""
+        return display_client_id(self.client_id)
 
 
 class AuthError(Exception):

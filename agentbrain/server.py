@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from agentbrain.acl import AuthError, AuthIdentity, authenticate_bearer
 from agentbrain.atomic import atomic_write_text
 from agentbrain.config import AppConfig
-from agentbrain.diary import DiaryGateError, append_diary, read_diary
+from agentbrain.diary import DiaryGateError, append_diary, read_diary, today_diary_status
 from agentbrain.handoff import read_handoff, upsert_handoff
 from agentbrain.index import connect_db, reindex
 from agentbrain.parse import normalize_trigger_order, parse_note
@@ -27,7 +27,6 @@ _TYPE_DIR_MAP: dict[str, str] = {
     "entity": "20_LongTerm/Entities",
     "project": "20_LongTerm/Projects",
     "moc": "20_LongTerm/MOC",
-    "inbox": "50_Inbox/new",
 }
 
 _SAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
@@ -101,6 +100,33 @@ class BrokerService:
         self._cooldowns: dict[tuple[str, str], dict[str, int]] = {}
         self._default_cooldown_turns: int = 5
 
+    def _sync_agy_quiet(self) -> None:
+        """写操作改变 revision 后，顺手把 agy 的全局规则文件刷到最新。
+
+        只做「渲染 + 比对 + 变了才写」，2KB 级文件，代价可忽略。写失败一律吞掉：
+        绝不能让刷新 agy 文件这件事拖死写入本身。
+        """
+        try:
+            from agentbrain.agy_rules import sync_agy_rules
+
+            sync_agy_rules(self.config)
+        except Exception:  # noqa: BLE001 —— fail-open
+            pass
+
+    def diary_status(self, *, can_casual: bool = False) -> dict[str, Any]:
+        """今日公账/私账的条数与作者（只元信息，不含正文）。
+
+        fail-open：这里出任何问题都只让状态行消失，绝不能让检索整体失败。
+        门控：`diary.gate` 打开且调用方不是 casual 时，私账连「有没有」都不暴露。
+        """
+        try:
+            status: dict[str, Any] = {"public": today_diary_status(self.config, "public")}
+            if not self.config.memory.diary_gate or can_casual:
+                status["private"] = today_diary_status(self.config, "private")
+            return status
+        except Exception:  # noqa: BLE001 —— 状态行是锦上添花，坏了就退化
+            return {}
+
     def healthz(self) -> dict[str, Any]:
         return {
             "ok": True,
@@ -128,6 +154,7 @@ class BrokerService:
         payload: dict[str, Any],
         *,
         client_id: str = "default",
+        can_casual: bool = False,
     ) -> dict[str, Any]:
         query = str(payload.get("query") or "").strip()
         if not query:
@@ -146,6 +173,7 @@ class BrokerService:
                 hops_override=hops_override,
             )
             result["revision"] = get_current_revision(self.config)
+            result["diary_today"] = self.diary_status(can_casual=can_casual)
             return result
 
         cd_key = (client_id, session_id)
@@ -174,6 +202,7 @@ class BrokerService:
                     session_cd[hit_path] = self._default_cooldown_turns
 
         result["revision"] = get_current_revision(self.config)
+        result["diary_today"] = self.diary_status(can_casual=can_casual)
         return result
 
     def read_note(
@@ -281,8 +310,12 @@ class BrokerService:
             first_line = content.splitlines()[0].lstrip("#").strip()
             title_raw = first_line[:60] if first_line else f"{note_type}-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
+        target_subdir = _TYPE_DIR_MAP.get(note_type)
+        if target_subdir is None:
+            allowed = ", ".join(sorted(_TYPE_DIR_MAP))
+            raise ServiceError(400, "invalid_request", f"unsupported note type: {note_type!r} (allowed: {allowed})")
+
         today_str = dt.date.today().isoformat()
-        target_subdir = _TYPE_DIR_MAP.get(note_type, "50_Inbox/new")
         target_dir = self.config.profile_dir / target_subdir
         target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -297,7 +330,7 @@ class BrokerService:
             f"type: {note_type}",
             f"created: {today_str}",
             f"updated: {today_str}",
-            f"source: {identity.client_id}",
+            f"source: {identity.display_source}",
             f"domain: {identity.domain}",
             f"tags: {json.dumps(tags, ensure_ascii=False)}",
             "status: active",
@@ -323,6 +356,8 @@ class BrokerService:
         with self._write_lock:
             atomic_write_text(target_file, full_text)
             stats = reindex(self.config)
+
+        self._sync_agy_quiet()
 
         rel_path = target_file.relative_to(self.config.profile_dir).as_posix()
         parsed = parse_note(target_file, full_text)
@@ -359,15 +394,17 @@ class BrokerService:
         if action == "upsert":
             try:
                 with self._write_lock:
-                    return upsert_handoff(
+                    result = upsert_handoff(
                         self.config,
                         task_key=str(payload.get("task_key") or ""),
                         status=str(payload.get("status") or "open"),
                         summary=str(payload.get("summary") or ""),
                         next_steps=payload.get("next_steps"),
                         touched_files=payload.get("touched_files"),
-                        updated_by=identity.client_id,
+                        updated_by=identity.display_source,
                     )
+                self._sync_agy_quiet()
+                return result
             except ValueError as exc:
                 raise ServiceError(400, "invalid_request", str(exc)) from exc
         raise ServiceError(400, "invalid_request", f"unsupported handoff action: {action}")
@@ -383,13 +420,17 @@ class BrokerService:
         try:
             if action == "append":
                 with self._write_lock:
-                    return append_diary(
+                    result = append_diary(
                         self.config,
                         ledger=ledger,
                         content=str(payload.get("content") or ""),
-                        author=identity.client_id,
+                        author=identity.display_source,
                         can_casual=identity.can_casual,
                     )
+                # 日记正文不进检索、不进 boot，但「今日日记」那一行状态会写进
+                # agy 的规则文件，所以写完要刷一次，否则另一端看到的条数是过期的。
+                self._sync_agy_quiet()
+                return result
             if action == "read":
                 recent_days = int(payload.get("recent_days", 3))
                 return read_diary(
@@ -442,6 +483,161 @@ class BrokerService:
             "revision": revision,
             "updated_at": updated_at,
             "index_age_seconds": index_age_seconds,
+        }
+
+    def _proactive_store(self):
+        from agentbrain.proactive import ProactiveStore
+
+        return ProactiveStore.from_app_config(self.config)
+
+    def review_events(
+        self,
+        payload: dict[str, Any],
+        *,
+        identity: AuthIdentity,
+    ) -> dict[str, Any]:
+        """写入一条或多条主动评审事件（凭证脱敏 + 超限显式 413 拒绝）。"""
+        if not self.config.memory.proactive.enabled:
+            raise ServiceError(403, "proactive_disabled", "proactive review is disabled")
+        from agentbrain.proactive import EVENT_KIND_HUMAN_TURN, PayloadTooLargeError
+        from agentbrain.proactive_adapters import _parse_utc_iso
+
+        raw_events = payload.get("events")
+        if raw_events is None:
+            raw_events = [payload]
+        if not isinstance(raw_events, list) or not raw_events:
+            raise ServiceError(400, "invalid_request", "events must be a non-empty list or single event object")
+
+        store = self._proactive_store()
+        results: list[dict[str, Any]] = []
+        for idx, item in enumerate(raw_events):
+            if not isinstance(item, dict):
+                raise ServiceError(400, "invalid_request", f"events[{idx}] must be an object")
+            client = str(item.get("client") or identity.client_id or "").strip()
+            session_id = str(item.get("session_id") or "").strip()
+            event_id = str(item.get("event_id") or "").strip()
+            event_kind = str(item.get("event_kind") or EVENT_KIND_HUMAN_TURN).strip()
+            content = str(item.get("content") or "")
+            qualifies_nightly = bool(item.get("qualifies_nightly", True))
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else None
+            occ_raw = item.get("occurred_at")
+            occ_dt = _parse_utc_iso(occ_raw) if occ_raw else None
+            if occ_raw and occ_dt is None:
+                raise ServiceError(400, "invalid_request", f"events[{idx}].occurred_at must be ISO-8601")
+
+            try:
+                res = store.ingest_event(
+                    client=client,
+                    session_id=session_id,
+                    event_id=event_id,
+                    event_kind=event_kind,
+                    content=content,
+                    occurred_at=occ_dt,
+                    meta=meta,
+                    qualifies_nightly=qualifies_nightly,
+                )
+            except PayloadTooLargeError as exc:
+                raise ServiceError(413, "payload_too_large", str(exc)) from exc
+            except ValueError as exc:
+                raise ServiceError(400, "invalid_request", str(exc)) from exc
+
+            results.append(
+                {
+                    "accepted": res.accepted,
+                    "deduped": res.deduped,
+                    "excluded": res.excluded,
+                    "event_row_id": res.event_row_id,
+                    "turn_seq": res.turn_seq,
+                    "completed_human_turns": res.completed_human_turns,
+                    "created_job_id": res.created_job_id,
+                }
+            )
+
+        return {"ok": True, "count": len(results), "results": results}
+
+    def review_cli_event(
+        self,
+        payload: dict[str, Any],
+        *,
+        identity: AuthIdentity,
+    ) -> dict[str, Any]:
+        """参考用 CLI 引用事件接口（仅作证据，绝不计入人类完成轮次）。"""
+        if not self.config.memory.proactive.enabled:
+            raise ServiceError(403, "proactive_disabled", "proactive review is disabled")
+        from agentbrain.proactive import PayloadTooLargeError
+        from agentbrain.proactive_adapters import ingest_cli_reference_event
+
+        session_id = str(payload.get("session_id") or identity.client_id or "cli").strip()
+        content = str(payload.get("content") or "")
+        event_id = str(payload.get("event_id") or "").strip() or None
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else None
+        store = self._proactive_store()
+        try:
+            res = ingest_cli_reference_event(
+                store,
+                session_id=session_id,
+                content=content,
+                event_id=event_id,
+                meta=meta,
+            )
+        except PayloadTooLargeError as exc:
+            raise ServiceError(413, "payload_too_large", str(exc)) from exc
+        except ValueError as exc:
+            raise ServiceError(400, "invalid_request", str(exc)) from exc
+        return {"ok": True, **res}
+
+    def review_status(self) -> dict[str, Any]:
+        """返回脱敏主动评审调度状态（仅元信息，绝不含任何聊天原文）。"""
+        store = self._proactive_store()
+        status = store.get_status()
+        status["adapters"] = store.list_adapter_cursors()
+        runner_st = store.get_adapter_cursor("proactive_runner", "status")
+        status["runner"] = runner_st or {
+            "last_error": None,
+            "unavailable_sources": [],
+        }
+        status["enabled"] = bool(self.config.memory.proactive.enabled)
+        status["ok"] = True
+        return status
+
+    def review_tick(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """手动触发一次夜间窗口调度检查与可选的 agy IDE 扫描。"""
+        if not self.config.memory.proactive.enabled:
+            return {"ok": True, "enabled": False, "skipped": True}
+        from agentbrain.proactive_adapters import scan_agy_ide_roots
+
+        store = self._proactive_store()
+        ide_report = None
+        catchup = bool(payload.get("catchup", False))
+        if (
+            self.config.memory.proactive.agy_ide_enabled
+            and self.config.memory.proactive.agy_ide_roots
+        ):
+            ide_report = scan_agy_ide_roots(
+                store,
+                self.config.memory.proactive.agy_ide_roots,
+                catchup=catchup,
+            )
+        tick = store.tick(include_historical=catchup)
+        return {
+            "ok": True,
+            "tick": {
+                "windows_checked": tick.windows_checked,
+                "windows_skipped_empty": tick.windows_skipped_empty,
+                "jobs_created": tick.jobs_created,
+                "windows_reopened": tick.windows_reopened,
+            },
+            "ide": (
+                {
+                    "roots_scanned": ide_report.roots_scanned,
+                    "transcripts_scanned": ide_report.transcripts_scanned,
+                    "events_ingested": ide_report.events_ingested,
+                    "turns_completed": ide_report.turns_completed,
+                    "unavailable_sources": ide_report.unavailable_sources,
+                }
+                if ide_report is not None
+                else None
+            ),
         }
 
 
@@ -515,6 +711,9 @@ class BrokerHTTPHandler(BaseHTTPRequestHandler):
             if method == "GET" and path == "/v1/status":
                 self._send_json(200, svc.status())
                 return
+            if method == "GET" and path == "/v1/review/status":
+                self._send_json(200, svc.review_status())
+                return
 
             if method == "POST":
                 payload = self._read_json_body()
@@ -525,7 +724,7 @@ class BrokerHTTPHandler(BaseHTTPRequestHandler):
                     self._send_json(200, svc.delta(payload))
                     return
                 if path == "/v1/search":
-                    self._send_json(200, svc.search(payload, client_id=identity.client_id))
+                    self._send_json(200, svc.search(payload, client_id=identity.client_id, can_casual=identity.can_casual))
                     return
                 if path == "/v1/read":
                     self._send_json(200, svc.read_note(payload, can_casual=identity.can_casual))
@@ -538,6 +737,15 @@ class BrokerHTTPHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/v1/diary":
                     self._send_json(200, svc.diary(payload, identity=identity))
+                    return
+                if path == "/v1/review/events":
+                    self._send_json(200, svc.review_events(payload, identity=identity))
+                    return
+                if path == "/v1/review/cli-event":
+                    self._send_json(200, svc.review_cli_event(payload, identity=identity))
+                    return
+                if path == "/v1/review/tick":
+                    self._send_json(200, svc.review_tick(payload))
                     return
 
             self._send_json(404, {"error": "not_found", "path": path})
@@ -592,12 +800,19 @@ def run_http_server(
     except Exception as _exc:  # 绝不能因为写规则文件失败而拖死服务
         print(f"WARN: agy 规则同步失败（忽略）：{_exc}")
 
+    from agentbrain.proactive_runner import ProactiveRunner
+
+    runner = ProactiveRunner(config, write_lock=httpd.service._write_lock)
+    runner_started = runner.start()
+    if runner_started:
+        print("AgentBrain proactive background runner started")
     print(f"AgentBrain HTTP server listening on http://{host}:{bind_port} (profile={config.memory.profile})")
     try:
         httpd.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\nShutting down AgentBrain HTTP server...")
     finally:
+        runner.stop()
         httpd.shutdown()
         httpd.server_close()
     return 0

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
+import re
 import threading
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -31,8 +34,33 @@ _STATIC_PROTOCOL_BLOCK = (
     "[SHARED_BRAIN 记忆协议]\n"
     "- 跨端共享记忆由本地 agentbrain broker 托管，按需通过 prefetch 自动注入相关事实与决策。\n"
     "- 本块为静态协议说明，不包含动态记忆或日记正文。\n"
-    "- 重要事实或偏好变更请使用记忆工具沉淀；会话压缩前自动同步接力状态。"
+    "- 重要事实或偏好变更请使用记忆工具沉淀；会话压缩前自动同步接力状态。\n"
+    "- 日记是习惯，不是任务：闲聊、日常、有意思的坑、有温度的瞬间 → 主动 diary_append 记一条公账；\n"
+    "  有自己的在意、不确定或想留给后面的自己的观察 → 记私账。工作流水（改了哪些文件、几个测试）不进日记。\n"
+    "- 日常闲聊就正常聊天，别套用任务纪律的语态和验收口吻；[DIARY] 行只是状态提示，不必向用户复述。"
 )
+
+
+def _format_diary_line(diary_today: Any) -> str:
+    """把 /v1/search 返回的 diary_today 元信息压成一行提示（只条数与作者，不含正文）。"""
+    if not isinstance(diary_today, dict):
+        return ""
+    try:
+        pub = diary_today.get("public") or {}
+        pri = diary_today.get("private") or {}
+        pub_n = int(pub.get("count") or 0)
+        pri_n = int(pri.get("count") or 0)
+        if pub_n:
+            stamp = str(pub.get("last_time") or "")[:5]
+            author = str(pub.get("last_author") or "")
+            meta = f"{stamp} {author}".strip()
+            pub_desc = f"公账 {pub_n} 条" + (f"（最后 {meta}）" if meta else "")
+        else:
+            pub_desc = "今日公账 0 条"
+        return f"[DIARY] {pub_desc}｜私账 {pri_n} 条"
+    except Exception:  # noqa: BLE001 —— 状态行坏掉不该拖累召回
+        return ""
+
 
 
 def _default_broker_yaml() -> Path:
@@ -123,6 +151,68 @@ def _read_diary_turn_capture(memory_yaml_path: Path) -> bool:
         return False
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+_INJECTED_BLOCK_RE = re.compile(
+    r"(?:\[SHARED_BRAIN[^\]]*\][\s\S]*?(?=\n\n|\Z)|"
+    r"\[MEMORY_DELTA\][^\n]*\n?|"
+    r"\[MEMORY_PREFETCH\][\s\S]*?(?=\n\n|\Z)|"
+    r"\[DIARY\][^\n]*\n?)"
+)
+
+
+def _read_proactive_capture_flags(memory_yaml_path: Path) -> tuple[bool, bool]:
+    """Pure-stdlib parser for proactive.enabled and proactive.event_capture (no PyYAML)."""
+    try:
+        if not memory_yaml_path.exists():
+            return False, False
+        text = memory_yaml_path.read_text(encoding="utf-8")
+        in_proactive = False
+        proactive_indent = -1
+        enabled = False
+        event_capture = False
+        for raw_line in text.splitlines():
+            code = raw_line.split("#", 1)[0].rstrip()
+            if not code.strip():
+                continue
+            indent = len(code) - len(code.lstrip(" "))
+            stripped = code.strip()
+            if indent == 0:
+                in_proactive = stripped.startswith("proactive:")
+                proactive_indent = indent if in_proactive else -1
+                continue
+            if in_proactive:
+                if indent <= proactive_indent:
+                    in_proactive = False
+                    continue
+                if stripped.startswith("enabled:"):
+                    enabled = _parse_bool(stripped.split(":", 1)[1].strip().strip('"').strip("'"))
+                elif stripped.startswith("event_capture:"):
+                    event_capture = _parse_bool(stripped.split(":", 1)[1].strip().strip('"').strip("'"))
+        return enabled, event_capture
+    except Exception:
+        return False, False
+
+
+def _strip_thinking_and_memory(text: str) -> str:
+    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    cleaned = _INJECTED_BLOCK_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _is_filtered_turn(session_id: str, turn_author: Optional[dict[str, Any]]) -> bool:
+    sid = (session_id or "").strip().lower()
+    if sid.startswith(("proactive-review", "system", "heartbeat", "cron", "__internal")):
+        return True
+    if isinstance(turn_author, dict):
+        if turn_author.get("is_bot") is True or turn_author.get("is_system") is True:
+            return True
+        for key in ("role", "kind", "type", "name"):
+            val = str(turn_author.get(key) or "").strip().lower()
+            if val in {"system", "bot", "heartbeat", "proactive_review", "review", "cron"}:
+                return True
+    return False
+
+
 class ObsidianBrokerMemoryProvider(MemoryProvider):
     """基于本地 HTTP mem-broker 的 Hermes MemoryProvider 实现（fail-open）。"""
 
@@ -136,6 +226,10 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
         self._last_revision: Optional[int] = None
         self._last_recall: Optional[RecallStatus] = None
         self._turn_capture: bool = False
+        self._proactive_enabled: bool = False
+        self._proactive_event_capture: bool = False
+        self._outbox_lock = threading.Lock()
+        self._session_turn_seq: dict[str, int] = {}
         self._closed: bool = False
 
     @property
@@ -205,23 +299,39 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             self._logger.warning("is_available failed: %s", exc)
             return False
 
+    def _resolve_memory_yaml_path(self, cfg_path: Path) -> Optional[Path]:
+        if not cfg_path.exists():
+            return None
+        raw = _parse_flat_yaml(cfg_path.read_text(encoding="utf-8"))
+        vault_root_raw = raw.get("vault_root")
+        if not vault_root_raw:
+            return None
+        vault_root = Path(os.path.expandvars(os.path.expanduser(vault_root_raw)))
+        profile = Path(self._hermes_home).name if self._hermes_home else "lily"
+        mem_path = vault_root / "profiles" / profile / "memory.yaml"
+        if not mem_path.exists() and profile != "lily":
+            mem_path = vault_root / "profiles" / "lily" / "memory.yaml"
+        return mem_path
+
     def _load_turn_capture(self, cfg_path: Path) -> bool:
         try:
-            if not cfg_path.exists():
+            mem_path = self._resolve_memory_yaml_path(cfg_path)
+            if mem_path is None:
                 return False
-            raw = _parse_flat_yaml(cfg_path.read_text(encoding="utf-8"))
-            vault_root_raw = raw.get("vault_root")
-            if not vault_root_raw:
-                return False
-            vault_root = Path(os.path.expandvars(os.path.expanduser(vault_root_raw)))
-            profile = Path(self._hermes_home).name if self._hermes_home else "lily"
-            mem_path = vault_root / "profiles" / profile / "memory.yaml"
-            if not mem_path.exists() and profile != "lily":
-                mem_path = vault_root / "profiles" / "lily" / "memory.yaml"
             return _read_diary_turn_capture(mem_path)
         except Exception as exc:
             self._logger.warning("failed to load diary.turn_capture: %s", exc)
             return False
+
+    def _load_proactive_flags(self, cfg_path: Path) -> tuple[bool, bool]:
+        try:
+            mem_path = self._resolve_memory_yaml_path(cfg_path)
+            if mem_path is None:
+                return False, False
+            return _read_proactive_capture_flags(mem_path)
+        except Exception as exc:
+            self._logger.warning("failed to load proactive capture flags: %s", exc)
+            return False, False
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         try:
@@ -235,8 +345,11 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             self._last_revision = None
             self._last_recall = None
             self._turn_capture = self._load_turn_capture(cfg_path)
+            self._proactive_enabled, self._proactive_event_capture = self._load_proactive_flags(cfg_path)
         except Exception as exc:
             self._turn_capture = False
+            self._proactive_enabled = False
+            self._proactive_event_capture = False
             self._logger.warning("initialize failed: %s", exc)
 
     def get_config_schema(self) -> list[dict[str, Any]]:
@@ -292,14 +405,21 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                 self._last_revision = rev
 
             hits = res.get("hits") or []
-            if not hits:
-                return ""
-            if all(bool(hit.get("weak_evidence")) for hit in hits):
+            diary_line = _format_diary_line(res.get("diary_today"))
+
+            if not hits or all(bool(hit.get("weak_evidence")) for hit in hits):
+                # 没有可用召回时，至少把「今天日记写了没」这一行带上：
+                # 习惯靠的是每轮都看得见的状态，而不是某天忽然想起来。
+                if diary_line:
+                    self._last_recall = None
+                    return diary_line
                 return ""
 
             lines: list[str] = []
             if rev is not None and prev_revision is not None and rev != prev_revision:
                 lines.append(f"[MEMORY_DELTA] revision {prev_revision} -> {rev}")
+            if diary_line:
+                lines.append(diary_line)
             lines.append("[MEMORY_PREFETCH]")
             used = sum(len(line) + 1 for line in lines) - 1
             count = 0
@@ -313,12 +433,111 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                 used += len(entry) + 1
                 count += 1
             if count == 0:
-                return ""
+                # 命中全被预算挤掉时，至少别把已经算好的日记状态行一起丢了
+                return diary_line
             self._last_recall = RecallStatus(provider_label=self.name, count=count)
             return "\n".join(lines)[:1200]
         except Exception as exc:
             self._logger.warning("prefetch failed: %s", exc)
             return ""
+
+    _OUTBOX_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+        (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+        (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{12,}"), "Bearer [REDACTED_TOKEN]"),
+        (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b"), "[REDACTED_API_KEY]"),
+        (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED_GH_TOKEN]"),
+        (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "[REDACTED_GH_TOKEN]"),
+        (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_AWS_KEY]"),
+        (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"), "[REDACTED_SLACK_TOKEN]"),
+        (
+            re.compile(
+                r"(?i)\b(api[_-]?key|apikey|secret|password|passwd|access_token|auth_token|token)\b"
+                r"(\s*[:=]\s*['\"]?)([^\s'\",;]{8,})(['\"]?)"
+            ),
+            r"\1\2[REDACTED]\4",
+        ),
+    )
+
+    @classmethod
+    def _redact_outbox_text(cls, text: str) -> str:
+        if not text:
+            return text
+        out = text
+        for pat, repl in cls._OUTBOX_REDACT_PATTERNS:
+            out = pat.sub(repl, out)
+        return out
+
+    def _outbox_path(self) -> Path:
+        if self._hermes_home:
+            return Path(self._hermes_home) / "cache" / "proactive_outbox.jsonl"
+        local_app = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app) / "agentbrain" / "outbox" if local_app else Path.home() / "AppData" / "Local" / "agentbrain" / "outbox"
+        return base / "hermes_proactive_outbox.jsonl"
+
+    def _enqueue_outbox(self, event: dict[str, Any]) -> None:
+        safe_event = dict(event)
+        if "content" in safe_event:
+            safe_event["content"] = self._redact_outbox_text(str(safe_event["content"] or ""))
+        if isinstance(safe_event.get("meta"), dict):
+            safe_event["meta"] = {
+                k: self._redact_outbox_text(v) if isinstance(v, str) else v
+                for k, v in safe_event["meta"].items()
+            }
+        outbox = self._outbox_path()
+        with self._outbox_lock:
+            outbox.parent.mkdir(parents=True, exist_ok=True)
+            with outbox.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(safe_event, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def _flush_outbox(self) -> None:
+        outbox = self._outbox_path()
+        with self._outbox_lock:
+            if not outbox.exists():
+                return
+            raw_lines = [ln for ln in outbox.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+            if not raw_lines:
+                return
+            remaining: list[str] = []
+            failed_network = False
+            for idx, line in enumerate(raw_lines):
+                if failed_network:
+                    remaining.append(line)
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                try:
+                    self._http_json("POST", "/v1/review/events", ev, timeout=2.0)
+                except urllib.error.HTTPError as http_exc:
+                    if http_exc.code in (400, 413):
+                        # 永久拒绝（格式错或超限），记录日志并移出队列避免阻塞后续事件
+                        self._logger.warning("proactive outbox event rejected (%s): %s", http_exc.code, ev.get("event_id"))
+                    else:
+                        remaining.append(line)
+                        failed_network = True
+                except Exception as exc:
+                    self._logger.warning("proactive outbox flush transient error: %s", exc)
+                    remaining.append(line)
+                    failed_network = True
+            tmp = outbox.with_suffix(".jsonl.tmp")
+            tmp.write_text(("\n".join(remaining) + "\n") if remaining else "", encoding="utf-8")
+            os.replace(tmp, outbox)
+
+    def _derive_turn_event_id(
+        self,
+        session_id: str,
+        messages: Optional[list[dict[str, Any]]],
+    ) -> str:
+        prev = self._session_turn_seq.get(session_id, 0)
+        msg_count = len(messages) if isinstance(messages, list) else 0
+        seq = max(prev + 1, msg_count)
+        self._session_turn_seq[session_id] = seq
+        if isinstance(messages, list) and messages:
+            last_msg = messages[-1]
+            if isinstance(last_msg, dict) and last_msg.get("id"):
+                return f"hermes:{session_id}:turn:{seq}:{last_msg['id']}"
+        return f"hermes:{session_id}:turn:{seq}"
 
     def sync_turn(
         self,
@@ -330,13 +549,44 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
         turn_author: Optional[dict[str, Any]] = None,
     ) -> None:
         try:
-            if self._closed or not self._turn_capture:
+            if self._closed:
+                return
+            eff_session = str(session_id or self._session_id or "default").strip() or "default"
+
+            # 1. 新主动评审事件采集（独立开关，默认关闭；持久 outbox + 重试）
+            if (
+                self._proactive_enabled
+                and self._proactive_event_capture
+                and not _is_filtered_turn(eff_session, turn_author)
+            ):
+                clean_u = _strip_thinking_and_memory(user_content)
+                clean_a = _strip_thinking_and_memory(assistant_content)
+                if clean_u or clean_a:
+                    ev_id = self._derive_turn_event_id(eff_session, messages)
+                    ev_payload = {
+                        "client": "hermes",
+                        "session_id": eff_session,
+                        "event_id": ev_id,
+                        "event_kind": "human_turn",
+                        "content": f"User: {clean_u}\nAssistant: {clean_a}".strip(),
+                        "occurred_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "qualifies_nightly": True,
+                    }
+                    self._enqueue_outbox(ev_payload)
+                    threading.Thread(
+                        target=self._flush_outbox,
+                        name="obsidian-broker-proactive-flush",
+                        daemon=True,
+                    ).start()
+
+            # 2. 旧版 raw turn_capture（保持默认关闭，互不干扰）
+            if not self._turn_capture:
                 return
             u_snip = " ".join((user_content or "").split())[:200]
             a_snip = " ".join((assistant_content or "").split())[:200]
             if not u_snip and not a_snip:
                 return
-            summary = f"session={session_id or self._session_id} | U: {u_snip} | A: {a_snip}"
+            summary = f"session={eff_session} | U: {u_snip} | A: {a_snip}"
 
             def _post_bg() -> None:
                 try:
@@ -352,6 +602,42 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             threading.Thread(target=_post_bg, name="obsidian-broker-sync", daemon=True).start()
         except Exception as exc:
             self._logger.warning("sync_turn failed: %s", exc)
+
+    def on_delegation(
+        self,
+        task: str = "",
+        result: str = "",
+        *,
+        session_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """子任务委派钩子：仅作为 reference_only 证据采集，不计入人类完成轮次。"""
+        try:
+            if self._closed or not (self._proactive_enabled and self._proactive_event_capture):
+                return
+            eff_session = str(session_id or self._session_id or "default").strip() or "default"
+            clean_task = _strip_thinking_and_memory(task)
+            clean_res = _strip_thinking_and_memory(result)
+            if not clean_task and not clean_res:
+                return
+            ev_payload = {
+                "client": "hermes",
+                "session_id": eff_session,
+                "event_id": f"hermes:{eff_session}:delegation:{uuid.uuid4().hex[:12]}",
+                "event_kind": "reference_only",
+                "content": f"[Delegation] Task: {clean_task}\nResult: {clean_res}".strip(),
+                "occurred_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "meta": metadata if isinstance(metadata, dict) else {"source": "delegation"},
+                "qualifies_nightly": True,
+            }
+            self._enqueue_outbox(ev_payload)
+            threading.Thread(
+                target=self._flush_outbox,
+                name="obsidian-broker-proactive-flush",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self._logger.warning("on_delegation failed: %s", exc)
 
     def on_memory_write(
         self,

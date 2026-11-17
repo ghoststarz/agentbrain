@@ -62,6 +62,92 @@ def _extract_section(markdown: str, heading_pattern: str) -> str:
     return "\n".join(captured).strip()
 
 
+_TARGET_FRAMES = {
+    "antigravity": "Antigravity CLI",
+    "codex": "Codex CLI",
+    "hermes": "Hermes Agent",
+}
+
+
+def _identity_intro(markdown: str, target: str) -> str:
+    """取 SOUL 开头的自我陈述段落（`# SOUL` 之后、第一个 `##` 之前），换掉框架名。
+
+    这段话是人格的「我是谁」，比特质列表重要得多：没有它，另一端拿到的是
+    一张形容词清单，读起来像个通用助手而不是某个人。
+    """
+    body = markdown
+    m = re.search(r"^#\s*SOUL\s*$", markdown, re.MULTILINE)
+    if m:
+        body = markdown[m.end():]
+    # 自我陈述没有标题，就是第一个 `##` 之前的那几段
+    block = re.split(r"^##\s+", body, maxsplit=1, flags=re.MULTILINE)[0].strip()
+    if not block:
+        return ""
+    frame = _TARGET_FRAMES.get(target, target)
+    # 「运行于 Hermes Agent框架」这类句子换了端就是错的，必须改写而不是照抄
+    block = re.sub(
+        r"运行于\s*[^，。,.\n]{0,24}框架",
+        f"运行于 {frame} ",
+        block,
+    )
+    block = re.sub(r"你是用户日常使用的主agent", "你是用户日常使用的主 agent", block)
+    return block
+
+
+def build_identity_block(soul_path: Path, target: str = "codex", max_chars: int = 1600) -> str:
+    """渲染跨端身份块：自我陈述 + 特质 + 语气（+ 外观设定）。
+
+    与 `extract_soul_excerpt` 的区别：那个只抓「特质 / 语气」两小节，给 Hermes 的
+    静态预算用；这个优先给「我是谁」，再补特质与语气，总量受 max_chars 约束。
+    """
+    if not soul_path.exists():
+        return "(SOUL 未配置)"
+    try:
+        raw = soul_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "(SOUL 未配置)"
+    if not raw:
+        return "(SOUL 未配置)"
+
+    parts: list[str] = []
+    intro = _identity_intro(raw, target)
+    if intro:
+        parts.append(intro)
+
+    traits = _extract_section(raw, r"^###\s*特质")
+    if traits:
+        parts.append(traits)
+    tone = _extract_section(raw, r"^###\s*语气")
+    if tone:
+        parts.append(tone)
+
+    combined = "\n\n".join(parts).strip()
+    if not combined:
+        # 兜底：老格式（只有 ## 人格 没有小节）
+        persona = _extract_section(raw, r"^##\s*人格")
+        combined = persona or raw
+
+    # 外观只在预算还剩很多时才带，它属于「形象」不属于「行为」
+    appearance = _extract_section(raw, r"^###\s*外观")
+    if appearance and len(combined) + len(appearance) + 2 <= max_chars:
+        combined = combined + "\n\n" + appearance
+
+    return _truncate_on_sentence(combined, max_chars)
+
+
+def _truncate_on_sentence(text: str, max_chars: int) -> str:
+    """按句子边界截断，宁可少一句也不要吐半句话。"""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    head = text[:max_chars]
+    cut = max(head.rfind(c) for c in "。！？\n")
+    if cut > max_chars // 3:
+        return head[: cut + 1].rstrip()
+    return head.rstrip() + "…"
+
+
 def extract_soul_excerpt(soul_path: Path, max_chars: int = 600) -> str:
     """从 SOUL.md 摘录「人格 + 语气」小节（<=600 字）；缺失则返回占位符。"""
     if not soul_path.exists():
@@ -113,7 +199,13 @@ def render_boot(config: AppConfig, target: str = "codex") -> dict[str, Any]:
     rev = get_current_revision(config)
     header = f"[SHARED_BRAIN profile={config.memory.profile} rev={rev}]"
 
-    soul_text = extract_soul_excerpt(config.broker.soul_path, max_chars=600)
+    if clean_target == "hermes":
+        # Hermes 自带 SOUL.md，这里只给一小段摘要，避免同一份人格注入两遍
+        soul_text = extract_soul_excerpt(config.broker.soul_path, max_chars=600)
+    else:
+        # 其它 harness 只靠这个文件认识「我是谁」：必须含自我陈述，不能只给特质清单
+        soul_budget = int(inject_cfg.get("soul_chars", 1600))
+        soul_text = build_identity_block(config.broker.soul_path, target=clean_target, max_chars=soul_budget)
     hot_text = read_hot_memory(config, max_chars=min(1500, config.memory.hot_max_chars))
 
     open_tasks = list_open_handoffs(config, limit=3)

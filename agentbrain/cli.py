@@ -51,6 +51,16 @@ def _cmd_reindex(config: AppConfig) -> int:
         f"chunks={stats.total_chunks}, links={stats.total_links}, "
         f"converged_facts={stats.converged_facts}, revision={stats.revision}"
     )
+    # 手改结构化文件（HOT.md / 项目页）后只能靠 reindex 生效——这也是「内容变了」的
+    # 确切信号之一，所以顺手把 agy 的规则文件刷到最新，别让 agy 继续读旧快照。
+    try:
+        from agentbrain.agy_rules import sync_agy_rules
+
+        res = sync_agy_rules(config)
+        if res.get("changed"):
+            print(f"agy 规则文件已刷新：{res['path']} ({res['chars']} 字)")
+    except Exception as exc:  # noqa: BLE001 —— 刷不了也不该让索引失败
+        print(f"WARN: agy 规则同步失败（忽略）：{exc}")
     return 0
 
 
@@ -158,6 +168,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="环境与 SOUL 漂移诊断")
     p_agy = sub.add_parser("sync-agy", help="把身份与热记忆写进 agy 的全局规则文件")
     p_agy.add_argument("--target", default="antigravity", help="渲染目标（默认 antigravity）")
+
+    sub.add_parser("review-status", help="查看主动评审调度脱敏状态（不含原文）")
+    sub.add_parser("review-tick", help="执行一次夜间窗口检查与可选 IDE 增量扫描")
+    sub.add_parser("review-catchup", help="显式从头补录配置中的 agy_ide_roots 历史")
+
+    p_rrun = sub.add_parser("review-run", help="运行一次主动评审 worker（支持 dry-run 与导出提示词）")
+    p_rrun.add_argument("--dry-run", action="store_true", help="试运行：校验但不写入 Vault")
+    p_rrun.add_argument("--export-prompts", default="", help="导出待评审任务提示词到此目录（不调用模型）")
+
+    p_rcli = sub.add_parser("review-cli-event", help="显式记录 agy CLI 参考事件（不计入人类轮次）")
+    p_rcli.add_argument("--session-id", required=True, help="会话 ID")
+    p_rcli.add_argument("--content", default="", help="事件文本内容")
+    p_rcli.add_argument("--file", default="", help="从文件读取事件内容")
+    p_rcli.add_argument("--event-id", default="", help="可选显式 event_id")
+
     register_serve_subparsers(sub)
     return parser
 
@@ -190,6 +215,87 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"写入 {res['path']}（{res['chars']} 字，changed={res['changed']}）")
         if res["backed_up"]:
             print("检测到非本工具生成的内容，已备份为 .md.bak-agentbrain")
+        return 0
+    if args.command == "review-status":
+        from agentbrain.proactive import ProactiveStore
+
+        store = ProactiveStore.from_app_config(config)
+        st = store.get_status()
+        st["adapters"] = store.list_adapter_cursors()
+        st["runner"] = store.get_adapter_cursor("proactive_runner", "status") or {
+            "last_error": None,
+            "unavailable_sources": [],
+        }
+        st["enabled"] = bool(config.memory.proactive.enabled)
+        print(json.dumps(st, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "review-tick":
+        if not config.memory.proactive.enabled:
+            print(json.dumps({"enabled": False, "skipped": True}, ensure_ascii=False, indent=2))
+            return 0
+        from agentbrain.proactive import ProactiveStore
+        from agentbrain.proactive_adapters import scan_agy_ide_roots
+
+        store = ProactiveStore.from_app_config(config)
+        ide = None
+        if config.memory.proactive.agy_ide_enabled and config.memory.proactive.agy_ide_roots:
+            ide = scan_agy_ide_roots(store, config.memory.proactive.agy_ide_roots, catchup=False)
+        tick = store.tick()
+        print(json.dumps({
+            "tick": tick.__dict__,
+            "ide": ide.__dict__ if ide else None,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "review-catchup":
+        if not config.memory.proactive.enabled:
+            print(json.dumps({"error": "proactive_disabled", "detail": "proactive.enabled 为 false"}, ensure_ascii=False))
+            return 1
+        from agentbrain.proactive import ProactiveStore
+        from agentbrain.proactive_adapters import scan_agy_ide_roots
+
+        store = ProactiveStore.from_app_config(config)
+        ide = scan_agy_ide_roots(store, config.memory.proactive.agy_ide_roots, catchup=True)
+        tick = store.tick(include_historical=True)
+        print(json.dumps({
+            "catchup": True,
+            "ide": ide.__dict__,
+            "tick": tick.__dict__,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "review-run":
+        from agentbrain.proactive import ProactiveStore
+        from agentbrain.proactive_runner import export_review_prompts
+        from agentbrain.proactive_worker import run_worker_once
+
+        store = ProactiveStore.from_app_config(config)
+        if args.export_prompts:
+            files = export_review_prompts(config, store, Path(args.export_prompts))
+            print(json.dumps({"exported": [str(f) for f in files]}, ensure_ascii=False, indent=2))
+            return 0
+        if not config.memory.proactive.enabled:
+            print("proactive.enabled 为 false，已拒绝运行模型评审（无网络调用）。")
+            return 1
+        res = run_worker_once(config, store, dry_run=bool(args.dry_run))
+        print(json.dumps(res.__dict__ if res else {"status": "idle"}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "review-cli-event":
+        if not config.memory.proactive.enabled:
+            print(json.dumps({"error": "proactive_disabled", "detail": "proactive.enabled 为 false"}, ensure_ascii=False))
+            return 1
+        from agentbrain.proactive import ProactiveStore
+        from agentbrain.proactive_adapters import ingest_cli_reference_event
+
+        content = args.content
+        if args.file:
+            content = Path(args.file).read_text(encoding="utf-8")
+        store = ProactiveStore.from_app_config(config)
+        res = ingest_cli_reference_event(
+            store,
+            session_id=args.session_id,
+            content=content,
+            event_id=args.event_id or None,
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
     serve_rc = dispatch_serve_command(config, args)
     if serve_rc is not None:

@@ -20,7 +20,7 @@ Hermes、Codex、Antigravity 这类 CLI/agent 各自只有自己那份会话记�
 
 ## 架构走一遍
 
-1. **接入层**：`server.py` 起标准库 HTTP 服务（默认 `127.0.0.1:18765`，只绑本地），`mcp_server.py` 起 MCP stdio 服务给 Codex / Antigravity 用；`agy_rules.py` 是第三条通道——把身份与热记忆渲染进 `~/.gemini/GEMINI.md`，因为 agy 每次会话都会读这个文件。
+1. **接入层**：`server.py` 起标准库 HTTP 服务（默认 `127.0.0.1:18765`，只绑本地），`mcp_server.py` 起 MCP stdio 服务给 Codex / Antigravity 用；`agy_rules.py` 是第三条通道——把身份与热记忆渲染进 `~/.gemini/GEMINI.md`（路径可用 `broker.yaml` 的 `agy_rules_path` 覆盖，且只有 `role: primary` 才写），因为 agy 每次会话都会读这个文件。渲染的身份块含**自我陈述 + 特质 + 语气 + 外观**（不是只有特质清单），并把「运行于 X 框架」按端改写；文件里还带一行「今日日记」条数状态。该文件在服务启动时刷一次，之后**任一写操作（`memory_write` / `handoff_upsert` / `diary_append`）改变 revision 就立即重渲染**（文件级 diff，变了才写），所以 agy 下次开会话拿到的是最新热记忆，而不是上个阶段的快照。
 2. **鉴权**：`tokens.json` 只存 token 的 sha256，`Bearer` → `client_id` → `memory.yaml` 里的 `domain` 与 `can_casual`。私账读取额外受 `diary.gate` 约束。
 3. **服务层** `BrokerService`：`boot` / `delta` / `search` / `read` / `write` / `handoff` / `diary` 七个动作，写入走"原子替换 + 重新索引"。
 4. **内核**：`parse.py` 解析 frontmatter 与 `[[wikilink]]`（含类型化关系），`segment.py` 做 CJK 重叠二元组，`index.py` 维护 FTS5 增量索引与事实键收敛，`retrieve.py` 做证据打分 + 1 跳图谱扩散 + 预算裁剪，`render.py` 负责三段渲染。
@@ -76,7 +76,7 @@ python -m agentbrain sync-agy                              # 重渲染 ~/.gemini
 | GET | `/v1/status` | 索引计数、revision、索引年龄 |
 | POST | `/v1/boot` | 启动块：人格摘要 + 协议 + 热记忆，按 `inject.<client>.boot_chars` 裁剪 |
 | POST | `/v1/delta` | 自某个 revision 以来的增量块 |
-| POST | `/v1/search` | FTS5 + 1 跳图谱扩散检索 |
+| POST | `/v1/search` | FTS5 + 1 跳图谱扩散检索；响应附带 `diary_today`（今日公/私账条数与最后作者，不含正文） |
 | POST | `/v1/read` | 读整篇笔记或指定标题块 |
 | POST | `/v1/write` | 原子写入笔记并重新索引 |
 | POST | `/v1/handoff` | 读/写结构化接力卡 |
@@ -90,7 +90,8 @@ python -m agentbrain sync-agy                              # 重渲染 ~/.gemini
 
 MCP 是"agent 主动来查"的通道，Hermes 需要的是"每轮自动送过去"。这两种语义不一样，所以仓库里另带一份 Hermes 插件：[`integrations/hermes/obsidian-broker/`](integrations/hermes/obsidian-broker/)——单文件、无第三方依赖的 `MemoryProvider` 实现：
 
-- `prefetch` 在每次用户输入前打 `POST /v1/search`，命中注入成 `[MEMORY_PREFETCH]` 块（1200 字硬顶，revision 变了多带一行 delta）；
+- `prefetch` 在每次用户输入前打 `POST /v1/search`，命中注入成 `[MEMORY_PREFETCH]` 块（1200 字硬顶，revision 变了多带一行 delta）；无论有没有命中，还会带一行 `[DIARY] 公账 N 条｜私账 M 条` —— 只报条数与作者，正文永不注入。这是「今天日记写了没」唯一的常驻提示，习惯靠它而不是靠临场想起；
+- `system_prompt_block` 给出静态协议（含日记约定与「闲聊不套任务纪律语态」），这是每轮都在上下文里的那一层；
 - `on_pre_compress` 在上下文压缩前把当前任务 upsert 成 `handoff` 槽位，压缩后不丢线；
 - `get_tool_schemas` 返回空——不往会话里塞额外工具面；
 - 每个钩子 fail-open，broker 没起时静默降级，对话不受影响。
@@ -111,7 +112,7 @@ MCP 是"agent 主动来查"的通道，Hermes 需要的是"每轮自动送过去
 
 ## 三条安全边界
 
-1. **索引层排除**：`30_Diary`（只写不读的账本，唯一读取路径是受 gate 控制的 `diary_read`）与 `50_Inbox/new`（不可信外来卡片，必须先人工处理进 `done`）在扫描阶段硬排除。
+1. **索引层排除**：`30_Diary`（只写不读的账本，唯一读取路径是受 gate 控制的 `diary_read`）、`90_Archive` 与 `50_Inbox/new`（已下线功能的遗留安全护栏）在扫描阶段硬排除。
 2. **鉴权**：`tokens.json` 只存哈希，映射到 `client_id` 后按 `memory.yaml` 的 `domain` / `can_casual` 判权。
 3. **审计**：每次调用记 `client / tool / scope / allowed / digest`，落在运行时的 `audit/` 目录下。
 
@@ -132,6 +133,13 @@ agentbrain/            内核与服务
 ├── handoff.py         接力卡（handoff.json）读写
 ├── agy_rules.py       渲染 ~/.gemini/GEMINI.md
 ├── atomic.py          原子写 + 跨进程文件锁
+├── proactive.py       主动整理调度核心（事件/分块/窗口/租约）
+├── proactive_adapters.py  Hermes / agy IDE / CLI 事件适配器
+├── proactive_hermes.py    Hermes 运行时发现与安全桥接调用
+├── proactive_worker.py    后台评审分段、模型路由与投影调度
+├── proactive_apply.py     受限操作校验与原子投影写入
+├── proactive_runner.py    单写者耐久租约后台循环
+├── integrations/      随包发布的桥接脚本（hermes_review_bridge.py）
 ├── serve.py           serve / mcp-stdio 子命令
 └── cli.py             命令行入口
 
@@ -150,25 +158,34 @@ memory.yaml            记忆域策略
 10_Working/            HOT.md 热记忆（硬顶字数）、.state/handoff.json 接力卡
 20_LongTerm/           Projects / Decisions / Facts / Entities / MOC
 30_Diary/              Public 公账、Private 私账（不进索引）
-50_Inbox/              new 待处理（不进索引）、done 已归档
 ```
 
 ## 测试
 
 ```bash
 pip install -e ".[dev]"
-pytest -q                     # 58 passed, 4 skipped（插件测试默认跳过）
+pytest -q                                                                 # 102 passed, 8 skipped（插件测试默认跳过）
+AGENTBRAIN_PLUGIN_PATH=integrations/hermes/obsidian-broker/__init__.py pytest -q  # 110 passed
 ```
 
-默认 58 项通过、4 项跳过——跳过的是 Hermes 插件侧的 prefetch 测试，插件不在本仓库。把 `AGENTBRAIN_PLUGIN_PATH` 指向插件的 `__init__.py` 后这 4 项也会跑，共 62 项。
+默认 102 项通过、8 项跳过——跳过的是 Hermes 插件侧的 prefetch 与 outbox 测试。把 `AGENTBRAIN_PLUGIN_PATH` 指向 [`integrations/hermes/obsidian-broker/__init__.py`](integrations/hermes/obsidian-broker/__init__.py) 后全部 110 项都会运行。
 
 其中一组是隔离性回归：日记写入后检索 0 命中、启动块不含日记、`reindex` 后笔记数不因日记增长。
+
+## 主动记忆整理（Proactive Review，默认关闭）
+
+在 `memory.yaml` 中显式开启 `proactive.enabled: true` 后，broker 可在后台按**每 5 轮人类对话增量触发**与**本地 23:00 夜间窗口**整理对话证据并受限投影到长期记忆与日记：
+
+- **默认复用 Hermes 框架路由**：通过随包发布的隔离桥接脚本（[`agentbrain/integrations/hermes_review_bridge.py`](agentbrain/integrations/hermes_review_bridge.py)）发现 Hermes 受管 Python（`installs/*/facts.json`），以 `HERMES_DISABLE_LAZY_INSTALLS=1`、无工具、纯结构化 JSON 模式调用 `agent.auxiliary_client.call_llm(task="background_review", ...)`，复用 `auxiliary.background_review` 或主 profile 模型与框架鉴权，无需额外配置端点或密钥（也保留可选 `model_backend: "openai_compatible"` 向后兼容）。
+- **多源基线采集**：支持 Hermes `obsidian-broker` 插件持久化 outbox、可选 `agy` IDE `transcript.jsonl` 增量扫描（首次默认从 EOF 建立基线，不追溯历史），以及 `review-cli-event`。
+- **受限安全投影**：只允许 `longterm_upsert` / `project_update` / `hot_update` / `handoff_upsert` / `diary_append` / `no_change`，禁止修改 `SOUL.md` / `USER.md` / `RULES.md` 与配置文件，并发冲突由 `expected_hash` 拦截，详情见 [`docs/proactive-stage2-handoff.md`](docs/proactive-stage2-handoff.md)。
 
 ## 已知边界
 
 - Windows 优先：文件锁走 `msvcrt`，脚本是计划任务；POSIX 分支有实现但未实测。
 - 单人单机单 vault：没有冲突合并协议，两个 broker 同时写同一 vault 没有保护。
 - `integrations/hermes/obsidian-broker/` 只依赖 HTTP 契约，不 import broker 的包；契约变了必须两边一起改，这是唯一的耦合点。本机是通过目录联接（junction）把 profile 的 plugins 目录指到这里的，删掉仓库那份插件就会一起消失。
+- 已完成一次真实 Hermes 框架模型桥接调用（无记忆写入），并在本机启用采集、建立 IDE 历史尾随基线；真实五轮写入质量与 23:00 跨夜触发仍待持续验证。
 - Codex 侧接线已就位，但受其自身模型配置限制。
 
 ## License

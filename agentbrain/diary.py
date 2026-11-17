@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from pathlib import Path
 from typing import Any
 
+from agentbrain.acl import display_client_id
 from agentbrain.atomic import atomic_write_text
 from agentbrain.config import AppConfig
 
@@ -53,7 +55,8 @@ def append_diary(
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / f"{date_str}.md"
 
-    tag = f" ({author})" if author else ""
+    clean_author = display_client_id(author)
+    tag = f" ({clean_author})" if clean_author else ""
     line = f"- [{time_str}]{tag} {clean_content}\n"
 
     if target_file.exists():
@@ -72,6 +75,49 @@ def append_diary(
         "date": date_str,
         "path": str(target_file),
     }
+
+
+def today_diary_status(config: AppConfig, ledger: str = "public") -> dict[str, Any]:
+    """返回今日某账本的条数与最后一条的作者/时间——只给元信息，绝不给正文。
+
+    用途：让客户端每轮都能看见「今天这栏我还没写」，把记日记从「临场想起来」
+    变成「机制里一直在提示」。正文永远不进上下文，日记仍排除在检索索引之外。
+    """
+    clean_ledger = str(ledger or "").strip().lower()
+    target_dir = _ledger_dir(config, clean_ledger)
+    today = dt.date.today().isoformat()
+    today_file = target_dir / f"{today}.md"
+
+    status: dict[str, Any] = {
+        "ledger": clean_ledger,
+        "date": today,
+        "count": 0,
+        "last_time": "",
+        "last_author": "",
+    }
+    if not today_file.exists():
+        return status
+
+    try:
+        raw = today_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return status
+
+    count = 0
+    last_time = ""
+    last_author = ""
+    # 行格式：- [HH:MM:SS] (client_id) 正文
+    line_re = re.compile(r"^-\s*\[(\d{2}:\d{2}:\d{2})\]\s*(?:\(([^)]*)\))?")
+    for line in raw.splitlines():
+        m = line_re.match(line.strip())
+        if not m:
+            continue
+        count += 1
+        last_time = m.group(1)
+        last_author = display_client_id(m.group(2) or "")
+
+    status.update({"count": count, "last_time": last_time, "last_author": last_author})
+    return status
 
 
 def read_diary(

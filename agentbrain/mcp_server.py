@@ -70,7 +70,13 @@ def create_mcp_server(config: AppConfig, client_id: str = "codex") -> MCPServer:
 
     @mcp.tool(name="memory_search", description="Search memory notes with FTS5 + 1-hop graph expansion", annotations=_ro)
     def memory_search(query: str, k: int = 5, hops: int = 1) -> str:
-        return _to_json(service.search({"query": query, "k": k, "hops": hops}))
+        return _to_json(
+            service.search(
+                {"query": query, "k": k, "hops": hops},
+                client_id=identity.client_id,
+                can_casual=identity.can_casual,
+            )
+        )
 
     @mcp.tool(name="memory_read", description="Read a note or specific heading block from the vault", annotations=_ro)
     def memory_read(note: str, block: str | None = None) -> str:

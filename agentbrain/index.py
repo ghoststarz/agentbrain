@@ -167,8 +167,9 @@ def init_db(config: AppConfig) -> Path:
 # 永不进入检索索引的目录（相对 profile 根）。
 # 30_Diary：只写不读的账本，只能经 diary_read 读取（受 gate 控制），
 #           一旦被索引就会通过 search / prefetch 漏进模型上下文。
-# 50_Inbox/new：外来卡片，内容不可信，绝不能参与检索与注入。
-NEVER_INDEX_DIRS = ("30_Diary", "50_Inbox/new")
+# 50_Inbox/new：已下线功能的遗留安全护栏，防止旧目录或外部误放的未审卡片参与检索与注入。
+# 90_Archive：已退役的内容。保留是为了"不硬删"，但它的语义就是不该再被检索到。
+NEVER_INDEX_DIRS = ("30_Diary", "50_Inbox/new", "90_Archive")
 
 
 def _iter_profile_markdowns(profile_dir: Path) -> list[Path]:

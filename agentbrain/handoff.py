@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from agentbrain.acl import display_client_id
 from agentbrain.atomic import atomic_write_json
 from agentbrain.config import AppConfig
 
@@ -89,7 +90,7 @@ def upsert_handoff(
         "next_steps": _normalize_str_list(next_steps),
         "touched_files": _normalize_str_list(touched_files),
         "updated_at": now_iso,
-        "updated_by": updated_by,
+        "updated_by": display_client_id(updated_by),
     }
     data["tasks"][clean_key] = entry
     atomic_write_json(handoff_path(config), data)
