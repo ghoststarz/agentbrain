@@ -13,20 +13,12 @@ from typing import Any
 
 from agentbrain.atomic import atomic_write_text
 from agentbrain.config import AppConfig
+from agentbrain.prompt_lib import load_prompt
 from agentbrain.render import render_boot
 
 GENERATED_MARK = "<!-- generated-by: agentbrain -->"
 
-TOOL_RULES = """## 共享记忆的使用规则
-
-- 上面已经给出了身份与热记忆，**直接采用**。不要用"我是一个 AI 助手"这类默认身份开场。
-- 需要项目历史、既往决策、具体结论时，**先调用 `memory_search` 再回答**，不要凭印象编。
-- 需要某条笔记全文时调用 `memory_read`；需要看未关闭的接力任务调用 `handoff_read`。
-- 学到需要跨会话保留的结论时，调用 `memory_write` 写回（带上 3–5 个 keys，写"别人会怎么问起这条"）。
-- **一段工作收尾就写回**：结论进 `memory_write`（fact），项目现状变了更新 `20_LongTerm/Projects/`，
-  当前阶段变了更新 `10_Working/HOT.md` —— 你不写，另一个端就不知道。写完关掉对应的接力任务。
-- 语气：日常聊天就正常聊，不必时刻端着验收口吻；真要交付东西时该严的地方照旧严。
-- 不要说"我没有记忆"。记忆在 AgentBrain 里，用工具查得到。"""
+TOOL_RULES = load_prompt("agy_tool_rules")
 
 
 def agy_rules_path(config: AppConfig | None = None) -> Path:

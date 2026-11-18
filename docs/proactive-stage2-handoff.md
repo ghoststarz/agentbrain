@@ -4,6 +4,18 @@
 
 ---
 
+## 0. 提示词放在哪（可手改，不必重启）
+
+| 文件 | 作用 |
+| --- | --- |
+| `agentbrain/prompt_assets/review_system.md` | 复盘主提示词：5 轮增量与 23:00 夜间**共用这一份** |
+| `agentbrain/prompt_assets/review_retry_compact.md` | 模型输出被截断时的重试指令 |
+| `agentbrain/prompt_assets/agy_tool_rules.md` | 写进 `~/.gemini/GEMINI.md` 的 agy 记忆规则（改后跑 `agentbrain sync-agy`） |
+
+加载器 `agentbrain/prompt_lib.py` 按 `mtime + size` 热读取：改 md 后下一次复盘立即生效，无需重启 broker；
+文件缺失或为空会抛 `PromptAssetError`，不会静默退化成空提示词。
+`~/.gemini/GEMINI.md` 是生成物，请勿手改——改上面的 md，再 `agentbrain sync-agy`。
+
 ## 1. 离线已测 vs 真实环境未测边界
 
 ### 已在离线隔离环境验证

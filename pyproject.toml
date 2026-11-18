@@ -28,3 +28,7 @@ agentbrain = "agentbrain.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agentbrain*"]
+
+[tool.setuptools.package-data]
+# 提示词以 md 分发，供用户直接手改（改了即时生效，无需重启服务）。
+agentbrain = ["prompt_assets/*.md"]
