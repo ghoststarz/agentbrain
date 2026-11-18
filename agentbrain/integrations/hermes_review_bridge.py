@@ -86,7 +86,7 @@ def _extract_jsonl_operations(text: str) -> dict[str, Any] | None:
             continue
         if str(obj.get("outcome") or "").strip().lower() == "no_change":
             saw_no_change = True
-        if "op_type" in obj:
+        if str(obj.get("op_type") or "").strip():
             ops.append(obj)
         elif isinstance(obj.get("operations"), list):
             ops.extend([o for o in obj["operations"] if isinstance(o, dict)])
@@ -102,12 +102,13 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
     try:
         obj = json.loads(cleaned)
     except json.JSONDecodeError:
+        # 多行 JSONL 先按行抢救（截断只丢最后一行），再退回整体修补。
+        salvaged = _extract_jsonl_operations(cleaned)
+        if salvaged is not None:
+            return salvaged
         try:
             return _repair_truncated_json(cleaned)
         except ValueError:
-            salvaged = _extract_jsonl_operations(cleaned)
-            if salvaged is not None:
-                return salvaged
             raise
     if not isinstance(obj, dict):
         raise ValueError("Model response JSON is not an object")
@@ -133,6 +134,28 @@ def _write_result(stream, payload: dict[str, Any]) -> None:
     else:  # pragma: no cover - buffer 一定存在，仅作兜底
         stream.write(data.decode("utf-8"))
         stream.flush()
+
+
+def _normalize_batch(parsed_content: dict[str, Any]) -> dict[str, Any]:
+    """把模型输出收敛成下游可校验的批次形状，并丢掉空操作占位。"""
+    if not isinstance(parsed_content, dict):
+        return parsed_content
+    if "outcome" not in parsed_content:
+        if str(parsed_content.get("op_type") or "").strip():
+            parsed_content = {"outcome": "operations", "operations": [parsed_content]}
+        elif isinstance(parsed_content.get("operations"), list):
+            parsed_content = {"outcome": "operations", "operations": parsed_content["operations"]}
+    if isinstance(parsed_content.get("operations"), list):
+        cleaned_ops = [
+            o
+            for o in parsed_content["operations"]
+            if isinstance(o, dict) and str(o.get("op_type") or "").strip()
+        ]
+        if cleaned_ops:
+            parsed_content = {"outcome": "operations", "operations": cleaned_ops}
+        elif str(parsed_content.get("outcome") or "").lower() != "no_change":
+            parsed_content = {"outcome": "no_change", "operations": []}
+    return parsed_content
 
 
 def main() -> int:
@@ -193,14 +216,7 @@ def main() -> int:
             route_info=route_info,
         )
         raw_content = extract_content_or_reasoning(response) or ""
-        parsed_content = _extract_json_object(str(raw_content))
-        # 模型常直接吐单个操作对象（JSONL 风格），这里统一收敛成带 outcome 的批次形状，
-        # 否则下游整批校验会判为「缺少 outcome」而白白丢弃一条真实操作。
-        if isinstance(parsed_content, dict) and "outcome" not in parsed_content:
-            if "op_type" in parsed_content:
-                parsed_content = {"outcome": "operations", "operations": [parsed_content]}
-            elif isinstance(parsed_content.get("operations"), list):
-                parsed_content = {"outcome": "operations", "operations": parsed_content["operations"]}
+        parsed_content = _normalize_batch(_extract_json_object(str(raw_content)))
         result = {
             "ok": True,
             "content": parsed_content,

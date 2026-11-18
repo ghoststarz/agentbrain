@@ -211,6 +211,9 @@ def call_hermes_framework_model(
 
     proc_timeout = max(5.0, float(cfg.model_timeout_seconds) + 5.0)
     cmd = [str(hermes_python), "-I", str(bridge_path)]
+    # 父进程是 pythonw（无控制台）。若子进程是控制台程序又不指定 CREATE_NO_WINDOW，
+    # Windows 会给它新开一个控制台窗口——复盘每触发一次就闪一个空白 cmd/终端窗口。
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
         completed = subprocess.run(
             cmd,
@@ -223,6 +226,7 @@ def call_hermes_framework_model(
             errors="replace",
             timeout=proc_timeout,
             check=False,
+            creationflags=creationflags,
         )
     except subprocess.TimeoutExpired as exc:
         raise HermesBridgeError(
