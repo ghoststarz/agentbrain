@@ -244,10 +244,10 @@ def test_service_write_never_touches_real_home_gemini(
     assert after == before, "测试用例写到了真实的 ~/.gemini/GEMINI.md"
 
 
-def test_agy_rules_carry_identity_and_diary_status(
+def test_agy_rules_carry_identity_without_diary_noise(
     stage2_env: tuple[AppConfig, Path, str]
 ) -> None:
-    """agy 那份文件必须带「我是谁」的自我陈述与今日日记状态。"""
+    """agy 那份文件必须带「我是谁」的自我陈述，且不再注入今日日记计数与习惯催促。"""
     from agentbrain import agy_rules
 
     cfg, _, _ = stage2_env
@@ -263,22 +263,24 @@ def test_agy_rules_carry_identity_and_diary_status(
     assert "你是 Testy" in text, "身份块丢了自我陈述，只剩特质清单"
     assert "Hermes Agent框架" not in text, "框架名没按端改写"
     assert "Antigravity CLI" in text
-    assert "## 今日日记" in text and "公账 1 条" in text
+    assert "## 今日日记" not in text
+    assert "公账 1 条" not in text
     assert "今天聊了会儿" not in text, "日记正文不该进规则文件"
 
 
-def test_agy_rules_nudge_when_diary_empty(stage2_env: tuple[AppConfig, Path, str]) -> None:
-    """公账还空着时，状态行要直接把「该记一笔」写在脸上。"""
+def test_agy_rules_has_no_diary_nudge_when_empty(stage2_env: tuple[AppConfig, Path, str]) -> None:
+    """公账为空时也不应出现逐轮/每次会话催记日记的静态块。"""
     from agentbrain import agy_rules
 
     cfg, _, _ = stage2_env
     text = agy_rules.build_agy_rules(cfg, target="antigravity")
-    assert "公账 0 条" in text
-    assert "今天还没有一条" in text
+    assert "## 今日日记" not in text
+    assert "公账 0 条" not in text
+    assert "今天还没有一条" not in text
 
 
-def test_diary_append_refreshes_agy_status_line(stage2_env: tuple[AppConfig, Path, str]) -> None:
-    """写完日记，agy 那份文件里的「今日日记」必须立刻更新——否则另一端看到的是旧条数。"""
+def test_diary_append_does_not_leak_diary_status_to_agy_rules(stage2_env: tuple[AppConfig, Path, str]) -> None:
+    """写完日记后，agy 规则文件不得包含日记正文或今日日记计数块。"""
     from agentbrain.server import BrokerService
     from agentbrain.acl import AuthIdentity
 
@@ -287,11 +289,8 @@ def test_diary_append_refreshes_agy_status_line(stage2_env: tuple[AppConfig, Pat
     ident = AuthIdentity(client_id="antigravity", domain="work")
 
     BrokerService(cfg).diary({"action": "append", "ledger": "public", "content": "第一条"}, identity=ident)
-    assert "公账 1 条" in target.read_text(encoding="utf-8")
-
-    BrokerService(cfg).diary({"action": "append", "ledger": "public", "content": "第二条"}, identity=ident)
     text = target.read_text(encoding="utf-8")
-    assert "公账 2 条" in text
+    assert "## 今日日记" not in text
     assert "第一条" not in text, "日记正文不该进规则文件"
 
 
@@ -456,7 +455,8 @@ def test_hermes_display_source_decoupled_from_client_acl(
 
     codex_ident = AuthIdentity(client_id="codex", domain="work", can_casual=False)
     svc.diary({"action": "append", "ledger": "public", "content": "Codex 公账"}, identity=codex_ident)
-    assert svc.diary_status(can_casual=False)["public"]["last_author"] == "codex"
+    # 日记署名只允许 hermes / antigravity；其它来源统一归到 hermes。
+    assert svc.diary_status(can_casual=False)["public"]["last_author"] == "hermes"
     svc.handoff(
         {"action": "upsert", "task_key": "codex:t1", "status": "open", "summary": "s"},
         identity=codex_ident,

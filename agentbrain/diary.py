@@ -25,6 +25,20 @@ def _ledger_dir(config: AppConfig, ledger: str) -> Path:
     raise ValueError(f"不支持的 ledger 类型: {ledger!r}（仅支持 public / private）")
 
 
+def normalize_diary_author(raw: str) -> str:
+    """日记署名只允许 hermes / antigravity 两种来源。
+
+    签名分歧（hermes:lily / proactive / agy_ide ...）会让同一份账本看起来像多人手写，
+    而账本本来就是两个客户端的流水视图。未知来源统一记为 hermes（Hermes 侧的主导者）。
+    """
+    clean = str(raw or "").strip().lower()
+    if not clean:
+        return "hermes"
+    if clean.startswith(("antigravity", "agy")):
+        return "antigravity"
+    return "hermes"
+
+
 def _check_gate(config: AppConfig, ledger: str, *, can_casual: bool = False) -> None:
     if str(ledger).strip().lower() == "private" and config.memory.diary_gate and not can_casual:
         raise DiaryGateError("private diary gate is enabled")
@@ -55,7 +69,7 @@ def append_diary(
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / f"{date_str}.md"
 
-    clean_author = display_client_id(author)
+    clean_author = normalize_diary_author(author)
     tag = f" ({clean_author})" if clean_author else ""
     line = f"- [{time_str}]{tag} {clean_content}\n"
 

@@ -12,7 +12,13 @@ from typing import Any
 
 from agentbrain.config import AppConfig
 from agentbrain.proactive import ProactiveStore
-from agentbrain.proactive_adapters import IdeScanReport, scan_agy_ide_roots
+from agentbrain.proactive_adapters import (
+    HermesStateDbScanReport,
+    IdeScanReport,
+    resolve_hermes_statedb_path,
+    scan_agy_ide_roots,
+    scan_hermes_statedb,
+)
 from agentbrain.proactive_clock import Clock, SystemClock, ensure_utc
 from agentbrain.proactive_redaction import redact_secrets
 from agentbrain.proactive_worker import run_worker_once, segment_job_prompts
@@ -38,13 +44,38 @@ class ProactiveRunner:
         self._lease_token: str | None = None
         self._last_ide_scan_utc: dt.datetime | None = None
         self.last_ide_report: IdeScanReport | None = None
+        self.last_hermes_report: HermesStateDbScanReport | None = None
         self.last_error: str | None = None
 
     def _make_store(self) -> ProactiveStore:
         return ProactiveStore.from_app_config(self.config, clock=self.clock)
 
+    def _log_cycle(self, payload: dict[str, Any]) -> None:
+        """把后台周期结果追加到运行日志（只含计数与错误，不含对话正文）。"""
+        try:
+            log_dir = self.config.broker.log_dir
+            log_dir.mkdir(parents=True, exist_ok=True)
+            record = {"ts": ensure_utc(self.clock.now_utc()).isoformat(), **payload}
+            with (log_dir / "proactive-runner.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def _persist_runner_status(self, store: ProactiveStore) -> None:
         try:
+            hermes_diag: dict[str, Any] | None = None
+            if self.last_hermes_report is not None:
+                hr = self.last_hermes_report
+                hermes_diag = {
+                    "available": hr.available,
+                    "sessions_scanned": hr.sessions_scanned,
+                    "turns_completed": hr.turns_completed,
+                    "events_ingested": hr.events_ingested,
+                    "events_deduped": hr.events_deduped,
+                    "skipped_pre_activation": hr.skipped_pre_activation,
+                    "skipped_excluded": hr.skipped_excluded,
+                    "last_error": hr.last_error,
+                }
             store.set_adapter_cursor(
                 "proactive_runner",
                 "status",
@@ -56,6 +87,7 @@ class ProactiveRunner:
                         if self.last_ide_report is not None
                         else []
                     ),
+                    "hermes_statedb": hermes_diag,
                     "updated_at_utc": ensure_utc(self.clock.now_utc()).isoformat(),
                 },
             )
@@ -108,6 +140,12 @@ class ProactiveRunner:
                 self._last_ide_scan_utc = now_utc
                 self.last_ide_report = ide_report
 
+        hermes_report: HermesStateDbScanReport | None = None
+        hermes_db_path = resolve_hermes_statedb_path(self.config)
+        if hermes_db_path is not None:
+            hermes_report = scan_hermes_statedb(store, hermes_db_path, catchup=False)
+            self.last_hermes_report = hermes_report
+
         tick_res = store.tick()
 
         def _heartbeat() -> bool:
@@ -145,6 +183,9 @@ class ProactiveRunner:
                 "windows_reopened": tick_res.windows_reopened,
             },
             "ide_turns": ide_report.turns_completed if ide_report else 0,
+            "hermes_turns": hermes_report.turns_completed if hermes_report else 0,
+            "hermes_ingested": hermes_report.events_ingested if hermes_report else 0,
+            "hermes_deduped": hermes_report.events_deduped if hermes_report else 0,
             "jobs_processed": processed,
             "events_pruned": pruned,
         }
@@ -162,14 +203,16 @@ class ProactiveRunner:
             poll = max(1, self.config.memory.proactive.worker_poll_seconds)
             while not self._stop_event.is_set():
                 try:
-                    self.run_cycle()
+                    res = self.run_cycle()
                     self.last_error = None
+                    self._log_cycle({"ok": True, "cycle": res})
                 except Exception as exc:  # noqa: BLE001
                     self.last_error = redact_secrets(f"{type(exc).__name__}: {exc}")[:300]
+                    self._log_cycle({"ok": False, "error": self.last_error})
                 try:
                     self._persist_runner_status(self._make_store())
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    self._log_cycle({"ok": False, "persist_error": redact_secrets(f"{type(exc).__name__}: {exc}")[:300]})
                 self._stop_event.wait(poll)
 
         self._thread = threading.Thread(

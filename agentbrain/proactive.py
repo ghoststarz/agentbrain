@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from agentbrain.acl import display_client_id
 from agentbrain.config import AppConfig, ProactiveConfig
 from agentbrain.proactive_clock import (
     Clock,
@@ -33,7 +36,7 @@ from agentbrain.proactive_clock import (
 )
 from agentbrain.proactive_redaction import redact_secrets
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 EVENT_KIND_HUMAN_TURN = "human_turn"
 EVENT_KIND_REFERENCE_ONLY = "reference_only"
@@ -69,6 +72,9 @@ CREATE TABLE IF NOT EXISTS events (
     content TEXT NOT NULL,
     content_truncated INTEGER NOT NULL DEFAULT 0,
     meta_json TEXT NOT NULL DEFAULT '{}',
+    content_hash TEXT,
+    route TEXT,
+    paired_route TEXT,
     UNIQUE(client, session_id, event_id)
 );
 
@@ -176,6 +182,26 @@ CREATE TABLE IF NOT EXISTS proactive_applied_ops (
 );
 CREATE INDEX IF NOT EXISTS idx_proactive_ops_dedupe
     ON proactive_applied_ops(op_type, dedupe_key);
+
+CREATE TABLE IF NOT EXISTS review_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL UNIQUE,
+    client TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    job_type TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    applied_count INTEGER NOT NULL DEFAULT 0,
+    categories_json TEXT NOT NULL DEFAULT '{}',
+    error_summary TEXT,
+    created_at_utc TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL,
+    delivered_at_utc TEXT,
+    delivered_to_client TEXT,
+    delivered_to_session_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_receipts_pending
+    ON review_receipts(delivered_at_utc, client, session_id, id);
 """
 
 
@@ -261,6 +287,39 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _owner_process_alive(owner_id: str) -> bool:
+    """判断租约 owner_id 里的 pid 是否仍存活（owner 形如 pid-1234-abcd1234）。
+
+    只看过期时间不够：进程被重启后旧租约最长还会挡住新实例整整一个 lease_seconds，
+    这期间后台复盘完全停摆。pid 已不存在时应立即允许接管。
+    """
+    raw = str(owner_id or "").strip()
+    if not raw.startswith("pid-"):
+        return True
+    try:
+        pid = int(raw[4:].split("-", 1)[0])
+    except (ValueError, IndexError):
+        return True
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong(0)
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return int(exit_code.value) == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def _chunk_text(text: str, chunk_size: int, max_chunks: int) -> list[str]:
     """将正文无损切分为有界块；超出硬上限时显式拒绝，绝不静默截断。"""
     max_total = chunk_size * max_chunks
@@ -344,6 +403,14 @@ class ProactiveStore:
             self._ensure_baseline(conn)
 
     def _ensure_migrations(self, conn: sqlite3.Connection) -> None:
+        cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+        for col_name in ("content_hash", "route", "paired_route"):
+            if col_name not in cols:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col_name} TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_cross_route "
+            "ON events(client, session_id, content_hash, occurred_at_us)"
+        )
         row = conn.execute(
             "SELECT value FROM scheduler_meta WHERE key = 'schema_version'"
         ).fetchone()
@@ -393,6 +460,7 @@ class ProactiveStore:
         occurred_at: dt.datetime | None = None,
         meta: dict[str, Any] | None = None,
         qualifies_nightly: bool = True,
+        route: str | None = None,
     ) -> IngestResult:
         """事务级写入事件并去重；人类轮次累计满批即创建增量任务。"""
         if event_kind not in VALID_EVENT_KINDS:
@@ -425,6 +493,8 @@ class ProactiveStore:
             self.config.max_payload_chunks,
         )
         primary_content = chunks[0]
+        content_hash = hashlib.sha256(sanitized_content.strip().encode("utf-8")).hexdigest()
+        eff_route = (route or (str(meta.get("route") or "") if isinstance(meta, dict) else "") or "").strip() or None
         meta_json = _bound_meta(meta)
         is_countable = 1 if event_kind == EVENT_KIND_HUMAN_TURN else 0
         nightly_flag = 1 if qualifies_nightly else 0
@@ -448,6 +518,37 @@ class ProactiveStore:
                     completed_human_turns=cnt,
                     created_job_id=None,
                 )
+
+            if eff_route in ("provider", "state_db"):
+                other_route = "state_db" if eff_route == "provider" else "provider"
+                win_lo = occ_us - 120_000_000
+                win_hi = occ_us + 120_000_000
+                paired = conn.execute(
+                    """
+                    SELECT id, turn_seq FROM events
+                    WHERE client = ? AND session_id = ? AND content_hash = ?
+                      AND route = ? AND (paired_route IS NULL OR paired_route = '')
+                      AND occurred_at_us BETWEEN ? AND ?
+                    ORDER BY ABS(occurred_at_us - ?) ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (client, session_id, content_hash, other_route, win_lo, win_hi, occ_us),
+                ).fetchone()
+                if paired is not None:
+                    conn.execute(
+                        "UPDATE events SET paired_route = ? WHERE id = ?",
+                        (eff_route, int(paired["id"])),
+                    )
+                    cnt = self._get_completed_turns(conn, client, session_id)
+                    return IngestResult(
+                        accepted=True,
+                        deduped=True,
+                        excluded=False,
+                        event_row_id=int(paired["id"]),
+                        turn_seq=int(paired["turn_seq"]) if paired["turn_seq"] is not None else None,
+                        completed_human_turns=cnt,
+                        created_job_id=None,
+                    )
 
             conn.execute(
                 """
@@ -492,8 +593,9 @@ class ProactiveStore:
                     countable, qualifies_nightly, turn_seq,
                     occurred_at_utc, occurred_at_us,
                     ingested_at_utc, ingested_at_us,
-                    content, content_truncated, meta_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    content, content_truncated, meta_json,
+                    content_hash, route
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     client,
@@ -510,6 +612,8 @@ class ProactiveStore:
                     primary_content,
                     0,
                     meta_json,
+                    content_hash,
+                    eff_route,
                 ),
             )
             event_row_id = int(cur.lastrowid)
@@ -1072,6 +1176,37 @@ class ProactiveStore:
                     (rev, rev, now_utc.isoformat(), win_id),
                 )
 
+            cat_rows = conn.execute(
+                "SELECT op_type, COUNT(*) AS cnt FROM proactive_applied_ops WHERE job_id = ? GROUP BY op_type",
+                (job_id,),
+            ).fetchall()
+            categories = {str(r["op_type"]): int(r["cnt"]) for r in cat_rows}
+            applied_total = sum(categories.values())
+            if applied_total == 0 and isinstance(summary, dict):
+                applied_total = int(summary.get("applied") or 0)
+            receipt_client = display_client_id(str(row["client"] or ("nightly" if row["job_type"] == "nightly" else "")))
+            receipt_session = str(row["session_id"] or "")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO review_receipts (
+                    job_id, client, session_id, job_type, outcome,
+                    applied_count, categories_json, error_summary,
+                    created_at_utc, created_at_us
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    job_id,
+                    receipt_client,
+                    receipt_session,
+                    str(row["job_type"]),
+                    outcome,
+                    applied_total,
+                    json.dumps(categories, ensure_ascii=False, separators=(",", ":")),
+                    now_utc.isoformat(),
+                    now_us,
+                ),
+            )
+
     def ack_job_failure(
         self,
         job_id: int,
@@ -1087,7 +1222,7 @@ class ProactiveStore:
         with self._tx() as conn:
             row = conn.execute(
                 """
-                SELECT attempts, max_attempts
+                SELECT attempts, max_attempts, job_type, client, session_id
                 FROM jobs
                 WHERE id = ? AND status = 'running' AND lease_token = ?
                 """,
@@ -1122,6 +1257,7 @@ class ProactiveStore:
                 )
             else:
                 new_status = JOB_STATUS_DEAD
+                now_utc = ensure_utc(self.clock.now_utc())
                 conn.execute(
                     """
                     UPDATE jobs
@@ -1134,7 +1270,112 @@ class ProactiveStore:
                     """,
                     (new_status, bounded_err, now_us, job_id),
                 )
+                receipt_client = display_client_id(str(row["client"] or ("nightly" if row["job_type"] == "nightly" else "")))
+                receipt_session = str(row["session_id"] or "")
+                safe_err = redact_secrets(bounded_err)[:160]
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO review_receipts (
+                        job_id, client, session_id, job_type, outcome,
+                        applied_count, categories_json, error_summary,
+                        created_at_utc, created_at_us
+                    ) VALUES (?, ?, ?, ?, 'failed', 0, '{}', ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        receipt_client,
+                        receipt_session,
+                        str(row["job_type"]),
+                        safe_err,
+                        now_utc.isoformat(),
+                        now_us,
+                    ),
+                )
             return new_status
+
+    def get_activation_baseline_us(self) -> int:
+        """读取激活基线时间戳（微秒）。"""
+        with self._read() as conn:
+            row = conn.execute(
+                "SELECT value FROM scheduler_meta WHERE key = 'activation_baseline_us'"
+            ).fetchone()
+            return int(row["value"]) if row is not None else 0
+
+    def list_pending_receipts(self, *, client_id: str, session_id: str) -> list[dict[str, Any]]:
+        """列出当前已鉴权客户端/会话尚未确认送达的评审完成回执。"""
+        eff_client = display_client_id(client_id)
+        eff_session = str(session_id or "").strip()
+        if not eff_client or not eff_session:
+            return []
+        with self._read() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, job_id, client, session_id, job_type, outcome,
+                       applied_count, categories_json, error_summary, created_at_utc
+                FROM review_receipts
+                WHERE delivered_at_utc IS NULL
+                  AND (
+                      (job_type = 'incremental' AND client = ? AND session_id = ?)
+                      OR job_type = 'nightly'
+                  )
+                ORDER BY id ASC
+                """,
+                (eff_client, eff_session),
+            ).fetchall()
+        receipts: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                cats = json.loads(str(r["categories_json"] or "{}"))
+            except json.JSONDecodeError:
+                cats = {}
+            receipts.append(
+                {
+                    "id": int(r["id"]),
+                    "job_id": int(r["job_id"]),
+                    "client": str(r["client"]),
+                    "session_id": str(r["session_id"]),
+                    "job_type": str(r["job_type"]),
+                    "outcome": str(r["outcome"]),
+                    "applied_count": int(r["applied_count"]),
+                    "categories": cats if isinstance(cats, dict) else {},
+                    "error_summary": r["error_summary"],
+                    "created_at_utc": str(r["created_at_utc"]),
+                }
+            )
+        return receipts
+
+    def ack_receipts(
+        self,
+        receipt_ids: list[int],
+        *,
+        client_id: str,
+        session_id: str,
+    ) -> int:
+        """幂等确认已送达的评审回执（仅允许属主会话或 nightly 回执）。"""
+        eff_client = display_client_id(client_id)
+        eff_session = str(session_id or "").strip()
+        clean_ids = sorted({int(rid) for rid in receipt_ids if int(rid) > 0})
+        if not clean_ids or not eff_client or not eff_session:
+            return 0
+        now_utc = ensure_utc(self.clock.now_utc()).isoformat()
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self._tx() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE review_receipts
+                SET delivered_at_utc = ?,
+                    delivered_to_client = ?,
+                    delivered_to_session_id = ?
+                WHERE id IN ({placeholders})
+                  AND delivered_at_utc IS NULL
+                  AND (
+                      (job_type = 'incremental' AND client = ? AND session_id = ?)
+                      OR job_type = 'nightly'
+                  )
+                """,
+                (now_utc, eff_client, eff_session, *clean_ids, eff_client, eff_session),
+            )
+            return int(cur.rowcount)
 
     def get_job_events(self, job_id: int) -> list[StoredEvent]:
         """按任务边界读取关联事件证据（供 Stage 2 worker 使用）。"""
@@ -1411,7 +1652,7 @@ class ProactiveStore:
                 (lease_name,),
             ).fetchone()
             if existing is not None and int(existing["expires_at_us"]) > now_us:
-                if str(existing["owner_id"]) != owner_id:
+                if str(existing["owner_id"]) != owner_id and _owner_process_alive(str(existing["owner_id"])):
                     return None
             conn.execute(
                 """

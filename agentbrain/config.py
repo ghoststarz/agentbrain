@@ -117,9 +117,11 @@ class ProactiveConfig:
     hermes_home: str = ""
     hermes_agent_dir: str = ""
     hermes_python: str = ""
+    hermes_statedb_enabled: bool = True
+    hermes_state_db_path: str = ""
     model_timeout_seconds: float = 30.0
     model_max_context_chars: int = 24000
-    model_max_output_tokens: int = 2000
+    model_max_output_tokens: int = 8192
 
 
 _VALID_MODEL_BACKENDS = frozenset({"", "auto", "hermes", "openai_compatible"})
@@ -320,7 +322,7 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
 
     model_timeout_seconds = float(proactive_raw.get("model_timeout_seconds", 30.0))
     model_max_context_chars = int(proactive_raw.get("model_max_context_chars", 24000))
-    model_max_output_tokens = int(proactive_raw.get("model_max_output_tokens", 2000))
+    model_max_output_tokens = int(proactive_raw.get("model_max_output_tokens", 8192))
     if enabled and (
         model_timeout_seconds <= 0
         or model_max_context_chars < 512
@@ -353,6 +355,8 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
         hermes_home=expand_portable_path(str(proactive_raw.get("hermes_home") or "")),
         hermes_agent_dir=expand_portable_path(str(proactive_raw.get("hermes_agent_dir") or "")),
         hermes_python=expand_portable_path(str(proactive_raw.get("hermes_python") or "")),
+        hermes_statedb_enabled=_require_bool(proactive_raw, "hermes_statedb_enabled", True),
+        hermes_state_db_path=expand_portable_path(str(proactive_raw.get("hermes_state_db_path") or "")),
         model_timeout_seconds=model_timeout_seconds,
         model_max_context_chars=model_max_context_chars,
         model_max_output_tokens=model_max_output_tokens,

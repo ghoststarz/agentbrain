@@ -14,7 +14,9 @@ from typing import Any
 
 import pytest
 
-_PLUGIN_PATH = Path(os.environ.get("AGENTBRAIN_PLUGIN_PATH", "").strip() or "__missing__")
+_RAW_PLUGIN_ENV = os.environ.get("AGENTBRAIN_PLUGIN_PATH", "").strip()
+_REPO_PLUGIN_PATH = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "obsidian-broker" / "__init__.py"
+_PLUGIN_PATH = _REPO_PLUGIN_PATH if _RAW_PLUGIN_ENV == "source" else Path(_RAW_PLUGIN_ENV or "__missing__")
 
 
 def _load_provider_cls() -> type[Any]:
@@ -97,8 +99,8 @@ def test_prefetch_returns_empty_when_all_hits_weak_evidence(monkeypatch: pytest.
     assert provider.recall_status() is None
 
 
-def test_prefetch_keeps_diary_status_line_when_no_hits(monkeypatch: pytest.MonkeyPatch) -> None:
-    """没有可用召回时也要带上日记状态行——这是「今天写了没」唯一的常驻提示。"""
+def test_prefetch_no_diary_noise_when_no_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """无可用召回且无回执时保持静默，不注入 [DIARY] 或 diary_today 噪声。"""
     cls = _load_provider_cls()
     provider = cls()
 
@@ -117,40 +119,51 @@ def test_prefetch_keeps_diary_status_line_when_no_hits(monkeypatch: pytest.Monke
     monkeypatch.setattr(provider, "_http_json", fake_http)
 
     out = provider.prefetch("一个没有任何命中的查询")
-    assert out.startswith("[DIARY]")
-    assert "公账 1 条" in out
-    assert "10:26" in out
-    assert "antigravity" in out
-    assert "私账 0 条" in out
-    # 弱证据同样只带状态行，不注入弱召回内容
+    assert out == ""
+    assert "[DIARY]" not in provider.system_prompt_block()
     assert provider.recall_status() is None
 
 
-def test_prefetch_diary_line_has_no_body_text(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prefetch_delivers_and_acks_review_receipt_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """无记忆命中但有待送达评审回执时，只返回一次性 [PREVIOUS_REVIEW_RESULT] 并立即 ack。"""
     cls = _load_provider_cls()
     provider = cls()
+    acked: list[dict[str, Any]] = []
+    receipts = [
+        [
+            {
+                "id": 42,
+                "job_type": "incremental",
+                "outcome": "no_change",
+                "applied_count": 0,
+                "categories": {},
+            }
+        ],
+        [],
+    ]
 
     def fake_http(method: str, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 1.5) -> dict[str, Any]:
         if path == "/v1/search":
-            return {
-                "hits": [],
-                "revision": 5,
-                "diary_today": {
-                    "public": {"count": 0, "last_time": "", "last_author": ""},
-                    "private": {"count": 0},
-                },
-            }
+            return {"hits": [], "revision": 5, "review_receipts": receipts.pop(0)}
+        if path == "/v1/review/receipts/ack":
+            acked.append(dict(payload or {}))
+            return {"ok": True, "acked": 1}
         return {}
 
     monkeypatch.setattr(provider, "_http_json", fake_http)
 
-    out = provider.prefetch("闲聊")
-    assert out == "[DIARY] 今日公账 0 条｜私账 0 条"
-    assert "日记正文" not in out
+    out1 = provider.prefetch("闲聊", session_id="sess-1")
+    assert "[PREVIOUS_REVIEW_RESULT]" in out1
+    assert "no_change" in out1
+    assert "[DIARY]" not in out1
+    assert acked == [{"session_id": "sess-1", "receipt_ids": [42]}]
+
+    out2 = provider.prefetch("下一轮", session_id="sess-1")
+    assert out2 == ""
 
 
-def test_prefetch_keeps_diary_status_when_hits_exceed_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """命中存在但第一条就超 1200 字预算时，状态行仍然要给出。"""
+def test_prefetch_returns_empty_when_hits_exceed_budget_without_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """命中存在但第一条就超 1200 字预算且无回执时，不退化输出 [DIARY]。"""
     cls = _load_provider_cls()
     provider = cls()
 
@@ -159,14 +172,13 @@ def test_prefetch_keeps_diary_status_when_hits_exceed_budget(monkeypatch: pytest
             return {
                 "hits": [{"title": "巨长笔记", "excerpt": "字" * 2000}],
                 "revision": 5,
-                "diary_today": {"public": {"count": 0, "last_time": "", "last_author": ""}, "private": {"count": 0}},
             }
         return {}
 
     monkeypatch.setattr(provider, "_http_json", fake_http)
 
     out = provider.prefetch("任意查询")
-    assert out == "[DIARY] 今日公账 0 条｜私账 0 条", f"状态行被一起丢了：{out!r}"
+    assert out == ""
     assert provider.recall_status() is None
 
 

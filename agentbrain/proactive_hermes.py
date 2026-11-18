@@ -155,8 +155,10 @@ def _parse_bridge_response(raw_stdout: str) -> dict[str, Any]:
         raise HermesBridgeError("Hermes 桥接输出顶层必须为 JSON 对象")
     if not payload.get("ok"):
         err_type = str(payload.get("error_type") or "HermesError")
+        where = str(payload.get("where") or "").strip()
         err_msg = redact_secrets(str(payload.get("error") or "unknown error"))
-        raise HermesBridgeError(f"{err_type}: {err_msg}")
+        loc = f" at {where}" if where else ""
+        raise HermesBridgeError(f"{err_type}{loc}: {err_msg}")
     content = payload.get("content")
     if not isinstance(content, dict):
         raise HermesBridgeError("Hermes 桥接返回 content 不是 JSON 对象")

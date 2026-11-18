@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from agentbrain.acl import AuthError, AuthIdentity, authenticate_bearer
+from agentbrain.acl import AuthError, AuthIdentity, authenticate_bearer, display_client_id
 from agentbrain.atomic import atomic_write_text
 from agentbrain.config import AppConfig
 from agentbrain.diary import DiaryGateError, append_diary, read_diary, today_diary_status
@@ -173,7 +173,6 @@ class BrokerService:
                 hops_override=hops_override,
             )
             result["revision"] = get_current_revision(self.config)
-            result["diary_today"] = self.diary_status(can_casual=can_casual)
             return result
 
         cd_key = (client_id, session_id)
@@ -202,7 +201,13 @@ class BrokerService:
                     session_cd[hit_path] = self._default_cooldown_turns
 
         result["revision"] = get_current_revision(self.config)
-        result["diary_today"] = self.diary_status(can_casual=can_casual)
+        if self.config.memory.proactive.enabled:
+            receipts = self._proactive_store().list_pending_receipts(
+                client_id=client_id,
+                session_id=session_id,
+            )
+            if receipts:
+                result["review_receipts"] = receipts
         return result
 
     def read_note(
@@ -513,7 +518,7 @@ class BrokerService:
         for idx, item in enumerate(raw_events):
             if not isinstance(item, dict):
                 raise ServiceError(400, "invalid_request", f"events[{idx}] must be an object")
-            client = str(item.get("client") or identity.client_id or "").strip()
+            client = display_client_id(str(item.get("client") or identity.client_id or "").strip())
             session_id = str(item.get("session_id") or "").strip()
             event_id = str(item.get("event_id") or "").strip()
             event_kind = str(item.get("event_kind") or EVENT_KIND_HUMAN_TURN).strip()
@@ -535,6 +540,7 @@ class BrokerService:
                     occurred_at=occ_dt,
                     meta=meta,
                     qualifies_nightly=qualifies_nightly,
+                    route="provider",
                 )
             except PayloadTooLargeError as exc:
                 raise ServiceError(413, "payload_too_large", str(exc)) from exc
@@ -604,10 +610,15 @@ class BrokerService:
         """手动触发一次夜间窗口调度检查与可选的 agy IDE 扫描。"""
         if not self.config.memory.proactive.enabled:
             return {"ok": True, "enabled": False, "skipped": True}
-        from agentbrain.proactive_adapters import scan_agy_ide_roots
+        from agentbrain.proactive_adapters import (
+            resolve_hermes_statedb_path,
+            scan_agy_ide_roots,
+            scan_hermes_statedb,
+        )
 
         store = self._proactive_store()
         ide_report = None
+        hermes_report = None
         catchup = bool(payload.get("catchup", False))
         if (
             self.config.memory.proactive.agy_ide_enabled
@@ -618,6 +629,9 @@ class BrokerService:
                 self.config.memory.proactive.agy_ide_roots,
                 catchup=catchup,
             )
+        hermes_db_path = resolve_hermes_statedb_path(self.config)
+        if hermes_db_path is not None:
+            hermes_report = scan_hermes_statedb(store, hermes_db_path, catchup=catchup)
         tick = store.tick(include_historical=catchup)
         return {
             "ok": True,
@@ -638,7 +652,42 @@ class BrokerService:
                 if ide_report is not None
                 else None
             ),
+            "hermes_statedb": (
+                {
+                    "available": hermes_report.available,
+                    "sessions_scanned": hermes_report.sessions_scanned,
+                    "turns_completed": hermes_report.turns_completed,
+                    "events_ingested": hermes_report.events_ingested,
+                    "events_deduped": hermes_report.events_deduped,
+                    "skipped_pre_activation": hermes_report.skipped_pre_activation,
+                    "skipped_excluded": hermes_report.skipped_excluded,
+                    "last_error": hermes_report.last_error,
+                }
+                if hermes_report is not None
+                else None
+            ),
         }
+
+    def review_receipts_ack(
+        self,
+        payload: dict[str, Any],
+        *,
+        identity: AuthIdentity,
+    ) -> dict[str, Any]:
+        """确认已送达的后台评审完成回执。"""
+        if not self.config.memory.proactive.enabled:
+            return {"ok": True, "acked": 0}
+        session_id = str(payload.get("session_id") or "").strip()
+        raw_ids = payload.get("receipt_ids")
+        if not session_id or not isinstance(raw_ids, list):
+            raise ServiceError(400, "invalid_request", "session_id and receipt_ids list are required")
+        receipt_ids = [int(rid) for rid in raw_ids if isinstance(rid, int) or (isinstance(rid, str) and rid.isdigit())]
+        acked = self._proactive_store().ack_receipts(
+            receipt_ids,
+            client_id=identity.client_id,
+            session_id=session_id,
+        )
+        return {"ok": True, "acked": acked}
 
 
 class _BrokerHTTPServer(ThreadingHTTPServer):
@@ -746,6 +795,9 @@ class BrokerHTTPHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/v1/review/tick":
                     self._send_json(200, svc.review_tick(payload))
+                    return
+                if path == "/v1/review/receipts/ack":
+                    self._send_json(200, svc.review_receipts_ack(payload, identity=identity))
                     return
 
             self._send_json(404, {"error": "not_found", "path": path})

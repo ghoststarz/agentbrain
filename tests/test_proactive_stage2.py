@@ -204,7 +204,12 @@ def test_hermes_provider_outbox_retry_identical_turns_and_filtering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plugin_path = Path(os.environ.get("AGENTBRAIN_PLUGIN_PATH", "").strip() or "__missing__")
+    raw_plugin_env = os.environ.get("AGENTBRAIN_PLUGIN_PATH", "").strip()
+    plugin_path = (
+        Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "obsidian-broker" / "__init__.py"
+        if raw_plugin_env == "source"
+        else Path(raw_plugin_env or "__missing__")
+    )
     if not plugin_path.exists():
         pytest.skip("AGENTBRAIN_PLUGIN_PATH not set")
     spec = importlib.util.spec_from_file_location("obsidian_broker_plugin_s2", plugin_path)

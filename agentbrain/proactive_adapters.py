@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,40 @@ class IdeScanReport:
     events_ingested: int
     turns_completed: int
     unavailable_sources: list[dict[str, str]]
+
+
+@dataclass(frozen=True)
+class HermesStateDbScanReport:
+    """一次 Hermes state.db 只读增量扫描的结构化诊断（不含聊天原文）。"""
+
+    db_path: str
+    available: bool
+    sessions_scanned: int
+    turns_completed: int
+    events_ingested: int
+    events_deduped: int
+    skipped_pre_activation: int
+    skipped_excluded: int
+    last_error: str | None = None
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+_INJECTED_BLOCK_RE = re.compile(
+    r"(?:\[SHARED_BRAIN[^\]]*\][\s\S]*?(?=\n\n|\Z)|"
+    r"\[MEMORY_DELTA\][^\n]*\n?|"
+    r"\[MEMORY_PREFETCH\][\s\S]*?(?=\n\n|\Z)|"
+    r"\[PREVIOUS_REVIEW_RESULT\][^\n]*\n?|"
+    r"\[DIARY\][^\n]*\n?)"
+)
+
+_EXCLUDED_HERMES_SOURCES = frozenset({"cron", "subagent", "oneshot", "system", "heartbeat", "review"})
+_EXCLUDED_HERMES_SESSION_PREFIXES = ("proactive-review", "system", "heartbeat", "cron", "__internal")
+
+
+def _clean_hermes_text(text: str) -> str:
+    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    cleaned = _INJECTED_BLOCK_RE.sub("", cleaned)
+    return redact_secrets(cleaned).strip()
 
 
 def _parse_utc_iso(raw: Any) -> dt.datetime | None:
@@ -382,3 +418,226 @@ def ingest_cli_reference_event(
         "event_row_id": res.event_row_id,
         "completed_human_turns": res.completed_human_turns,
     }
+
+
+def resolve_hermes_statedb_path(config: Any) -> Path | None:
+    """解析 Hermes 规范 state.db 路径（配置显式覆盖优先，其次按 profile home 推导）。"""
+    pro_cfg = config.memory.proactive
+    if not pro_cfg.hermes_statedb_enabled:
+        return None
+    explicit = str(getattr(pro_cfg, "hermes_state_db_path", "") or "").strip()
+    if explicit:
+        return Path(explicit).resolve()
+    try:
+        from agentbrain.proactive_hermes import resolve_hermes_profile_home
+
+        _, profile_home = resolve_hermes_profile_home(config)
+        return (profile_home / "state.db").resolve()
+    except Exception:
+        return None
+
+
+def _is_excluded_hermes_session(session_id: str, source: str, hidden: int) -> bool:
+    if int(hidden or 0) == 1:
+        return True
+    sid_low = (session_id or "").strip().lower()
+    if not sid_low or sid_low.startswith(_EXCLUDED_HERMES_SESSION_PREFIXES):
+        return True
+    src_low = (source or "").strip().lower()
+    return src_low in _EXCLUDED_HERMES_SOURCES
+
+
+def scan_hermes_statedb(
+    store: ProactiveStore,
+    db_path: Path,
+    *,
+    catchup: bool = False,
+) -> HermesStateDbScanReport:
+    """只读增量扫描 Hermes 规范 state.db，采集激活基线之后的已完成轮次并与 provider 路由去重。"""
+    resolved = Path(db_path).resolve()
+    db_str = str(resolved)
+    if not resolved.exists() or not resolved.is_file():
+        return HermesStateDbScanReport(
+            db_path=db_str,
+            available=False,
+            sessions_scanned=0,
+            turns_completed=0,
+            events_ingested=0,
+            events_deduped=0,
+            skipped_pre_activation=0,
+            skipped_excluded=0,
+            last_error="state_db_missing",
+        )
+
+    baseline_us = store.get_activation_baseline_us()
+    baseline_epoch = baseline_us / 1_000_000.0 if baseline_us > 0 else 0.0
+    cursor = store.get_adapter_cursor("hermes_statedb", db_str)
+    last_msg_id = int(cursor.get("last_msg_id", 0)) if isinstance(cursor, dict) else 0
+    raw_pending = cursor.get("pending_users") if isinstance(cursor, dict) else None
+    pending_users: dict[str, dict[str, Any]] = (
+        {str(k): dict(v) for k, v in raw_pending.items() if isinstance(v, dict)}
+        if isinstance(raw_pending, dict)
+        else {}
+    )
+
+    sessions_seen: set[str] = set()
+    turns_completed = 0
+    events_ingested = 0
+    events_deduped = 0
+    skipped_pre_activation = 0
+    skipped_excluded = 0
+
+    try:
+        uri = f"file:{resolved.as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+    except Exception as exc:  # noqa: BLE001
+        return HermesStateDbScanReport(
+            db_path=db_str,
+            available=False,
+            sessions_scanned=0,
+            turns_completed=0,
+            events_ingested=0,
+            events_deduped=0,
+            skipped_pre_activation=0,
+            skipped_excluded=0,
+            last_error=redact_secrets(f"{type(exc).__name__}: {exc}")[:200],
+        )
+
+    try:
+        if not catchup and baseline_epoch > 0:
+            pre_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE id > ? AND timestamp IS NOT NULL AND timestamp < ?",
+                (last_msg_id, baseline_epoch),
+            ).fetchone()
+            skipped_pre_activation = int(pre_row["cnt"]) if pre_row is not None else 0
+
+        query_ts = 0.0 if catchup else baseline_epoch
+        rows = conn.execute(
+            """
+            SELECT m.id, m.session_id, m.role, m.content, m.finish_reason,
+                   m.tool_calls, m.timestamp, m.message_uid,
+                   s.source AS session_source, COALESCE(s.hidden, 0) AS session_hidden
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE m.id > ? AND (m.timestamp IS NULL OR m.timestamp >= ?)
+            ORDER BY m.id ASC
+            """,
+            (last_msg_id, query_ts),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        conn.close()
+        return HermesStateDbScanReport(
+            db_path=db_str,
+            available=False,
+            sessions_scanned=0,
+            turns_completed=0,
+            events_ingested=0,
+            events_deduped=0,
+            skipped_pre_activation=skipped_pre_activation,
+            skipped_excluded=0,
+            last_error=redact_secrets(f"{type(exc).__name__}: {exc}")[:200],
+        )
+    conn.close()
+
+    new_last_id = last_msg_id
+    for r in rows:
+        row_id = int(r["id"])
+        new_last_id = max(new_last_id, row_id)
+        sid = str(r["session_id"] or "").strip()
+        src = str(r["session_source"] or "").strip().lower()
+        hidden = int(r["session_hidden"] or 0)
+
+        if _is_excluded_hermes_session(sid, src, hidden):
+            skipped_excluded += 1
+            pending_users.pop(sid, None)
+            continue
+
+        sessions_seen.add(sid)
+        role = str(r["role"] or "").strip().lower()
+        raw_content = str(r["content"] or "")
+        if _is_internal_review_noise(raw_content):
+            skipped_excluded += 1
+            continue
+
+        clean_text = _clean_hermes_text(raw_content)
+        ts_val = r["timestamp"]
+        uid = str(r["message_uid"] or "").strip()
+
+        if role == "user":
+            if clean_text:
+                pending_users[sid] = {
+                    "id": row_id,
+                    "uid": uid,
+                    "ts": float(ts_val) if ts_val is not None else 0.0,
+                    "content": clean_text,
+                }
+            continue
+
+        if role == "assistant":
+            finish_reason = str(r["finish_reason"] or "").strip().lower()
+            has_tool_calls = bool(str(r["tool_calls"] or "").strip())
+            if finish_reason == "tool_calls" or has_tool_calls or not clean_text:
+                continue
+            pending = pending_users.pop(sid, None)
+            if pending is None:
+                continue
+
+            turn_text = f"User: {pending['content']}\nAssistant: {clean_text}".strip()
+            stable_id = uid or str(row_id)
+            event_id = f"hermes:{sid}:msg:{stable_id}"
+            eff_ts = float(ts_val) if ts_val is not None else float(pending.get("ts") or 0.0)
+            occ_dt = (
+                dt.datetime.fromtimestamp(eff_ts, tz=dt.timezone.utc)
+                if eff_ts > 0
+                else None
+            )
+            event_kind = EVENT_KIND_REFERENCE_ONLY if src == "cli" else EVENT_KIND_HUMAN_TURN
+            res = store.ingest_event(
+                client="hermes",
+                session_id=sid,
+                event_id=event_id,
+                event_kind=event_kind,
+                content=turn_text,
+                occurred_at=occ_dt,
+                meta={
+                    "route": "state_db",
+                    "source": src or "unknown",
+                    "msg_id": row_id,
+                    "message_uid": uid,
+                },
+                qualifies_nightly=True,
+                route="state_db",
+            )
+            if res.deduped:
+                events_deduped += 1
+            elif res.accepted:
+                events_ingested += 1
+                if event_kind == EVENT_KIND_HUMAN_TURN:
+                    turns_completed += 1
+
+    # 限制未完成缓存体积，避免长期运行膨胀
+    if len(pending_users) > 200:
+        keep_keys = sorted(pending_users, key=lambda k: int(pending_users[k].get("id") or 0))[-200:]
+        pending_users = {k: pending_users[k] for k in keep_keys}
+
+    store.set_adapter_cursor(
+        "hermes_statedb",
+        db_str,
+        {
+            "last_msg_id": new_last_id,
+            "pending_users": pending_users,
+        },
+    )
+
+    return HermesStateDbScanReport(
+        db_path=db_str,
+        available=True,
+        sessions_scanned=len(sessions_seen),
+        turns_completed=turns_completed,
+        events_ingested=events_ingested,
+        events_deduped=events_deduped,
+        skipped_pre_activation=skipped_pre_activation,
+        skipped_excluded=skipped_excluded,
+        last_error=None,
+    )

@@ -34,32 +34,49 @@ _STATIC_PROTOCOL_BLOCK = (
     "[SHARED_BRAIN 记忆协议]\n"
     "- 跨端共享记忆由本地 agentbrain broker 托管，按需通过 prefetch 自动注入相关事实与决策。\n"
     "- 本块为静态协议说明，不包含动态记忆或日记正文。\n"
-    "- 重要事实或偏好变更请使用记忆工具沉淀；会话压缩前自动同步接力状态。\n"
-    "- 日记是习惯，不是任务：闲聊、日常、有意思的坑、有温度的瞬间 → 主动 diary_append 记一条公账；\n"
-    "  有自己的在意、不确定或想留给后面的自己的观察 → 记私账。工作流水（改了哪些文件、几个测试）不进日记。\n"
-    "- 日常闲聊就正常聊天，别套用任务纪律的语态和验收口吻；[DIARY] 行只是状态提示，不必向用户复述。"
+    "- 重要事实或偏好变更可由后台评审自动沉淀；会话压缩前自动同步接力状态。"
 )
 
+_CATEGORY_LABELS = {
+    "longterm_upsert": "长期记忆",
+    "project_update": "项目页",
+    "hot_update": "热记忆",
+    "handoff_upsert": "接力",
+    "diary_append": "日记",
+}
 
-def _format_diary_line(diary_today: Any) -> str:
-    """把 /v1/search 返回的 diary_today 元信息压成一行提示（只条数与作者，不含正文）。"""
-    if not isinstance(diary_today, dict):
-        return ""
-    try:
-        pub = diary_today.get("public") or {}
-        pri = diary_today.get("private") or {}
-        pub_n = int(pub.get("count") or 0)
-        pri_n = int(pri.get("count") or 0)
-        if pub_n:
-            stamp = str(pub.get("last_time") or "")[:5]
-            author = str(pub.get("last_author") or "")
-            meta = f"{stamp} {author}".strip()
-            pub_desc = f"公账 {pub_n} 条" + (f"（最后 {meta}）" if meta else "")
-        else:
-            pub_desc = "今日公账 0 条"
-        return f"[DIARY] {pub_desc}｜私账 {pri_n} 条"
-    except Exception:  # noqa: BLE001 —— 状态行坏掉不该拖累召回
-        return ""
+
+def _format_review_receipts(receipts: Any) -> tuple[list[str], list[int]]:
+    """格式化一次性后台记忆整理完成回执（仅含结果/分类计数，不含日记或对话正文）。"""
+    if not isinstance(receipts, list) or not receipts:
+        return [], []
+    lines: list[str] = []
+    ids: list[int] = []
+    for item in receipts:
+        if not isinstance(item, dict):
+            continue
+        rid = item.get("id")
+        if isinstance(rid, int) and rid > 0:
+            ids.append(rid)
+        job_type = str(item.get("job_type") or "incremental").strip().lower()
+        scope_label = "夜间后台记忆整理" if job_type == "nightly" else "上轮后台记忆整理"
+        outcome = str(item.get("outcome") or "").strip().lower()
+        if outcome == "applied":
+            applied_n = int(item.get("applied_count") or 0)
+            cats = item.get("categories") if isinstance(item.get("categories"), dict) else {}
+            cat_parts = [
+                f"{_CATEGORY_LABELS.get(str(k), str(k))} {int(v)}"
+                for k, v in cats.items()
+                if int(v or 0) > 0
+            ]
+            cat_desc = f"（{'、'.join(cat_parts)}）" if cat_parts else ""
+            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：写入 {applied_n} 条{cat_desc}。")
+        elif outcome == "no_change":
+            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：无新增变更（no_change）。")
+        elif outcome == "failed":
+            err = str(item.get("error_summary") or "unknown_error").replace("\n", " ").strip()[:120]
+            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}失败：{err}")
+    return lines, ids
 
 
 
@@ -156,6 +173,7 @@ _INJECTED_BLOCK_RE = re.compile(
     r"(?:\[SHARED_BRAIN[^\]]*\][\s\S]*?(?=\n\n|\Z)|"
     r"\[MEMORY_DELTA\][^\n]*\n?|"
     r"\[MEMORY_PREFETCH\][\s\S]*?(?=\n\n|\Z)|"
+    r"\[PREVIOUS_REVIEW_RESULT\][^\n]*\n?|"
     r"\[DIARY\][^\n]*\n?)"
 )
 
@@ -346,6 +364,12 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             self._last_recall = None
             self._turn_capture = self._load_turn_capture(cfg_path)
             self._proactive_enabled, self._proactive_event_capture = self._load_proactive_flags(cfg_path)
+            if self._proactive_enabled and self._proactive_event_capture and self._outbox_path().exists():
+                threading.Thread(
+                    target=self._flush_outbox,
+                    name="obsidian-broker-proactive-init-flush",
+                    daemon=True,
+                ).start()
         except Exception as exc:
             self._turn_capture = False
             self._proactive_enabled = False
@@ -405,21 +429,28 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                 self._last_revision = rev
 
             hits = res.get("hits") or []
-            diary_line = _format_diary_line(res.get("diary_today"))
+            receipt_lines, receipt_ids = _format_review_receipts(res.get("review_receipts"))
+            if receipt_ids and effective_session_id:
+                try:
+                    self._http_json(
+                        "POST",
+                        "/v1/review/receipts/ack",
+                        {"session_id": effective_session_id, "receipt_ids": receipt_ids},
+                        timeout=0.5,
+                    )
+                except Exception as ack_exc:
+                    self._logger.warning("review receipts ack failed: %s", ack_exc)
 
             if not hits or all(bool(hit.get("weak_evidence")) for hit in hits):
-                # 没有可用召回时，至少把「今天日记写了没」这一行带上：
-                # 习惯靠的是每轮都看得见的状态，而不是某天忽然想起来。
-                if diary_line:
+                if receipt_lines:
                     self._last_recall = None
-                    return diary_line
+                    return "\n".join(receipt_lines)[:1200]
                 return ""
 
             lines: list[str] = []
             if rev is not None and prev_revision is not None and rev != prev_revision:
                 lines.append(f"[MEMORY_DELTA] revision {prev_revision} -> {rev}")
-            if diary_line:
-                lines.append(diary_line)
+            lines.extend(receipt_lines)
             lines.append("[MEMORY_PREFETCH]")
             used = sum(len(line) + 1 for line in lines) - 1
             count = 0
@@ -433,8 +464,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                 used += len(entry) + 1
                 count += 1
             if count == 0:
-                # 命中全被预算挤掉时，至少别把已经算好的日记状态行一起丢了
-                return diary_line
+                return "\n".join(receipt_lines)[:1200] if receipt_lines else ""
             self._last_recall = RecallStatus(provider_label=self.name, count=count)
             return "\n".join(lines)[:1200]
         except Exception as exc:
@@ -608,8 +638,10 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
         task: str = "",
         result: str = "",
         *,
+        child_session_id: str = "",
         session_id: str = "",
         metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> None:
         """子任务委派钩子：仅作为 reference_only 证据采集，不计入人类完成轮次。"""
         try:
@@ -620,6 +652,9 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             clean_res = _strip_thinking_and_memory(result)
             if not clean_task and not clean_res:
                 return
+            meta_payload: dict[str, Any] = dict(metadata) if isinstance(metadata, dict) else {"source": "delegation"}
+            if child_session_id:
+                meta_payload["child_session_id"] = str(child_session_id)
             ev_payload = {
                 "client": "hermes",
                 "session_id": eff_session,
@@ -627,7 +662,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                 "event_kind": "reference_only",
                 "content": f"[Delegation] Task: {clean_task}\nResult: {clean_res}".strip(),
                 "occurred_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "meta": metadata if isinstance(metadata, dict) else {"source": "delegation"},
+                "meta": meta_payload,
                 "qualifies_nightly": True,
             }
             self._enqueue_outbox(ev_payload)

@@ -334,6 +334,7 @@ def _format_longterm_note_content(
         fm: dict[str, Any] = {
             "type": note_type,
             "title": title,
+            "proactive_owned": True,
             "created": today_str,
             "updated": today_str,
             "source": trusted_source,
@@ -552,6 +553,22 @@ def _derive_dedupe_key(op: dict[str, Any]) -> str:
     return sha256_text(json.dumps(op, sort_keys=True, ensure_ascii=False))[:24]
 
 
+def _is_proactive_owned_note(path: Path) -> bool:
+    """判断目标是否为主动复盘生成的受管笔记（而非用户手写笔记）。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[:2000]
+    except OSError:
+        return False
+    if not text.startswith("---"):
+        return False
+    parts = text.split("---", 2)
+    head = parts[1] if len(parts) >= 2 else ""
+    if "proactive_owned: true" in head:
+        return True
+    # 旧版本生成的长期笔记：frontmatter 同时带 evidence_level 与 source_refs。
+    return "evidence_level:" in head and "source_refs:" in head
+
+
 def _check_hash_conflict(
     *,
     rel: str,
@@ -578,6 +595,12 @@ def _check_hash_conflict(
     else:
         req_hash = expected_hash or trusted_hash or snap_hash
     if not req_hash:
+        # 系统自己生成的笔记（frontmatter 带 evidence_level/source_refs）跨任务续写时，
+        # 模型这一批的上下文里未必包含该文件（快照只收预算内的相关笔记），因此拿不到哈希。
+        # 只要目标确实是本系统生成的受管笔记、且用户没有手工改写其受管块之外的内容，
+        # 允许按受管块合并更新；人工笔记仍然必须提供哈希，不能靠这条放松覆盖手写内容。
+        if _is_proactive_owned_note(target):
+            return None
         raise ConflictError(f"更新已有文件 {rel} 必须提供 expected_hash 或服务端读取快照哈希")
     cur_hash = sha256_text(target.read_text(encoding="utf-8"))
     if cur_hash != req_hash:
@@ -827,7 +850,7 @@ def validate_and_apply_batch(
                 continue
             seen_targets_in_batch.add(rel)
             if req_hash is None:
-                if target_p.exists():
+                if target_p.exists() and not _is_proactive_owned_note(target_p):
                     raise ConflictError(f"写锁复检冲突：目标 {rel} 在校验后被外部创建")
             else:
                 if not target_p.exists():
@@ -931,7 +954,7 @@ def validate_and_apply_batch(
                     config,
                     ledger=op["ledger"],
                     content=op["content"],
-                    author="proactive",
+                    author=("antigravity" if str(job.client or "").startswith(("agy", "antigravity")) else "hermes"),
                     can_casual=False,
                     now=op["_resolved_dt"],
                 )
@@ -988,7 +1011,10 @@ def validate_and_apply_batch(
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 title = str(op.get("title") or op["project"])
-                default_header = f"---\ntype: project\ntitle: {json.dumps(title, ensure_ascii=False)}\nstatus: active\n---\n\n# {title}\n\n"
+                default_header = (
+                    f"---\ntype: project\ntitle: {json.dumps(title, ensure_ascii=False)}\n"
+                    f"proactive_owned: true\nstatus: active\n---\n\n# {title}\n\n"
+                )
                 merged = _merge_managed_block(
                     existing,
                     default_header=default_header,

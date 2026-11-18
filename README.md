@@ -20,7 +20,7 @@ Hermes、Codex、Antigravity 这类 CLI/agent 各自只有自己那份会话记�
 
 ## 架构走一遍
 
-1. **接入层**：`server.py` 起标准库 HTTP 服务（默认 `127.0.0.1:18765`，只绑本地），`mcp_server.py` 起 MCP stdio 服务给 Codex / Antigravity 用；`agy_rules.py` 是第三条通道——把身份与热记忆渲染进 `~/.gemini/GEMINI.md`（路径可用 `broker.yaml` 的 `agy_rules_path` 覆盖，且只有 `role: primary` 才写），因为 agy 每次会话都会读这个文件。渲染的身份块含**自我陈述 + 特质 + 语气 + 外观**（不是只有特质清单），并把「运行于 X 框架」按端改写；文件里还带一行「今日日记」条数状态。该文件在服务启动时刷一次，之后**任一写操作（`memory_write` / `handoff_upsert` / `diary_append`）改变 revision 就立即重渲染**（文件级 diff，变了才写），所以 agy 下次开会话拿到的是最新热记忆，而不是上个阶段的快照。
+1. **接入层**：`server.py` 起标准库 HTTP 服务（默认 `127.0.0.1:18765`，只绑本地），`mcp_server.py` 起 MCP stdio 服务给 Codex / Antigravity 用；`agy_rules.py` 是第三条通道——把身份与热记忆渲染进 `~/.gemini/GEMINI.md`（路径可用 `broker.yaml` 的 `agy_rules_path` 覆盖，且只有 `role: primary` 才写），因为 agy 每次会话都会读这个文件。渲染的身份块含**自我陈述 + 特质 + 语气 + 外观**（不是只有特质清单），并把「运行于 X 框架」按端改写。该文件在服务启动时刷一次，之后**任一写操作（`memory_write` / `handoff_upsert` / `diary_append`）改变 revision 就立即重渲染**（文件级 diff，变了才写），所以 agy 下次开会话拿到的是最新热记忆，而不是上个阶段的快照。
 2. **鉴权**：`tokens.json` 只存 token 的 sha256，`Bearer` → `client_id` → `memory.yaml` 里的 `domain` 与 `can_casual`。私账读取额外受 `diary.gate` 约束。
 3. **服务层** `BrokerService`：`boot` / `delta` / `search` / `read` / `write` / `handoff` / `diary` 七个动作，写入走"原子替换 + 重新索引"。
 4. **内核**：`parse.py` 解析 frontmatter 与 `[[wikilink]]`（含类型化关系），`segment.py` 做 CJK 重叠二元组，`index.py` 维护 FTS5 增量索引与事实键收敛，`retrieve.py` 做证据打分 + 1 跳图谱扩散 + 预算裁剪，`render.py` 负责三段渲染。
@@ -76,7 +76,7 @@ python -m agentbrain sync-agy                              # 重渲染 ~/.gemini
 | GET | `/v1/status` | 索引计数、revision、索引年龄 |
 | POST | `/v1/boot` | 启动块：人格摘要 + 协议 + 热记忆，按 `inject.<client>.boot_chars` 裁剪 |
 | POST | `/v1/delta` | 自某个 revision 以来的增量块 |
-| POST | `/v1/search` | FTS5 + 1 跳图谱扩散检索；响应附带 `diary_today`（今日公/私账条数与最后作者，不含正文） |
+| POST | `/v1/search` | FTS5 + 1 跳图谱扩散检索；按会话返回一次性后台评审完成回执 `review_receipts` |
 | POST | `/v1/read` | 读整篇笔记或指定标题块 |
 | POST | `/v1/write` | 原子写入笔记并重新索引 |
 | POST | `/v1/handoff` | 读/写结构化接力卡 |
@@ -90,8 +90,8 @@ python -m agentbrain sync-agy                              # 重渲染 ~/.gemini
 
 MCP 是"agent 主动来查"的通道，Hermes 需要的是"每轮自动送过去"。这两种语义不一样，所以仓库里另带一份 Hermes 插件：[`integrations/hermes/obsidian-broker/`](integrations/hermes/obsidian-broker/)——单文件、无第三方依赖的 `MemoryProvider` 实现：
 
-- `prefetch` 在每次用户输入前打 `POST /v1/search`，命中注入成 `[MEMORY_PREFETCH]` 块（1200 字硬顶，revision 变了多带一行 delta）；无论有没有命中，还会带一行 `[DIARY] 公账 N 条｜私账 M 条` —— 只报条数与作者，正文永不注入。这是「今天日记写了没」唯一的常驻提示，习惯靠它而不是靠临场想起；
-- `system_prompt_block` 给出静态协议（含日记约定与「闲聊不套任务纪律语态」），这是每轮都在上下文里的那一层；
+- `prefetch` 在每次用户输入前打 `POST /v1/search`，命中注入成 `[MEMORY_PREFETCH]` 块（1200 字硬顶，revision 变了多带一行 delta）；仅当后台记忆整理任务完成时，在下一轮注入一次性 `[PREVIOUS_REVIEW_RESULT]` 完成回执并立即 ack，其余轮次保持静默；
+- `system_prompt_block` 给出静态协议，这是每轮都在上下文里的那一层；
 - `on_pre_compress` 在上下文压缩前把当前任务 upsert 成 `handoff` 槽位，压缩后不丢线；
 - `get_tool_schemas` 返回空——不往会话里塞额外工具面；
 - 每个钩子 fail-open，broker 没起时静默降级，对话不受影响。
