@@ -15,6 +15,8 @@ from agentbrain.proactive import (
     EVENT_KIND_HUMAN_TURN,
     EVENT_KIND_REFERENCE_ONLY,
     ProactiveStore,
+    classify_user_turn,
+    normalize_user_text,
 )
 from agentbrain.proactive_redaction import redact_secrets
 
@@ -28,6 +30,7 @@ class IdeScanReport:
     events_ingested: int
     turns_completed: int
     unavailable_sources: list[dict[str, str]]
+    skipped_duplicate: int = 0
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,7 @@ class HermesStateDbScanReport:
     skipped_pre_activation: int
     skipped_excluded: int
     last_error: str | None = None
+    skipped_duplicate: int = 0
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
@@ -56,6 +60,44 @@ _INJECTED_BLOCK_RE = re.compile(
 
 _EXCLUDED_HERMES_SOURCES = frozenset({"cron", "subagent", "oneshot", "system", "heartbeat", "review"})
 _EXCLUDED_HERMES_SESSION_PREFIXES = ("proactive-review", "system", "heartbeat", "cron", "__internal")
+
+_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_BG_PROC_TOKEN_RE = re.compile(r"\b(?:proc|task|job|bg)[_-][a-z0-9_-]+\b", re.IGNORECASE)
+_BG_KV_ID_RE = re.compile(
+    r"\b(?:pid|process_id|task_id|job_id)\s*[:=]\s*[a-z0-9_-]+\b",
+    re.IGNORECASE,
+)
+_BG_PROCESS_NUM_RE = re.compile(r"\bprocess\s+\d+\b", re.IGNORECASE)
+_SPACES_RE = re.compile(r"[ \t]{2,}")
+_NEAR_DEDUPE_WINDOW_SECONDS = 120.0
+
+
+def _normalize_for_near_dedupe(text: str) -> str:
+    """归一化正文并剥离后台进程/任务 ID，用于同会话 120s 相邻近重复去重。"""
+    norm = normalize_user_text(text)
+    if not norm:
+        return ""
+    norm = _UUID_RE.sub("<ID>", norm)
+    norm = _BG_KV_ID_RE.sub("<ID>", norm)
+    norm = _BG_PROC_TOKEN_RE.sub("<ID>", norm)
+    norm = _BG_PROCESS_NUM_RE.sub("process <ID>", norm)
+    return _SPACES_RE.sub(" ", norm)
+
+
+def _is_near_duplicate(
+    prev: dict[str, Any] | None,
+    eff_ts: float,
+    norm_hash: str,
+) -> bool:
+    if not isinstance(prev, dict) or eff_ts <= 0:
+        return False
+    prev_ts = float(prev.get("ts") or 0.0)
+    if prev_ts <= 0:
+        return False
+    return abs(eff_ts - prev_ts) <= _NEAR_DEDUPE_WINDOW_SECONDS and prev.get("hash") == norm_hash
 
 
 def _clean_hermes_text(text: str) -> str:
@@ -105,7 +147,7 @@ def _scan_single_transcript(
     catchup: bool = False,
     is_initial_baseline: bool = False,
     root_tag: str = "",
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """增量扫描单个 transcript.jsonl，支持源级首次基线、部分行、同大小替换/截断与未完成轮次保留。"""
     source_key = str(jsonl_path.resolve())
     cursor = store.get_adapter_cursor("agy_ide", source_key)
@@ -174,7 +216,7 @@ def _scan_single_transcript(
                 "pending_user_turn": pending_user,
             },
         )
-        return 0, 0
+        return 0, 0, 0
 
     if cursor is None:
         # 激活后新建的对话文件或显式 catchup：从头处理
@@ -182,11 +224,13 @@ def _scan_single_transcript(
         last_step = -1
         generation = 0
         pending_user = None
+        last_event: dict[str, Any] | None = None
     else:
         byte_offset = int(cursor.get("byte_offset", 0))
         last_step = int(cursor.get("last_step_index", -1))
         generation = int(cursor.get("generation", 0))
         pending_user = cursor.get("pending_user_turn")
+        last_event = cursor.get("last_event") if isinstance(cursor.get("last_event"), dict) else None
         if isinstance(pending_user, dict) and "content" in pending_user:
             pending_user = {
                 **pending_user,
@@ -207,6 +251,7 @@ def _scan_single_transcript(
 
     ingested = 0
     turns = 0
+    skipped_dup = 0
     new_offset = byte_offset
 
     with jsonl_path.open("rb") as fh:
@@ -289,21 +334,45 @@ def _scan_single_transcript(
             ):
                 if pending_user is not None:
                     u_step = int(pending_user["step_index"])
-                    turn_text = f"User: {pending_user['content'].strip()}\nAssistant: {content.strip()}"
+                    user_text = pending_user["content"].strip()
+                    turn_kind = classify_user_turn(user_text)
+                    turn_text = f"User: {user_text}\nAssistant: {content.strip()}"
+                    eff_ts = occ_dt.timestamp() if occ_dt is not None else 0.0
+                    norm_hash = hashlib.sha256(_normalize_for_near_dedupe(turn_text).encode("utf-8")).hexdigest()
+                    if turn_kind == "system_notice" and _is_near_duplicate(last_event, eff_ts, norm_hash):
+                        skipped_dup += 1
+                        pending_user = None
+                        continue
+
+                    if turn_kind == "system_notice":
+                        ev_kind = EVENT_KIND_REFERENCE_ONLY
+                        qualifies_nightly = False
+                    else:
+                        ev_kind = EVENT_KIND_HUMAN_TURN
+                        qualifies_nightly = True
+
                     gen_suffix = f":g{generation}" if generation > 0 else ""
                     res = store.ingest_event(
                         client="agy_ide",
                         session_id=f"{root_tag}:{conv_id}",
                         event_id=f"agy_ide:{root_tag}:{conv_id}{gen_suffix}:turn:{u_step}-{step_index}",
-                        event_kind=EVENT_KIND_HUMAN_TURN,
+                        event_kind=ev_kind,
                         content=turn_text,
                         occurred_at=occ_dt,
-                        meta={"user_step": u_step, "model_step": step_index, "conv_id": conv_id},
-                        qualifies_nightly=True,
+                        meta={
+                            "user_step": u_step,
+                            "model_step": step_index,
+                            "conv_id": conv_id,
+                            "turn_kind": turn_kind,
+                        },
+                        qualifies_nightly=qualifies_nightly,
                     )
                     if res.accepted and not res.deduped:
                         ingested += 1
-                        turns += 1
+                        if ev_kind == EVENT_KIND_HUMAN_TURN:
+                            turns += 1
+                    if eff_ts > 0:
+                        last_event = {"ts": eff_ts, "hash": norm_hash}
                     pending_user = None
 
     prefix_len, prefix_hash = _compute_file_prefix(jsonl_path, min(new_offset, 512))
@@ -319,9 +388,10 @@ def _scan_single_transcript(
             "prefix_len": prefix_len,
             "prefix_hash": prefix_hash,
             "pending_user_turn": pending_user,
+            "last_event": last_event,
         },
     )
-    return ingested, turns
+    return ingested, turns, skipped_dup
 
 
 def scan_agy_ide_roots(
@@ -338,6 +408,7 @@ def scan_agy_ide_roots(
     transcripts_scanned = 0
     events_ingested = 0
     turns_completed = 0
+    skipped_duplicate = 0
     unavailable: list[dict[str, str]] = []
 
     for root in roots:
@@ -357,7 +428,7 @@ def scan_agy_ide_roots(
                 })
                 continue
             transcripts_scanned += 1
-            ing, trn = _scan_single_transcript(
+            ing, trn, dup = _scan_single_transcript(
                 store,
                 conv_dir.name,
                 jsonl_path,
@@ -367,6 +438,7 @@ def scan_agy_ide_roots(
             )
             events_ingested += ing
             turns_completed += trn
+            skipped_duplicate += dup
 
     if is_initial_baseline:
         store.set_adapter_cursor(
@@ -384,6 +456,7 @@ def scan_agy_ide_roots(
         events_ingested=events_ingested,
         turns_completed=turns_completed,
         unavailable_sources=unavailable,
+        skipped_duplicate=skipped_duplicate,
     )
 
 
@@ -480,12 +553,20 @@ def scan_hermes_statedb(
         else {}
     )
 
+    raw_last_by_session = cursor.get("last_by_session") if isinstance(cursor, dict) else None
+    last_by_session: dict[str, dict[str, Any]] = (
+        {str(k): dict(v) for k, v in raw_last_by_session.items() if isinstance(v, dict)}
+        if isinstance(raw_last_by_session, dict)
+        else {}
+    )
+
     sessions_seen: set[str] = set()
     turns_completed = 0
     events_ingested = 0
     events_deduped = 0
     skipped_pre_activation = 0
     skipped_excluded = 0
+    skipped_duplicate = 0
 
     try:
         uri = f"file:{resolved.as_posix()}?mode=ro"
@@ -583,16 +664,31 @@ def scan_hermes_statedb(
             if pending is None:
                 continue
 
-            turn_text = f"User: {pending['content']}\nAssistant: {clean_text}".strip()
+            user_text = pending["content"]
+            turn_kind = classify_user_turn(user_text)
+            turn_text = f"User: {user_text}\nAssistant: {clean_text}".strip()
             stable_id = uid or str(row_id)
             event_id = f"hermes:{sid}:msg:{stable_id}"
             eff_ts = float(ts_val) if ts_val is not None else float(pending.get("ts") or 0.0)
+            norm_hash = hashlib.sha256(_normalize_for_near_dedupe(turn_text).encode("utf-8")).hexdigest()
+            # 只折叠「系统通知」的近重复：真人重复发言（如连发"继续"）必须各自成轮，
+            # 否则会丢失真实轮次，也与既有语义冲突。
+            if turn_kind == "system_notice" and _is_near_duplicate(last_by_session.get(sid), eff_ts, norm_hash):
+                skipped_duplicate += 1
+                continue
+
             occ_dt = (
                 dt.datetime.fromtimestamp(eff_ts, tz=dt.timezone.utc)
                 if eff_ts > 0
                 else None
             )
-            event_kind = EVENT_KIND_REFERENCE_ONLY if src == "cli" else EVENT_KIND_HUMAN_TURN
+            if turn_kind == "system_notice":
+                event_kind = EVENT_KIND_REFERENCE_ONLY
+                qualifies_nightly = False
+            else:
+                event_kind = EVENT_KIND_REFERENCE_ONLY if src == "cli" else EVENT_KIND_HUMAN_TURN
+                qualifies_nightly = True
+
             res = store.ingest_event(
                 client="hermes",
                 session_id=sid,
@@ -605,8 +701,9 @@ def scan_hermes_statedb(
                     "source": src or "unknown",
                     "msg_id": row_id,
                     "message_uid": uid,
+                    "turn_kind": turn_kind,
                 },
-                qualifies_nightly=True,
+                qualifies_nightly=qualifies_nightly,
                 route="state_db",
             )
             if res.deduped:
@@ -615,11 +712,16 @@ def scan_hermes_statedb(
                 events_ingested += 1
                 if event_kind == EVENT_KIND_HUMAN_TURN:
                     turns_completed += 1
+            if eff_ts > 0:
+                last_by_session[sid] = {"ts": eff_ts, "hash": norm_hash}
 
     # 限制未完成缓存体积，避免长期运行膨胀
     if len(pending_users) > 200:
         keep_keys = sorted(pending_users, key=lambda k: int(pending_users[k].get("id") or 0))[-200:]
         pending_users = {k: pending_users[k] for k in keep_keys}
+    if len(last_by_session) > 200:
+        keep_last = sorted(last_by_session, key=lambda k: float(last_by_session[k].get("ts") or 0.0))[-200:]
+        last_by_session = {k: last_by_session[k] for k in keep_last}
 
     store.set_adapter_cursor(
         "hermes_statedb",
@@ -627,6 +729,7 @@ def scan_hermes_statedb(
         {
             "last_msg_id": new_last_id,
             "pending_users": pending_users,
+            "last_by_session": last_by_session,
         },
     )
 
@@ -640,4 +743,5 @@ def scan_hermes_statedb(
         skipped_pre_activation=skipped_pre_activation,
         skipped_excluded=skipped_excluded,
         last_error=None,
+        skipped_duplicate=skipped_duplicate,
     )

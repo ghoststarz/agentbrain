@@ -4,6 +4,14 @@
 
 ---
 
+## 0.1 什么算“一个用户轮次”
+
+只有**真人发言**计数。以下以 `[IMPORTANT:`、`[INTERNAL NOTIFICATION`、`[PREVIOUS_REVIEW_RESULT]`、`[DIARY]` 开头或含 `heartbeat #` 的消息会被判定为系统通知：仍然入库、仍然作为复盘证据，但 `countable=0`，不推进 5 轮计数，且证据里最多保留最近 2 条、每条截断 400 字。`[OUT-OF-BAND USER MESSAGE]` 是真人插话，正常计数。
+
+- 相邻≤120 秒、正文（剥掉进程/任务 ID 后）完全相同的**系统通知**会被折叠，避免 agy 结果回灌刷屏；真人重复发言（例如连发“继续”）各自成轮。
+- 历史库口径升级后可执行 `python -m agentbrain review-reconcile-countable`（幂等，带 `--force` 可重跑）重算 `countable` 与轮次水位；水位按「旧编号已跑批次覆盖到哪里」换算，不会把已复盘内容重排。
+- 迁移前备份：`%LOCALAPPDATA%\agentbrain\backups\countable-<stamp>\lily.db`。
+
 ## 0. 提示词放在哪（可手改，不必重启）
 
 | 文件 | 作用 |

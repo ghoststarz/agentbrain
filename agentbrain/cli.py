@@ -183,6 +183,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rcli.add_argument("--file", default="", help="从文件读取事件内容")
     p_rcli.add_argument("--event-id", default="", help="可选显式 event_id")
 
+    p_rrec = sub.add_parser("review-reconcile-countable", help="一次性幂等收敛历史可计数口径与轮次水位")
+    p_rrec.add_argument("--force", action="store_true", help="强制重新扫描并收敛（忽略已迁移标记）")
+
     register_serve_subparsers(sub)
     return parser
 
@@ -295,6 +298,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             content=content,
             event_id=args.event_id or None,
         )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "review-reconcile-countable":
+        from agentbrain.proactive import ProactiveStore
+
+        store = ProactiveStore.from_app_config(config)
+        res = store.reconcile_countable_events(force=bool(args.force))
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
     serve_rc = dispatch_serve_command(config, args)

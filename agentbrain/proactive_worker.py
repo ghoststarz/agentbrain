@@ -131,19 +131,23 @@ def _collect_existing_context(
     return "\n\n".join(snippets), snapshot_hashes
 
 
-def _format_event_block(ev: StoredEvent) -> str:
+def _format_event_block(ev: StoredEvent, *, notice_only: bool = False) -> str:
     safe_content = redact_secrets(ev.content)
+    if notice_only:
+        safe_content = safe_content[:400]
     meta_part = ""
     if ev.meta:
         safe_meta = {k: v for k, v in ev.meta.items() if k not in ("raw", "thinking")}
         if safe_meta:
             meta_part = f" meta={json.dumps(safe_meta, ensure_ascii=False)}"
     source_ref = f"{ev.client}:{ev.session_id}:{ev.event_id}"
-    return (
+    header = (
         f"[source_ref={source_ref} event_id={ev.event_id} kind={ev.event_kind} client={ev.client} "
-        f"session={ev.session_id} occurred_at={ev.occurred_at_utc} turn_seq={ev.turn_seq}{meta_part}]\n"
-        f"{safe_content}"
+        f"session={ev.session_id} occurred_at={ev.occurred_at_utc} turn_seq={ev.turn_seq}{meta_part}]"
     )
+    if notice_only:
+        return f"{header}\n[系统通知，仅参考]\n{safe_content}"
+    return f"{header}\n{safe_content}"
 
 
 def segment_job_prompts_with_snapshots(
@@ -151,14 +155,24 @@ def segment_job_prompts_with_snapshots(
     job: ClaimedJob,
     events: list[StoredEvent],
 ) -> tuple[list[tuple[list[StoredEvent], str]], dict[str, str]]:
-    """按上下文预算确定性分段并返回服务端读取快照哈希；单条超预算显式失败，绝不静默丢弃未处理证据。"""
+    """按上下文预算确定性分段并返回服务端读取快照哈希；可计数事件优先，不可计数仅保留最近 2 条且截断到 400 字。"""
+    countable_events = sorted(
+        (ev for ev in events if ev.countable),
+        key=lambda e: (e.occurred_at_us, e.row_id),
+    )
+    uncountable_events = sorted(
+        (ev for ev in events if not ev.countable),
+        key=lambda e: (e.occurred_at_us, e.row_id),
+    )[-2:]
+    ordered_events = countable_events + uncountable_events
+
     max_ctx = config.memory.proactive.model_max_context_chars
     header = (
         f"job_id={job.job_id} job_type={job.job_type} idempotency_key={job.idempotency_key} "
         f"window_id={job.window_id or ''} hot_max_chars={config.memory.hot_max_chars}\n"
     )
     context_budget = min(max_ctx // 3, 6000)
-    existing_ctx, snapshot_hashes = _collect_existing_context(config, events, context_budget)
+    existing_ctx, snapshot_hashes = _collect_existing_context(config, ordered_events, context_budget)
     static_overhead = len(_system_prompt()) + len(header) + len(existing_ctx) + 256
     event_budget = max_ctx - static_overhead
     if event_budget < 256:
@@ -166,7 +180,7 @@ def segment_job_prompts_with_snapshots(
             f"上下文预算不足以容纳任何事件（max_ctx={max_ctx}, overhead={static_overhead}）"
         )
 
-    if not events:
+    if not ordered_events:
         prompt = (
             f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
             "<untrusted_evidence>\n</untrusted_evidence>"
@@ -178,8 +192,8 @@ def segment_job_prompts_with_snapshots(
     cur_blocks: list[str] = []
     cur_len = 0
 
-    for ev in events:
-        block = _format_event_block(ev)
+    for ev in ordered_events:
+        block = _format_event_block(ev, notice_only=not ev.countable)
         if len(block) > event_budget:
             raise ContextBudgetExceededError(
                 f"单条事件 {ev.event_id} 长度 ({len(block)}) 超出单段预算 ({event_budget})，拒绝静默丢弃"
@@ -527,6 +541,8 @@ def run_worker_once(
     """认领并处理一个可执行任务；dry-run 不修改队列/租约/游标；失败时精确 ack_job_failure。"""
     if not config.memory.proactive.enabled:
         return None
+    if not dry_run:
+        store.reconcile_countable_events()
     job = store.peek_next_claimable_job() if dry_run else store.claim_job(worker_id)
     if job is None:
         return None

@@ -17,6 +17,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -42,6 +43,43 @@ EVENT_KIND_HUMAN_TURN = "human_turn"
 EVENT_KIND_REFERENCE_ONLY = "reference_only"
 EXCLUDED_EVENT_KINDS = frozenset({"system", "heartbeat", "review_generated"})
 VALID_EVENT_KINDS = frozenset({EVENT_KIND_HUMAN_TURN, EVENT_KIND_REFERENCE_ONLY}) | EXCLUDED_EVENT_KINDS
+
+SYSTEM_NOTICE_PREFIXES = (
+    "[IMPORTANT:",
+    "[INTERNAL NOTIFICATION",
+    "[PREVIOUS_REVIEW_RESULT]",
+    "[DIARY]",
+)
+_MULTI_BLANK_LINES_RE = re.compile(r"(?:\n[ \t]*){2,}")
+
+
+def extract_user_segment(text: str) -> str:
+    """从 'User: ...\\nAssistant: ...' 格式中提取首段 User 正文；若无前缀则返回原文。"""
+    s = (text or "").lstrip()
+    if s.startswith("User:"):
+        after_user = s[len("User:") :]
+        idx = after_user.find("\nAssistant:")
+        if idx >= 0:
+            return after_user[:idx]
+        return after_user
+    return text or ""
+
+
+def normalize_user_text(text: str) -> str:
+    """归一化用户文本：统一换行、去首尾空白、合并连续空行。"""
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+    return _MULTI_BLANK_LINES_RE.sub("\n\n", normalized)
+
+
+def classify_user_turn(text: str) -> str:
+    """将用户消息分类为 'system_notice'（不可计数）或 'user'（可计数）。"""
+    user_part = extract_user_segment(text)
+    norm = normalize_user_text(user_part)
+    if norm.startswith(SYSTEM_NOTICE_PREFIXES) or "heartbeat #" in norm.lower():
+        return "system_notice"
+    return "user"
 
 JOB_STATUS_PENDING = "pending"
 JOB_STATUS_RUNNING = "running"
@@ -561,7 +599,7 @@ class ProactiveStore:
             )
             counter = conn.execute(
                 """
-                SELECT completed_human_turns, last_scheduled_turn
+                SELECT completed_human_turns, last_scheduled_turn, last_reviewed_turn
                 FROM session_counters
                 WHERE client = ? AND session_id = ?
                 """,
@@ -571,6 +609,7 @@ class ProactiveStore:
 
             completed_turns = int(counter["completed_human_turns"])
             last_scheduled = int(counter["last_scheduled_turn"])
+            last_reviewed = int(counter["last_reviewed_turn"])
             turn_seq: int | None = None
             created_job_id: int | None = None
 
@@ -624,7 +663,12 @@ class ProactiveStore:
                 )
 
             batch_size = self.config.incremental_batch_size
-            if is_countable and (completed_turns - last_scheduled) >= batch_size:
+            if (
+                is_countable
+                and completed_turns > last_reviewed
+                and (completed_turns - last_scheduled) >= batch_size
+                and (completed_turns - last_reviewed) >= batch_size
+            ):
                 batch_start = last_scheduled + 1
                 batch_end = last_scheduled + batch_size
                 idem_key = f"inc:{client}:{session_id}:{batch_start}:{batch_end}"
@@ -1833,3 +1877,187 @@ class ProactiveStore:
                     now_iso,
                 ),
             )
+
+    def reconcile_countable_events(self, *, force: bool = False) -> dict[str, Any]:
+        """一次性幂等收敛：按新可计数口径重算 countable/qualifies_nightly/completed_human_turns，水位只升不降。"""
+        now_iso = ensure_utc(self.clock.now_utc()).isoformat()
+        meta_key = "countable_classification_v1_migrated"
+
+        with self._tx() as conn:
+            if not force:
+                done = conn.execute(
+                    "SELECT value FROM scheduler_meta WHERE key = ?",
+                    (meta_key,),
+                ).fetchone()
+                if done is not None:
+                    return {
+                        "already_migrated": True,
+                        "events_scanned": 0,
+                        "demoted_to_uncountable": 0,
+                        "sessions_updated": 0,
+                        "total_countable_turns": 0,
+                    }
+
+            rows = conn.execute(
+                """
+                SELECT id, client, session_id, countable, qualifies_nightly, turn_seq, content, meta_json
+                FROM events
+                ORDER BY client ASC, session_id ASC, occurred_at_us ASC, id ASC
+                """
+            ).fetchall()
+
+            events_scanned = len(rows)
+            demoted = 0
+            session_seq: dict[tuple[str, str], int] = {}
+            countable_records: list[tuple[tuple[str, str], int, int | None]] = []
+
+            for r in rows:
+                row_id = int(r["id"])
+                key = (str(r["client"]), str(r["session_id"]))
+                cur_countable = int(r["countable"])
+                cur_nightly = int(r["qualifies_nightly"])
+                cur_seq = r["turn_seq"]
+                turn_kind = classify_user_turn(str(r["content"] or ""))
+
+                try:
+                    meta_obj = json.loads(str(r["meta_json"] or "{}"))
+                    if not isinstance(meta_obj, dict):
+                        meta_obj = {}
+                except json.JSONDecodeError:
+                    meta_obj = {}
+
+                if turn_kind == "system_notice":
+                    if cur_countable == 1:
+                        demoted += 1
+                    new_countable = 0
+                    new_nightly = 0
+                    new_seq: int | None = None
+                    if (
+                        cur_countable != 0
+                        or cur_nightly != 0
+                        or cur_seq is not None
+                        or meta_obj.get("turn_kind") != "system_notice"
+                    ):
+                        meta_obj["turn_kind"] = "system_notice"
+                        conn.execute(
+                            """
+                            UPDATE events
+                            SET countable = 0, qualifies_nightly = 0, turn_seq = NULL, meta_json = ?
+                            WHERE id = ?
+                            """,
+                            (_bound_meta(meta_obj), row_id),
+                        )
+                else:
+                    new_countable = cur_countable
+                    new_seq = None
+                    if new_countable == 1:
+                        next_seq = session_seq.get(key, 0) + 1
+                        session_seq[key] = next_seq
+                        new_seq = next_seq
+                        countable_records.append((key, row_id, int(cur_seq) if cur_seq is not None else None))
+                    if cur_seq != new_seq or meta_obj.get("turn_kind") != "user":
+                        meta_obj["turn_kind"] = "user"
+                        conn.execute(
+                            """
+                            UPDATE events
+                            SET turn_seq = ?, meta_json = ?
+                            WHERE id = ?
+                            """,
+                            (new_seq, _bound_meta(meta_obj), row_id),
+                        )
+
+            # 已排队但仍未跑完的任务：这些会话的水位不能动，否则会重复排批或漏批。
+            open_sessions: set[tuple[str, str]] = set()
+            # 增量任务记录的 batch_end 是「旧编号」的轮次水位；夜间任务是全局事件序号。
+            session_old_end: dict[tuple[str, str], int] = {}
+            nightly_until = 0
+            for r in conn.execute(
+                "SELECT client, session_id, status, batch_end, window_id, until_event_id FROM jobs"
+            ):
+                key = (str(r["client"]), str(r["session_id"] or ""))
+                if str(r["status"]) in (JOB_STATUS_PENDING, JOB_STATUS_RUNNING, JOB_STATUS_RETRY_WAIT):
+                    open_sessions.add(key)
+                    continue
+                if str(r["status"]) != "succeeded":
+                    continue
+                if r["window_id"]:
+                    try:
+                        nightly_until = max(nightly_until, int(r["until_event_id"] or 0))
+                    except (TypeError, ValueError):
+                        pass
+                    continue
+                if r["batch_end"] is not None:
+                    session_old_end[key] = max(session_old_end.get(key, 0), int(r["batch_end"]))
+
+            # 旧编号 -> 新编号的可计数轮次：按「旧 turn_seq 是否已落在已跑批次内」换算。
+            reviewed_by_session: dict[tuple[str, str], int] = {}
+            global_ordinal: dict[int, int] = {}
+            for idx, r in enumerate(
+                conn.execute("SELECT id FROM events ORDER BY occurred_at_us ASC, id ASC"), start=1
+            ):
+                global_ordinal[int(r["id"])] = idx
+
+            for key, row_id, old_seq in countable_records:
+                covered = old_seq is not None and old_seq <= session_old_end.get(key, 0)
+                if not covered and nightly_until:
+                    covered = global_ordinal.get(row_id, 0) <= nightly_until
+                if covered:
+                    reviewed_by_session[key] = reviewed_by_session.get(key, 0) + 1
+
+            existing_counters = conn.execute(
+                "SELECT client, session_id FROM session_counters"
+            ).fetchall()
+            all_sessions = set(session_seq.keys()) | {
+                (str(r["client"]), str(r["session_id"])) for r in existing_counters
+            }
+
+            sessions_updated = 0
+            total_countable_turns = 0
+            for client, session_id in sorted(all_sessions):
+                new_completed = session_seq.get((client, session_id), 0)
+                total_countable_turns += new_completed
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO session_counters (
+                        client, session_id, completed_human_turns,
+                        last_scheduled_turn, last_reviewed_turn, updated_at_utc
+                    ) VALUES (?, ?, 0, 0, 0, ?)
+                    """,
+                    (client, session_id, now_iso),
+                )
+                if (client, session_id) in open_sessions:
+                    conn.execute(
+                        """
+                        UPDATE session_counters
+                        SET completed_human_turns = ?, updated_at_utc = ?
+                        WHERE client = ? AND session_id = ?
+                        """,
+                        (new_completed, now_iso, client, session_id),
+                    )
+                else:
+                    new_reviewed = min(new_completed, reviewed_by_session.get((client, session_id), 0))
+                    conn.execute(
+                        """
+                        UPDATE session_counters
+                        SET completed_human_turns = ?,
+                            last_scheduled_turn = ?,
+                            last_reviewed_turn = ?,
+                            updated_at_utc = ?
+                        WHERE client = ? AND session_id = ?
+                        """,
+                        (new_completed, new_reviewed, new_reviewed, now_iso, client, session_id),
+                    )
+                sessions_updated += 1
+
+            conn.execute(
+                "INSERT OR REPLACE INTO scheduler_meta (key, value) VALUES (?, ?)",
+                (meta_key, now_iso),
+            )
+
+            return {
+                "already_migrated": False,
+                "events_scanned": events_scanned,
+                "demoted_to_uncountable": demoted,
+                "sessions_updated": sessions_updated,
+                "total_countable_turns": total_countable_turns,
+            }
