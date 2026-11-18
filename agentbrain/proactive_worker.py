@@ -19,6 +19,7 @@ from agentbrain.config import (
 )
 from agentbrain.proactive import ClaimedJob, LeaseMismatchError, ProactiveStore, StoredEvent
 from agentbrain.proactive_apply import (
+    MAX_BATCH_OPS,
     ApplySummary,
     BatchValidationError,
     ConflictError,
@@ -35,9 +36,124 @@ _EXCLUDED_CONTEXT_PREFIXES = ("30_Diary/", "30_Diary\\", "SOUL.md", "USER.md", "
 from agentbrain.prompt_lib import load_prompt
 
 
-def _system_prompt() -> str:
-    """复盘主提示词：外部 md 文件，改了即时生效（5 轮与夜间共用）。"""
-    return load_prompt("review_system")
+def _system_prompt(job_type: str | None = None, *, window_id: str | None = None) -> str:
+    """复盘主提示词：外部 md 文件，改了即时生效；夜间任务把专用要求**前置**。"""
+    base = load_prompt("review_system")
+    if job_type == "nightly":
+        addendum = load_prompt("review_nightly_addendum")
+        if window_id:
+            addendum = addendum.replace("<窗口日期>", str(window_id))
+        # 前置而不是追加：弱模型对末尾的补充要求容易忽略，实测前置才稳定遵守。
+        return f"{addendum}\n\n{base}"
+    return base
+
+
+def _format_missing_diary_code(missing: list[str]) -> str:
+    missing_set = set(missing)
+    if "public" in missing_set and "private" in missing_set:
+        return "nightly_missing_diary:both"
+    if "public" in missing_set:
+        return "nightly_missing_diary:public"
+    if "private" in missing_set:
+        return "nightly_missing_diary:private"
+    return "nightly_missing_diary:both"
+
+
+class NightlyMissingDiaryError(RuntimeError):
+    """夜间复盘缺少必需的公账或私账日记条目。"""
+
+    def __init__(self, missing: list[str]) -> None:
+        self.missing = list(missing)
+        self.code = _format_missing_diary_code(self.missing)
+        super().__init__(self.code)
+
+
+def _extract_nightly_diary_ops(
+    raw_output: Any,
+    *,
+    window_id: str | None,
+) -> dict[str, dict[str, Any]]:
+    """从模型输出中提取符合夜间窗口日期的公/私账 diary_append 操作（按 ledger 索引）。"""
+    if not isinstance(raw_output, dict):
+        return {}
+    if str(raw_output.get("outcome") or "").strip() != "operations":
+        return {}
+    ops = raw_output.get("operations")
+    if not isinstance(ops, list):
+        return {}
+    found: dict[str, dict[str, Any]] = {}
+    target_date = str(window_id or "").strip()
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        if str(op.get("op_type") or "").strip() != "diary_append":
+            continue
+        ledger = str(op.get("ledger") or "").strip().lower()
+        if ledger not in ("public", "private"):
+            continue
+        if not str(op.get("content") or "").strip():
+            continue
+        if target_date and str(op.get("event_date") or "").strip() != target_date:
+            continue
+        if ledger not in found:
+            found[ledger] = op
+    return found
+
+
+def _missing_nightly_diary_ledgers(
+    raw_output: Any,
+    *,
+    window_id: str | None,
+    satisfied: set[str] | None = None,
+) -> list[str]:
+    found = set(_extract_nightly_diary_ops(raw_output, window_id=window_id).keys())
+    if satisfied:
+        found |= satisfied
+    return [ledger for ledger in ("public", "private") if ledger not in found]
+
+
+def _nightly_missing_retry_hint(missing: list[str], window_id: str | None) -> str:
+    if set(missing) == {"public", "private"}:
+        missing_desc = "缺少 public 和 private 日记"
+    elif "public" in missing:
+        missing_desc = "缺少 public 日记"
+    else:
+        missing_desc = "缺少 private 日记"
+    date_part = f"（event_date 必须为 {window_id}）" if window_id else ""
+    return (
+        f"\n\nIMPORTANT: 本次为夜间复盘，{missing_desc}{date_part}。"
+        "请补齐并输出合法 JSON（必须包含 diary_append，且不要返回 no_change 或空操作），"
+        "不要包含多余解释。"
+    )
+
+
+def _merge_nightly_diary_retry(
+    first_out: dict[str, Any],
+    retry_out: dict[str, Any],
+    *,
+    window_id: str | None,
+) -> dict[str, Any]:
+    """若重试仅补齐了缺失的一侧日记，则保留首次输出中已合乎窗口日期的另一侧日记。"""
+    if not isinstance(retry_out, dict):
+        return retry_out
+    if str(retry_out.get("outcome") or "").strip() != "operations":
+        return retry_out
+    retry_ops = retry_out.get("operations")
+    if not isinstance(retry_ops, list) or not retry_ops:
+        return retry_out
+    retry_diaries = _extract_nightly_diary_ops(retry_out, window_id=window_id)
+    first_diaries = _extract_nightly_diary_ops(first_out, window_id=window_id)
+    prefix = [
+        op
+        for ledger in ("public", "private")
+        if ledger not in retry_diaries and ledger in first_diaries
+        for op in (first_diaries[ledger],)
+    ]
+    if not prefix or len(prefix) + len(retry_ops) > MAX_BATCH_OPS:
+        return retry_out
+    merged = dict(retry_out)
+    merged["operations"] = prefix + list(retry_ops)
+    return merged
 
 
 class ContextBudgetExceededError(RuntimeError):
@@ -173,7 +289,7 @@ def segment_job_prompts_with_snapshots(
     )
     context_budget = min(max_ctx // 3, 6000)
     existing_ctx, snapshot_hashes = _collect_existing_context(config, ordered_events, context_budget)
-    static_overhead = len(_system_prompt()) + len(header) + len(existing_ctx) + 256
+    static_overhead = len(_system_prompt(job.job_type, window_id=job.window_id)) + len(header) + len(existing_ctx) + 256
     event_budget = max_ctx - static_overhead
     if event_budget < 256:
         raise ContextBudgetExceededError(
@@ -247,6 +363,8 @@ def _resolve_chat_completions_url(endpoint: str) -> str:
 def call_openai_compatible_model(
     cfg: ProactiveConfig,
     user_prompt: str,
+    *,
+    system_prompt: str | None = None,
 ) -> dict[str, Any]:
     """通过标准库 urllib 调用 OpenAI 兼容 HTTP JSON 接口（受限超时，无工具调用）。"""
     validate_proactive_worker_config(cfg)
@@ -256,7 +374,7 @@ def call_openai_compatible_model(
     payload = {
         "model": cfg.model_name,
         "messages": [
-            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": system_prompt if system_prompt is not None else _system_prompt()},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
@@ -305,17 +423,22 @@ def call_proactive_model(
     user_prompt: str,
     *,
     hermes_runner: Callable[..., dict[str, Any]] | None = None,
+    job_type: str | None = None,
+    window_id: str | None = None,
 ) -> dict[str, Any]:
     """根据配置路由调用后台评审模型（默认 Hermes 框架路由，可选 OpenAI 兼容端点）。"""
     cfg = config.memory.proactive
     validate_proactive_worker_config(cfg)
     backend = resolve_effective_model_backend(cfg)
+    sys_prompt = _system_prompt(job_type, window_id=window_id)
     if backend == "openai_compatible":
+        if job_type == "nightly":
+            return call_openai_compatible_model(cfg, user_prompt, system_prompt=sys_prompt)
         return call_openai_compatible_model(cfg, user_prompt)
     try:
         return call_hermes_framework_model(
             config,
-            _system_prompt(),
+            sys_prompt,
             user_prompt,
             runner=hermes_runner,
         )
@@ -347,6 +470,7 @@ def process_claimed_job(
     total_applied = 0
     total_skipped = 0
     has_applied = False
+    satisfied_ledgers: set[str] = set()
 
     if (
         not dry_run
@@ -380,6 +504,13 @@ def process_claimed_job(
         total_applied = max(0, int(cursor.get("total_applied") or 0))
         total_skipped = max(0, int(cursor.get("total_skipped") or 0))
         has_applied = bool(cursor.get("has_applied", total_applied > 0))
+        raw_ledgers = cursor.get("nightly_diary_ledgers")
+        if isinstance(raw_ledgers, list):
+            satisfied_ledgers = {
+                str(x).strip().lower()
+                for x in raw_ledgers
+                if str(x).strip().lower() in ("public", "private")
+            }
     else:
         segments, snapshot_hashes = segment_job_prompts_with_snapshots(config, job, events)
         initial_snapshot_hashes = dict(snapshot_hashes)
@@ -394,6 +525,7 @@ def process_claimed_job(
                     "total_applied": 0,
                     "total_skipped": 0,
                     "has_applied": False,
+                    "nightly_diary_ledgers": [],
                     "snapshot_hashes": snapshot_hashes,
                     "initial_snapshot_hashes": initial_snapshot_hashes,
                     "trusted_post_write_hashes": trusted_post_write_hashes,
@@ -427,7 +559,12 @@ def process_claimed_job(
 
     def _call_model_with_heartbeat(prompt: str, *, allow_compact_retry: bool = True) -> dict[str, Any]:
         if dry_run:
-            return call_proactive_model(config, prompt, hermes_runner=hermes_runner)
+            return call_proactive_model(
+                config,
+                prompt,
+                hermes_runner=hermes_runner,
+                job_type=job.job_type,
+            )
         hb_stop = threading.Event()
         hb_error: list[BaseException] = []
 
@@ -449,7 +586,13 @@ def process_claimed_job(
         hb_thread.start()
         try:
             try:
-                return call_proactive_model(config, prompt, hermes_runner=hermes_runner)
+                return call_proactive_model(
+                    config,
+                    prompt,
+                    hermes_runner=hermes_runner,
+                    job_type=job.job_type,
+                    window_id=job.window_id,
+                )
             except ModelTransportError as exc:
                 # 真实现场最常见的是输出被 max_tokens 截断导致 JSON 半截；重试一次并要求更紧凑的输出，
                 # 而不是直接把整批证据判死（判死会静默丢掉这一批对话）。
@@ -474,6 +617,29 @@ def process_claimed_job(
         _refresh_leases()
         model_out = _call_model_with_heartbeat(prompt)
         _refresh_leases()
+        is_last_seg = seg_idx == len(segments) - 1
+        if job.job_type == "nightly" and is_last_seg:
+            missing = _missing_nightly_diary_ledgers(
+                model_out,
+                window_id=job.window_id,
+                satisfied=satisfied_ledgers,
+            )
+            if missing:
+                retry_prompt = prompt + _nightly_missing_retry_hint(missing, job.window_id)
+                retry_out = _call_model_with_heartbeat(retry_prompt, allow_compact_retry=False)
+                _refresh_leases()
+                model_out = _merge_nightly_diary_retry(
+                    model_out,
+                    retry_out,
+                    window_id=job.window_id,
+                )
+                missing_after = _missing_nightly_diary_ledgers(
+                    model_out,
+                    window_id=job.window_id,
+                    satisfied=satisfied_ledgers,
+                )
+                if missing_after:
+                    raise NightlyMissingDiaryError(missing_after)
         summary: ApplySummary = validate_and_apply_batch(
             config,
             store,
@@ -488,6 +654,10 @@ def process_claimed_job(
             trusted_post_write_hashes=trusted_post_write_hashes,
             lease_check=(lambda: store.has_valid_lease(job.job_id, job.lease_token)) if not dry_run else None,
         )
+        if job.job_type == "nightly":
+            satisfied_ledgers |= set(
+                _extract_nightly_diary_ops(model_out, window_id=job.window_id).keys()
+            )
         if summary.post_write_hashes:
             snapshot_hashes.update(summary.post_write_hashes)
             trusted_post_write_hashes.update(summary.post_write_hashes)
@@ -505,6 +675,7 @@ def process_claimed_job(
                     "total_applied": total_applied,
                     "total_skipped": total_skipped,
                     "has_applied": has_applied,
+                    "nightly_diary_ledgers": sorted(satisfied_ledgers),
                     "snapshot_hashes": snapshot_hashes,
                     "initial_snapshot_hashes": initial_snapshot_hashes,
                     "trusted_post_write_hashes": trusted_post_write_hashes,
@@ -515,6 +686,19 @@ def process_claimed_job(
                     "segments_prompts": [p for _, p in segments],
                 },
             )
+
+    if job.job_type == "nightly":
+        missing_final = [l for l in ("public", "private") if l not in satisfied_ledgers]
+        if missing_final:
+            raise NightlyMissingDiaryError(missing_final)
+        if not dry_run and job.window_id:
+            missing_disk: list[str] = []
+            if not (config.profile_dir / "30_Diary" / "Public" / f"{job.window_id}.md").exists():
+                missing_disk.append("public")
+            if not (config.profile_dir / "30_Diary" / "Private" / f"{job.window_id}.md").exists():
+                missing_disk.append("private")
+            if missing_disk:
+                raise NightlyMissingDiaryError(missing_disk)
 
     return WorkerRunResult(
         job_id=job.job_id,
@@ -576,14 +760,17 @@ def run_worker_once(
         ContextBudgetExceededError,
         LeaseMismatchError,
         ModelTransportError,
+        NightlyMissingDiaryError,
         Exception,
     ) as exc:
         if not dry_run:
             try:
+                is_missing_diary = isinstance(exc, NightlyMissingDiaryError)
                 store.ack_job_failure(
                     job.job_id,
                     job.lease_token,
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=exc.code if is_missing_diary else f"{type(exc).__name__}: {exc}",
+                    force_dead=is_missing_diary,
                 )
             except LeaseMismatchError:
                 pass

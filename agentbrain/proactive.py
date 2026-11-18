@@ -1258,6 +1258,7 @@ class ProactiveStore:
         *,
         error: str,
         retry_delay_seconds: int | None = None,
+        force_dead: bool = False,
     ) -> str:
         """记录任务失败并计算指数退避重试时间；绝不推进已评审进度。"""
         now_us = dt_to_us(self.clock.now_utc())
@@ -1277,7 +1278,7 @@ class ProactiveStore:
 
             attempts = int(row["attempts"])
             max_attempts = int(row["max_attempts"])
-            if attempts < max_attempts:
+            if not force_dead and attempts < max_attempts:
                 if retry_delay_seconds is not None:
                     delay_sec = max(0, int(retry_delay_seconds))
                 else:
