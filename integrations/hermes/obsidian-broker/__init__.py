@@ -46,6 +46,26 @@ _CATEGORY_LABELS = {
 }
 
 
+def _publish_review_notice(session_id: str, text: str) -> bool:
+    """把回执作为会话内系统提示（review.summary）推给客户端。
+
+    与 Hermes 自身的 "💾 Memory updated" 同一个通道：只出现在聊天界面，不进模型上下文，
+    也不占用模型输出。插件与网关同进程，取不到网关（CLI/旧版本）时返回 False 由调用方回退。
+    """
+    sid = str(session_id or "").strip()
+    if not sid or not text:
+        return False
+    try:
+        from tui_gateway import server as _gateway
+
+        emit = getattr(_gateway, "_emit", None)
+        if emit is None:
+            return False
+        return bool(emit("review.summary", sid, {"text": text}))
+    except Exception:
+        return False
+
+
 def _format_review_receipts(receipts: Any) -> tuple[list[str], list[int]]:
     """格式化一次性后台记忆整理完成回执（仅含结果/分类计数，不含日记或对话正文）。"""
     if not isinstance(receipts, list) or not receipts:
@@ -71,10 +91,8 @@ def _format_review_receipts(receipts: Any) -> tuple[list[str], list[int]]:
             body = f"{scope_label}失败：{err}"
         else:
             continue
-        # 用户看不见注入的上下文，所以明确要求助手在回复里转述一行。
-        lines.append(
-            f"[PREVIOUS_REVIEW_RESULT] {body}。（请在本轮回复开头用一行把这个结果告诉用户，不要展开细节）"
-        )
+        # 干净的展示文案；是否要求模型转述由调用方决定（正常走界面提示，不需要模型参与）。
+        lines.append(f"💾 {body}")
     return lines, ids
 
 
@@ -429,6 +447,29 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
 
             hits = res.get("hits") or []
             receipt_lines, receipt_ids = _format_review_receipts(res.get("review_receipts"))
+            if receipt_lines and effective_session_id:
+                # 优先走界面提示（review.summary）：不占模型上下文、不占模型输出。
+                published_ids: list[int] = []
+                fallback_lines: list[str] = []
+                for line, rid in zip(receipt_lines, receipt_ids):
+                    if _publish_review_notice(effective_session_id, line):
+                        published_ids.append(rid)
+                    else:
+                        fallback_lines.append(
+                            f"[PREVIOUS_REVIEW_RESULT] {line.lstrip('💾 ')}"
+                            "（请在本轮回复开头用一行告诉用户这个结果，不要展开细节）"
+                        )
+                receipt_lines = fallback_lines
+                if published_ids:
+                    try:
+                        self._http_json(
+                            "POST",
+                            "/v1/review/receipts/ack",
+                            {"session_id": effective_session_id, "receipt_ids": published_ids},
+                            timeout=0.5,
+                        )
+                    except Exception as ack_exc:
+                        self._logger.warning("review receipts ack failed: %s", ack_exc)
             if receipt_ids and effective_session_id:
                 try:
                     self._http_json(
