@@ -899,6 +899,55 @@ class ProactiveStore:
                 ):
                     jobs_created += 1
 
+            # 3. 兜底补齐：窗口存在、当前 revision 还没完成，但根本没有对应任务
+            #    （外部手改状态、任务被清理、或上次 enqueue 失败）。否则窗口会永久卡在 pending。
+            outstanding = conn.execute(
+                """
+                SELECT nw.window_id, nw.last_revision, nw.completed_revision,
+                       nw.watermark_event_id, nw.window_start_us, nw.window_end_us
+                FROM nightly_windows nw
+                WHERE nw.last_revision > nw.completed_revision
+                  AND nw.status IN ('pending', 'scheduled', 'reopened')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jobs j
+                      WHERE j.job_type = 'nightly'
+                        AND j.window_id = nw.window_id
+                        AND j.revision = nw.last_revision
+                        AND j.status != 'dead'
+                  )
+                ORDER BY nw.window_end_us ASC, nw.window_id ASC
+                """
+            ).fetchall()
+            for win in outstanding:
+                win_id = str(win["window_id"])
+                rev = int(win["last_revision"])
+                watermark = int(win["watermark_event_id"] or 0)
+                stats = conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM events
+                    WHERE qualifies_nightly = 1
+                      AND occurred_at_us >= ?
+                      AND occurred_at_us < ?
+                      AND id <= ?
+                    """,
+                    (int(win["window_start_us"]), int(win["window_end_us"]), watermark),
+                ).fetchone()
+                cnt = int(stats["cnt"]) if stats is not None else 0
+                if cnt == 0:
+                    continue
+                if self._enqueue_nightly_job(
+                    conn,
+                    window_id=win_id,
+                    revision=rev,
+                    since_event_id=0,
+                    until_event_id=watermark,
+                    event_count=cnt,
+                    now_utc=now_utc,
+                    now_us=now_us,
+                ):
+                    jobs_created += 1
+
         return TickResult(
             windows_checked=windows_checked,
             windows_skipped_empty=windows_skipped_empty,
