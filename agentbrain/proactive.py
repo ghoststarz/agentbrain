@@ -1281,11 +1281,24 @@ class ProactiveStore:
             receipt_session = str(row["session_id"] or "")
             conn.execute(
                 """
-                INSERT OR IGNORE INTO review_receipts (
+                INSERT INTO review_receipts (
                     job_id, client, session_id, job_type, outcome,
                     applied_count, categories_json, error_summary,
                     created_at_utc, created_at_us
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    client = excluded.client,
+                    session_id = excluded.session_id,
+                    job_type = excluded.job_type,
+                    outcome = excluded.outcome,
+                    applied_count = excluded.applied_count,
+                    categories_json = excluded.categories_json,
+                    error_summary = excluded.error_summary,
+                    created_at_utc = excluded.created_at_utc,
+                    created_at_us = excluded.created_at_us,
+                    delivered_at_utc = NULL,
+                    delivered_to_client = NULL,
+                    delivered_to_session_id = NULL
                 """,
                 (
                     job_id,
@@ -1369,12 +1382,25 @@ class ProactiveStore:
                 safe_err = redact_secrets(bounded_err)[:160]
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO review_receipts (
+                    INSERT INTO review_receipts (
                         job_id, client, session_id, job_type, outcome,
                         applied_count, categories_json, error_summary,
                         created_at_utc, created_at_us
                     ) VALUES (?, ?, ?, ?, 'failed', 0, '{}', ?, ?, ?)
-                    """,
+                ON CONFLICT(job_id) DO UPDATE SET
+                    client = excluded.client,
+                    session_id = excluded.session_id,
+                    job_type = excluded.job_type,
+                    outcome = excluded.outcome,
+                    applied_count = excluded.applied_count,
+                    categories_json = excluded.categories_json,
+                    error_summary = excluded.error_summary,
+                    created_at_utc = excluded.created_at_utc,
+                    created_at_us = excluded.created_at_us,
+                    delivered_at_utc = NULL,
+                    delivered_to_client = NULL,
+                    delivered_to_session_id = NULL
+                """,
                     (
                         job_id,
                         receipt_client,

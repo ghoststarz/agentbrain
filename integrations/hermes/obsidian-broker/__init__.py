@@ -62,17 +62,10 @@ def _format_review_receipts(receipts: Any) -> tuple[list[str], list[int]]:
         scope_label = "夜间后台记忆整理" if job_type == "nightly" else "上轮后台记忆整理"
         outcome = str(item.get("outcome") or "").strip().lower()
         if outcome == "applied":
-            applied_n = int(item.get("applied_count") or 0)
-            cats = item.get("categories") if isinstance(item.get("categories"), dict) else {}
-            cat_parts = [
-                f"{_CATEGORY_LABELS.get(str(k), str(k))} {int(v)}"
-                for k, v in cats.items()
-                if int(v or 0) > 0
-            ]
-            cat_desc = f"（{'、'.join(cat_parts)}）" if cat_parts else ""
-            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：写入 {applied_n} 条{cat_desc}。")
+            # 只报“写了 / 没写”，不暴露任何具体内容或条目计数（分类信息仍可留在服务端审计）。
+            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：长期记忆已写。")
         elif outcome == "no_change":
-            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：无新增变更（no_change）。")
+            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：记忆no_change。")
         elif outcome == "failed":
             err = str(item.get("error_summary") or "unknown_error").replace("\n", " ").strip()[:120]
             lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}失败：{err}")

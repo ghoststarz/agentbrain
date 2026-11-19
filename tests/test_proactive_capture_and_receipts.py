@@ -297,8 +297,10 @@ def test_hermes_statedb_end_to_end_5_turns_job_notes_once_receipt(
         # 2) local-galaxy 下一轮收到一次性 [PREVIOUS_REVIEW_RESULT] 并自动 ack
         out_once = provider.prefetch("继续聊点别的", session_id="local-galaxy")
         assert "[PREVIOUS_REVIEW_RESULT]" in out_once
-        assert "写入 1 条" in out_once
-        assert "长期记忆 1" in out_once
+        assert "长期记忆已写" in out_once
+        # 不再暴露具体分类计数（用户要求只报“写了/没写”）
+        assert "长期记忆 1" not in out_once
+        assert "日记" not in out_once
         assert "[DIARY]" not in out_once
 
         # 3) 再下一轮完全静默
