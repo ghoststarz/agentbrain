@@ -207,7 +207,9 @@ def _resolve_evidence_level(
 ) -> str:
     ev_level = str(raw_level or "report").strip().lower()
     if ev_level not in _EVIDENCE_LEVELS:
-        raise BatchValidationError(f"operation[{op_idx}] 非法 evidence_level: {ev_level!r}")
+        # 模型常自造词（inferred/probable…）。降级成 report 比让整批作废划算：
+        # 一次枚举写错不该丢掉这一批对话的全部结论。
+        ev_level = "report"
     if ev_level == "verified" and not _has_source_validation_evidence(matched_events):
         return "report"
     return ev_level

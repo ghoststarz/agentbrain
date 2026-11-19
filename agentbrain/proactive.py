@@ -1377,6 +1377,13 @@ class ProactiveStore:
                     """,
                     (new_status, bounded_err, now_us, job_id),
                 )
+                if new_status == JOB_STATUS_DEAD:
+                    # 任务判死后若被重新排队，旧的进度游标会让它“跳过所有分段”直接空跑；
+                    # 判死时清掉，保证重跑真的重做。
+                    conn.execute(
+                        "DELETE FROM adapter_cursors WHERE adapter_name = 'worker_segment' AND source_key = ?",
+                        (f"job_segment_progress:{job_id}",),
+                    )
                 receipt_client = display_client_id(str(row["client"] or ("nightly" if row["job_type"] == "nightly" else "")))
                 receipt_session = str(row["session_id"] or "")
                 safe_err = redact_secrets(bounded_err)[:160]

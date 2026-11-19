@@ -12,9 +12,11 @@ from agentbrain.prompt_lib import PromptAssetError, list_prompts, load_prompt, p
 
 def test_review_system_prompt_loads_with_core_rules() -> None:
     text = load_prompt("review_system")
-    assert "no_change" in text
-    assert "expected_hash" in text
-    assert "日记" in text
+    assert "longterm_upsert" in text
+    assert "diary_append" in text
+    assert "source_refs" in text
+    # 实测：提示词里出现 no_change 这个选项本身会显著提高不写率，因此正文不应包含它。
+    assert "no_change" not in text
 
 
 def test_agy_tool_rules_prompt_available() -> None:

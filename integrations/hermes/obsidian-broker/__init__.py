@@ -63,12 +63,18 @@ def _format_review_receipts(receipts: Any) -> tuple[list[str], list[int]]:
         outcome = str(item.get("outcome") or "").strip().lower()
         if outcome == "applied":
             # 只报“写了 / 没写”，不暴露任何具体内容或条目计数（分类信息仍可留在服务端审计）。
-            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：长期记忆已写。")
+            body = f"{scope_label}已完成：长期记忆已写"
         elif outcome == "no_change":
-            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}已完成：记忆no_change。")
+            body = f"{scope_label}已完成：记忆no_change"
         elif outcome == "failed":
             err = str(item.get("error_summary") or "unknown_error").replace("\n", " ").strip()[:120]
-            lines.append(f"[PREVIOUS_REVIEW_RESULT] {scope_label}失败：{err}")
+            body = f"{scope_label}失败：{err}"
+        else:
+            continue
+        # 用户看不见注入的上下文，所以明确要求助手在回复里转述一行。
+        lines.append(
+            f"[PREVIOUS_REVIEW_RESULT] {body}。（请在本轮回复开头用一行把这个结果告诉用户，不要展开细节）"
+        )
     return lines, ids
 
 
