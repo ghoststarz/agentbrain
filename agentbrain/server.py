@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
 import threading
@@ -77,6 +78,66 @@ def _extract_hard_anchor_keys(
 def _sanitize_filename(name: str) -> str:
     cleaned = _SAFE_FILENAME_RE.sub("-", name).strip().strip(".")
     return cleaned[:80] if cleaned else "note"
+
+
+def _norm_text(value: str) -> str:
+    """归一化文本用于镜像笔记比对（折叠所有空白）。"""
+    return " ".join(str(value or "").split())
+
+
+def _note_tags(meta: dict[str, Any]) -> list[str]:
+    raw = meta.get("tags")
+    if isinstance(raw, str):
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    return []
+
+
+def _find_upsert_target(
+    target_dir: Path,
+    safe_stem: str,
+    previous_content: str,
+    tags: list[str],
+) -> Path | None:
+    """在目标目录里定位「本次写入应该覆盖的那一条」笔记；找不到返回 None。
+
+    优先用 frontmatter 的 `mirror_hash` 对上旧正文的哈希（编辑记忆时最准），
+    其次用旧正文归一化后的前缀做包含匹配，最后才按标题/文件名兜底。
+    调用方带 `hermes-mirror` 标签时只覆盖同样带该标签的笔记，绝不吞掉手写笔记。
+    """
+    if not target_dir.is_dir():
+        return None
+    mirror_only = "hermes-mirror" in tags
+    prev_norm = _norm_text(previous_content)
+    prev_hash = hashlib.sha256(prev_norm.encode("utf-8")).hexdigest() if prev_norm else ""
+    prev_probe = prev_norm[:200]
+
+    by_hash: Path | None = None
+    by_content: Path | None = None
+    by_title: Path | None = None
+    for path in sorted(target_dir.glob("*.md")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        try:
+            meta = parse_note(path, text).frontmatter or {}
+        except Exception:  # noqa: BLE001
+            meta = {}
+        if mirror_only and "hermes-mirror" not in _note_tags(meta):
+            continue
+        if prev_hash and str(meta.get("mirror_hash") or "").strip() == prev_hash:
+            by_hash = by_hash or path
+            continue
+        if prev_probe and prev_probe in _norm_text(text):
+            by_content = by_content or path
+            continue
+        if path.stem == safe_stem or str(meta.get("title") or "").strip() == safe_stem:
+            by_title = by_title or path
+    return by_hash or by_content or by_title
 
 
 class ServiceError(Exception):
@@ -325,15 +386,37 @@ class BrokerService:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         safe_stem = _sanitize_filename(title_raw)
-        target_file = target_dir / f"{safe_stem}.md"
-        if target_file.exists():
-            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-            target_file = target_dir / f"{safe_stem}-{stamp}.md"
+        upsert = bool(payload.get("upsert"))
+        previous_content = str(payload.get("previous_content") or "").strip()
+
+        created_str = today_str
+        existing_target: Path | None = None
+        if upsert:
+            existing_target = _find_upsert_target(target_dir, safe_stem, previous_content, tags)
+        if existing_target is not None:
+            # 镜像/更新语义：原地覆盖，保留原文件路径与 created，不再另存带时间戳的副本
+            target_file = existing_target
+            try:
+                prev_meta = parse_note(
+                    existing_target,
+                    existing_target.read_text(encoding="utf-8", errors="replace"),
+                ).frontmatter or {}
+            except Exception:  # noqa: BLE001
+                prev_meta = {}
+            created_str = str(prev_meta.get("created") or "").strip() or today_str
+            prev_title = str(prev_meta.get("title") or "").strip()
+            if prev_title:
+                title_raw = prev_title
+        else:
+            target_file = target_dir / f"{safe_stem}.md"
+            if target_file.exists():
+                stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                target_file = target_dir / f"{safe_stem}-{stamp}.md"
 
         fm_lines = [
             "---",
             f"type: {note_type}",
-            f"created: {today_str}",
+            f"created: {created_str}",
             f"updated: {today_str}",
             f"source: {identity.display_source}",
             f"domain: {identity.domain}",
@@ -345,6 +428,9 @@ class BrokerService:
             f"keys2: {json.dumps(keys2, ensure_ascii=False)}",
             f"order: {order}",
         ]
+        if "hermes-mirror" in tags:
+            # 记录本次正文的指纹：下一次编辑记忆时据此精确命中同一条，不必靠标题猜
+            fm_lines.append(f"mirror_hash: {hashlib.sha256(_norm_text(content).encode('utf-8')).hexdigest()}")
         if aliases:
             fm_lines.append(f"aliases: {json.dumps(aliases, ensure_ascii=False)}")
         fm_lines.append("---")

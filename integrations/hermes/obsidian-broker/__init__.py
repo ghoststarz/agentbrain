@@ -287,6 +287,27 @@ def _strip_thinking_and_memory(text: str) -> str:
     return cleaned.strip()
 
 
+_MIRROR_TITLE_MAX = 24
+
+
+def _derive_mirror_title(text: str) -> str:
+    """从记忆条目正文派生短标题（避免把整句话当文件名）。"""
+    first = ""
+    for line in str(text or "").splitlines():
+        clean = line.strip().lstrip("#").strip()
+        if clean:
+            first = clean
+            break
+    if not first:
+        return ""
+    for sep in ("：", ":", "。", "；", ";", "，", ","):
+        idx = first.find(sep)
+        if 0 < idx <= _MIRROR_TITLE_MAX:
+            first = first[:idx]
+            break
+    return " ".join(first.split())[:_MIRROR_TITLE_MAX].strip()
+
+
 def _is_filtered_turn(session_id: str, turn_author: Optional[dict[str, Any]]) -> bool:
     sid = (session_id or "").strip().lower()
     if sid.startswith(("proactive-review", "system", "heartbeat", "cron", "__internal")):
@@ -799,16 +820,22 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
         try:
             if self._closed or action == "remove" or not (content or "").strip():
                 return
-            self._http_json(
-                "POST",
-                "/v1/write",
-                {
-                    "content": content,
-                    "type": "fact",
-                    "tags": ["hermes-mirror", str(target or "memory")],
-                },
-                timeout=1.5,
-            )
+            meta = metadata if isinstance(metadata, dict) else {}
+            payload: dict[str, Any] = {
+                "content": content,
+                "type": "fact",
+                "tags": ["hermes-mirror", str(target or "memory")],
+                # 镜像写入必须是 upsert：同名/同条目原地更新，不要每改一次就长出一份带时间戳的副本
+                "upsert": True,
+            }
+            derived_title = _derive_mirror_title(content)
+            if derived_title:
+                payload["title"] = derived_title
+            prev = str(meta.get("previous_content") or "").strip()
+            if prev:
+                # 这条记忆被编辑前的原文：服务端据此精确找回同一条笔记并原地覆盖
+                payload["previous_content"] = prev
+            self._http_json("POST", "/v1/write", payload, timeout=1.5)
         except Exception as exc:
             self._logger.warning("on_memory_write failed: %s", exc)
 
