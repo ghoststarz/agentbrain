@@ -562,7 +562,9 @@ def test_restricted_projection_security_manual_blocks_conflict_and_diary_idempot
     assert summary.applied_count == 2
     assert summary.skipped_dedupe_count == 1  # 崩溃重放日记未重复追加！
 
-    fact_text = (cfg.profile_dir / "20_LongTerm" / "Facts" / "Alpha Fact.md").read_text(encoding="utf-8")
+    alpha_files = sorted((cfg.profile_dir / "20_LongTerm" / "Facts").glob("FACT-*-Alpha-Fact.md"))
+    assert len(alpha_files) == 1
+    fact_text = alpha_files[0].read_text(encoding="utf-8")
     assert "evidence_level: report" in fact_text
 
     updated_proj = proj_path.read_text(encoding="utf-8")
@@ -612,7 +614,7 @@ def test_budget_segmentation_lease_concurrency_and_http_endpoints(tmp_path: Path
                 enabled=True,
                 model_endpoint=srv.endpoint,
                 model_name="fake-gpt",
-                model_max_context_chars=1800,
+                model_max_context_chars=6000,
                 max_payload_chars=1500,
             ),
         )
@@ -621,8 +623,10 @@ def test_budget_segmentation_lease_concurrency_and_http_endpoints(tmp_path: Path
             store_tiny.ingest_event(client="hermes", session_id="tiny", event_id=f"t-{i}", content="B" * 1200)
         job_tiny = store_tiny.claim_job("w1")
         assert job_tiny is not None
-        with pytest.raises(ContextBudgetExceededError):
-            process_claimed_job(cfg_tiny, store_tiny, job_tiny, clock=clock)
+        # 需求 1：单条事件超单段预算时确定性切分并保留全部证据，不再整单硬失败
+        res_tiny = process_claimed_job(cfg_tiny, store_tiny, job_tiny, clock=clock)
+        assert res_tiny is not None
+        assert res_tiny.segments_processed >= 2
 
     # 2. 进程级耐久租约互斥
     tok1 = store.try_acquire_runner_lease("proc-1", lease_seconds=60)

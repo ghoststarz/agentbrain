@@ -181,6 +181,7 @@ class ProactiveRunner:
                 "windows_skipped_empty": tick_res.windows_skipped_empty,
                 "jobs_created": tick_res.jobs_created,
                 "windows_reopened": tick_res.windows_reopened,
+                "windows_requeued_dead": tick_res.windows_requeued_dead,
             },
             "ide_turns": ide_report.turns_completed if ide_report else 0,
             "hermes_turns": hermes_report.turns_completed if hermes_report else 0,

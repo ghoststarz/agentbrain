@@ -16,7 +16,10 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `agentbrain/prompt_assets/review_system.md` | 复盘主提示词：5 轮增量与 23:00 夜间**共用这一份** |
+| `agentbrain/prompt_assets/review_system.md` | 复盘主提示词：5 轮增量与 22:30 夜间**共用这一份**（人格部分运行时从 SOUL.md 热读） |
+| `agentbrain/prompt_assets/review_nightly_addendum.md` | 夜间整轮要求：必须各写一条公账与私账 |
+| `agentbrain/prompt_assets/review_nightly_segment.md` | 夜间多分段时的分段要求：只输出 `digest`，不写日记 |
+| `agentbrain/prompt_assets/review_repair.md` | 批量校验失败后的一次「只修格式」重试指令 |
 | `agentbrain/prompt_assets/review_retry_compact.md` | 模型输出被截断时的重试指令 |
 | `agentbrain/prompt_assets/agy_tool_rules.md` | 写进 `~/.gemini/GEMINI.md` 的 agy 记忆规则（改后跑 `agentbrain sync-agy`） |
 
@@ -39,7 +42,7 @@
 - 真实 Hermes 运行时 `background_review` / 主模型路由调用（或可选 OpenAI 兼容端点）与实际提取质量。
 - 真实 `agy` IDE 运行目录（`brain/*/.system_generated/logs/transcript.jsonl`）在实时对话中的增量捕获。
 - 真实 Hermes 运行时加载更新后的 `obsidian-broker` 插件与 `/new` 会话流转。
-- 真实 OS 本地时间 23:00 跨夜及漏夜追平运行。
+- 真实 OS 本地时间 22:30 跨夜及漏夜追平运行。
 
 ---
 
@@ -65,8 +68,10 @@ proactive:
   enabled: true
   event_capture: true
   incremental_batch_size: 5
-  nightly_hour: 23
-  nightly_minute: 0
+  nightly_hour: 22
+  nightly_minute: 30
+  archive_enabled: true        # 夜间复盘末尾执行 14 天遗忘归档
+  archive_after_days: 14
   lease_seconds: 300
   max_attempts: 5
   base_backoff_seconds: 30
@@ -157,11 +162,11 @@ HTTP 服务运行中也可通过鉴权请求查看状态：`GET http://127.0.0.1
 4. 运行 `review-status`：确认 Hermes 与 `agy_ide` 会话均达到 `completed_human_turns == 5`，各自生成 `incremental` 任务并成功变为 `succeeded`（`outcome` 为 `applied` 或 `no_change`）。
 5. 检查对应笔记或 `30_Diary/` 是否符合预期、未触碰 `SOUL.md`、手工项目段落完好。
 
-### B. 23:00 夜间窗口验收
-1. 在当日有过对话后，等待 OS 本地时间越过 23:00（或重启后首个周期 tick）。
+### B. 22:30 夜间窗口验收
+1. 在当日有过对话后，等待 OS 本地时间越过 22:30（或重启后首个周期 tick）。
 2. 运行 `review-status`：确认 `nightly_windows` 生成当日窗口并执行 `nightly` 任务；若当日无有效事件则记录为 `skipped_empty` 且不调用模型。
 3. 若产出了日记，确认文件名日期为窗口日期而非次日日期。
 
 ### C. 漏夜追平验收
-1. 关闭服务跨过 1 个或多个 23:00（期间如有离线 IDE 记录或无记录）。
+1. 关闭服务跨过 1 个或多个 22:30（期间如有离线 IDE 记录或无记录）。
 2. 重新启动服务后观察 `review-status`：确认空窗口被跳过，非空窗口按 `window_id` 时间先后顺序逐一完成追平，无重复写入与重复日记。

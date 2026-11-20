@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import threading
@@ -11,12 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from agentbrain.archive import apply_archive, plan_archive
 from agentbrain.config import (
     AppConfig,
     ProactiveConfig,
     resolve_effective_model_backend,
     validate_proactive_worker_config,
 )
+from agentbrain.index import touch_notes_access
 from agentbrain.proactive import ClaimedJob, LeaseMismatchError, ProactiveStore, StoredEvent
 from agentbrain.proactive_apply import (
     MAX_BATCH_OPS,
@@ -26,26 +29,70 @@ from agentbrain.proactive_apply import (
     sha256_text,
     validate_and_apply_batch,
 )
-from agentbrain.proactive_clock import Clock, SystemClock
+from agentbrain.proactive_clock import Clock, SystemClock, dt_to_us, ensure_utc
 from agentbrain.proactive_hermes import HermesBridgeError, call_hermes_framework_model
 from agentbrain.proactive_redaction import redact_secrets
+from agentbrain.prompt_lib import PromptAssetError, load_prompt, load_soul
 from agentbrain.retrieve import search_notes
 
 _EXCLUDED_CONTEXT_PREFIXES = ("30_Diary/", "30_Diary\\", "SOUL.md", "USER.md", "RULES.md")
 
-from agentbrain.prompt_lib import load_prompt
 
+def _system_prompt(
+    job_type: str | None = None,
+    *,
+    window_id: str | None = None,
+    soul_text: str | None = None,
+    soul_path: Path | str | None = None,
+    allow_diary: bool = True,
+) -> str:
+    """复盘主提示词：人格从 SOUL.md 运行时热读，与「怎么写」操作规则分离；夜间任务前置专用要求。
 
-def _system_prompt(job_type: str | None = None, *, window_id: str | None = None) -> str:
-    """复盘主提示词：外部 md 文件，改了即时生效；夜间任务把专用要求**前置**。"""
+    `allow_diary=False` 用于夜间复盘的分段轮次：那几轮只产出 digest，日记留给最后一个分段统一写，
+    避免多分段各写一份日记，把一天写成七八条重复流水账。
+    """
+    if soul_text is None:
+        if soul_path is None:
+            raise PromptAssetError("必须提供 soul_text 或 soul_path，禁止静默退化为空人格")
+        resolved_soul = load_soul(soul_path)
+    else:
+        resolved_soul = str(soul_text).strip()
+        if not resolved_soul:
+            raise PromptAssetError("soul_text 不能为空，禁止静默退化为空人格")
+
+    persona_block = f"## 你是谁（运行时读取自 SOUL.md，此处不得写死）\n\n{resolved_soul}"
     base = load_prompt("review_system")
     if job_type == "nightly":
-        addendum = load_prompt("review_nightly_addendum")
+        addendum_name = "review_nightly_addendum" if allow_diary else "review_nightly_segment"
+        addendum = load_prompt(addendum_name)
         if window_id:
             addendum = addendum.replace("<窗口日期>", str(window_id))
         # 前置而不是追加：弱模型对末尾的补充要求容易忽略，实测前置才稳定遵守。
-        return f"{addendum}\n\n{base}"
-    return base
+        return f"{addendum}\n\n{persona_block}\n\n{base}"
+    return f"{persona_block}\n\n{base}"
+
+
+def _nightly_system_prompt_overhead_chars(
+    *,
+    window_id: str | None,
+    soul_text: str | None = None,
+    soul_path: Path | str | None = None,
+) -> int:
+    """预算估算用：取「完整版」与「分段版」两种提示词里更长的那个长度。"""
+    lengths = []
+    for allow in (True, False):
+        lengths.append(
+            len(
+                _system_prompt(
+                    "nightly",
+                    window_id=window_id,
+                    soul_text=soul_text,
+                    soul_path=soul_path,
+                    allow_diary=allow,
+                )
+            )
+        )
+    return max(lengths)
 
 
 def _format_missing_diary_code(missing: list[str]) -> str:
@@ -112,6 +159,29 @@ def _missing_nightly_diary_ledgers(
     return [ledger for ledger in ("public", "private") if ledger not in found]
 
 
+def _strip_diary_ops(raw_output: Any) -> tuple[Any, int]:
+    """防御性剔除日记操作：多分段夜间复盘里，只有最后一个分段允许写日记。"""
+    if not isinstance(raw_output, dict):
+        return raw_output, 0
+    ops = raw_output.get("operations")
+    if not isinstance(ops, list):
+        return raw_output, 0
+    kept: list[Any] = []
+    removed = 0
+    for op in ops:
+        if isinstance(op, dict) and str(op.get("op_type") or "").strip() == "diary_append":
+            removed += 1
+            continue
+        kept.append(op)
+    if removed == 0:
+        return raw_output, 0
+    cleaned = dict(raw_output)
+    cleaned["operations"] = kept
+    if not kept:
+        cleaned["outcome"] = "no_change"
+    return cleaned, removed
+
+
 def _nightly_missing_retry_hint(missing: list[str], window_id: str | None) -> str:
     if set(missing) == {"public", "private"}:
         missing_desc = "缺少 public 和 private 日记"
@@ -174,6 +244,7 @@ class WorkerRunResult:
     applied_count: int
     skipped_dedupe_count: int
     dry_run: bool
+    model_route: dict[str, Any] | None = None
 
 
 def _collect_existing_context(
@@ -244,6 +315,9 @@ def _collect_existing_context(
         except Exception:
             pass
 
+    if snapshot_hashes:
+        touch_notes_access(config, snapshot_hashes.keys())
+
     return "\n\n".join(snippets), snapshot_hashes
 
 
@@ -264,6 +338,34 @@ def _format_event_block(ev: StoredEvent, *, notice_only: bool = False) -> str:
     if notice_only:
         return f"{header}\n[系统通知，仅参考]\n{safe_content}"
     return f"{header}\n{safe_content}"
+
+
+def _split_oversized_block(event_id: str, block: str, event_budget: int) -> list[str]:
+    """当单条事件 block 超出 event_budget 时，确定性按字符切为 N 段，不丢内容、不重复、顺序不变。"""
+    if len(block) <= event_budget:
+        return [block]
+
+    total_parts = 2
+    for _ in range(5):
+        max_prefix = f"[part {total_parts}/{total_parts} of event_id={event_id}]\n"
+        body_budget = event_budget - len(max_prefix)
+        if body_budget <= 0:
+            raise ContextBudgetExceededError(
+                f"事件 {event_id} 的分段头长度 ({len(max_prefix)}) 超出单段预算 ({event_budget})"
+            )
+        needed = (len(block) + body_budget - 1) // body_budget
+        if needed == total_parts:
+            break
+        total_parts = needed
+
+    max_prefix = f"[part {total_parts}/{total_parts} of event_id={event_id}]\n"
+    body_budget = event_budget - len(max_prefix)
+    chunks = [block[i : i + body_budget] for i in range(0, len(block), body_budget)]
+    actual_n = len(chunks)
+    return [
+        f"[part {idx}/{actual_n} of event_id={event_id}]\n{chunk}"
+        for idx, chunk in enumerate(chunks, start=1)
+    ]
 
 
 def segment_job_prompts_with_snapshots(
@@ -289,7 +391,19 @@ def segment_job_prompts_with_snapshots(
     )
     context_budget = min(max_ctx // 3, 6000)
     existing_ctx, snapshot_hashes = _collect_existing_context(config, ordered_events, context_budget)
-    static_overhead = len(_system_prompt(job.job_type, window_id=job.window_id)) + len(header) + len(existing_ctx) + 256
+    sys_prompt_len = len(
+        _system_prompt(job.job_type, window_id=job.window_id, soul_path=config.broker.soul_path)
+    )
+    if job.job_type == "nightly":
+        # 夜间可能是多分段：分段轮次用的是另一份补充要求，取两者更长的做预算，避免低估。
+        sys_prompt_len = max(
+            sys_prompt_len,
+            _nightly_system_prompt_overhead_chars(
+                window_id=job.window_id,
+                soul_path=config.broker.soul_path,
+            ),
+        )
+    static_overhead = sys_prompt_len + len(header) + len(existing_ctx) + 256
     event_budget = max_ctx - static_overhead
     if event_budget < 256:
         raise ContextBudgetExceededError(
@@ -309,26 +423,25 @@ def segment_job_prompts_with_snapshots(
     cur_len = 0
 
     for ev in ordered_events:
-        block = _format_event_block(ev, notice_only=not ev.countable)
-        if len(block) > event_budget:
-            raise ContextBudgetExceededError(
-                f"单条事件 {ev.event_id} 长度 ({len(block)}) 超出单段预算 ({event_budget})，拒绝静默丢弃"
-            )
-        add_len = len(block) + (2 if cur_blocks else 0)
-        if cur_blocks and (cur_len + add_len > event_budget):
-            ev_text = "\n\n".join(cur_blocks)
-            prompt = (
-                f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
-                f"<untrusted_evidence>\n{ev_text}\n</untrusted_evidence>"
-            )
-            segments.append((cur_events, prompt))
-            cur_events = [ev]
-            cur_blocks = [block]
-            cur_len = len(block)
-        else:
-            cur_events.append(ev)
-            cur_blocks.append(block)
-            cur_len += add_len
+        raw_block = _format_event_block(ev, notice_only=not ev.countable)
+        parts = _split_oversized_block(ev.event_id, raw_block, event_budget)
+        for part in parts:
+            add_len = len(part) + (2 if cur_blocks else 0)
+            if cur_blocks and (cur_len + add_len > event_budget):
+                ev_text = "\n\n".join(cur_blocks)
+                prompt = (
+                    f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
+                    f"<untrusted_evidence>\n{ev_text}\n</untrusted_evidence>"
+                )
+                segments.append((cur_events, prompt))
+                cur_events = [ev]
+                cur_blocks = [part]
+                cur_len = len(part)
+            else:
+                if not cur_events or cur_events[-1].row_id != ev.row_id:
+                    cur_events.append(ev)
+                cur_blocks.append(part)
+                cur_len += add_len
 
     if cur_blocks:
         ev_text = "\n\n".join(cur_blocks)
@@ -418,6 +531,14 @@ def call_openai_compatible_model(
         raise ModelTransportError(f"模型响应结构化 JSON 解析失败: {exc}") from exc
 
 
+def _supports_kwarg(fn: Callable[..., Any], kwarg: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return kwarg in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def call_proactive_model(
     config: AppConfig,
     user_prompt: str,
@@ -425,14 +546,31 @@ def call_proactive_model(
     hermes_runner: Callable[..., dict[str, Any]] | None = None,
     job_type: str | None = None,
     window_id: str | None = None,
+    route_out: dict[str, Any] | None = None,
+    allow_diary: bool = True,
 ) -> dict[str, Any]:
     """根据配置路由调用后台评审模型（默认 Hermes 框架路由，可选 OpenAI 兼容端点）。"""
     cfg = config.memory.proactive
     validate_proactive_worker_config(cfg)
     backend = resolve_effective_model_backend(cfg)
-    sys_prompt = _system_prompt(job_type, window_id=window_id)
+    sys_prompt = _system_prompt(
+        job_type,
+        window_id=window_id,
+        soul_path=config.broker.soul_path,
+        allow_diary=allow_diary,
+    )
     if backend == "openai_compatible":
-        if job_type == "nightly":
+        if route_out is not None:
+            route_out.clear()
+            route_out.update(
+                {
+                    "route_source": "openai_compatible",
+                    "route_resolved": True,
+                    "resolved_provider": "openai_compatible",
+                    "resolved_model": cfg.model_name,
+                }
+            )
+        if _supports_kwarg(call_openai_compatible_model, "system_prompt"):
             return call_openai_compatible_model(cfg, user_prompt, system_prompt=sys_prompt)
         return call_openai_compatible_model(cfg, user_prompt)
     try:
@@ -441,6 +579,7 @@ def call_proactive_model(
             sys_prompt,
             user_prompt,
             runner=hermes_runner,
+            route_out=route_out,
         )
     except HermesBridgeError as exc:
         raise ModelTransportError(str(exc)) from exc
@@ -511,10 +650,20 @@ def process_claimed_job(
                 for x in raw_ledgers
                 if str(x).strip().lower() in ("public", "private")
             }
+        raw_digests = cursor.get("earlier_digests")
+        earlier_digests_state: list[str] = (
+            [str(x) for x in raw_digests] if isinstance(raw_digests, list) else []
+        )
+        raw_written = cursor.get("written_notes")
+        written_notes_state: list[str] = (
+            [str(x) for x in raw_written] if isinstance(raw_written, list) else []
+        )
     else:
         segments, snapshot_hashes = segment_job_prompts_with_snapshots(config, job, events)
         initial_snapshot_hashes = dict(snapshot_hashes)
         trusted_post_write_hashes = {}
+        earlier_digests_state = []
+        written_notes_state = []
         if not dry_run:
             store.set_adapter_cursor(
                 "worker_segment",
@@ -526,6 +675,8 @@ def process_claimed_job(
                     "total_skipped": 0,
                     "has_applied": False,
                     "nightly_diary_ledgers": [],
+                    "earlier_digests": [],
+                    "written_notes": [],
                     "snapshot_hashes": snapshot_hashes,
                     "initial_snapshot_hashes": initial_snapshot_hashes,
                     "trusted_post_write_hashes": trusted_post_write_hashes,
@@ -556,15 +707,29 @@ def process_claimed_job(
                     raise LeaseMismatchError(f"任务 {job.job_id} runner 租约已失效，中止执行")
 
     _COMPACT_RETRY_HINT = "\n\n" + load_prompt("review_retry_compact")
+    last_model_route: dict[str, Any] = {}
 
-    def _call_model_with_heartbeat(prompt: str, *, allow_compact_retry: bool = True) -> dict[str, Any]:
+    def _call_model_with_heartbeat(
+        prompt: str,
+        *,
+        allow_compact_retry: bool = True,
+        allow_diary: bool = True,
+    ) -> dict[str, Any]:
+        call_route: dict[str, Any] = {}
         if dry_run:
-            return call_proactive_model(
+            out = call_proactive_model(
                 config,
                 prompt,
                 hermes_runner=hermes_runner,
                 job_type=job.job_type,
+                window_id=job.window_id,
+                route_out=call_route,
+                allow_diary=allow_diary,
             )
+            if call_route:
+                last_model_route.clear()
+                last_model_route.update(call_route)
+            return out
         hb_stop = threading.Event()
         hb_error: list[BaseException] = []
 
@@ -586,13 +751,19 @@ def process_claimed_job(
         hb_thread.start()
         try:
             try:
-                return call_proactive_model(
+                out = call_proactive_model(
                     config,
                     prompt,
                     hermes_runner=hermes_runner,
                     job_type=job.job_type,
                     window_id=job.window_id,
+                    route_out=call_route,
+                    allow_diary=allow_diary,
                 )
+                if call_route:
+                    last_model_route.clear()
+                    last_model_route.update(call_route)
+                return out
             except ModelTransportError as exc:
                 # 真实现场最常见的是输出被 max_tokens 截断导致 JSON 半截；重试一次并要求更紧凑的输出，
                 # 而不是直接把整批证据判死（判死会静默丢掉这一批对话）。
@@ -600,6 +771,7 @@ def process_claimed_job(
                     return _call_model_with_heartbeat(
                         prompt + _COMPACT_RETRY_HINT,
                         allow_compact_retry=False,
+                        allow_diary=allow_diary,
                     )
                 raise
         finally:
@@ -611,13 +783,47 @@ def process_claimed_job(
                     raise err
                 raise LeaseMismatchError(f"任务 {job.job_id} 后台心跳续约失败: {err}") from err
 
+    multi_nightly = job.job_type == "nightly" and len(segments) > 1
+    earlier_digests: list[str] = list(earlier_digests_state)
+    written_notes: list[str] = list(written_notes_state)
+
     for seg_idx, (seg_events, prompt) in enumerate(segments):
         if seg_idx < start_seg:
             continue
         _refresh_leases()
-        model_out = _call_model_with_heartbeat(prompt)
-        _refresh_leases()
         is_last_seg = seg_idx == len(segments) - 1
+        seg_prompt = prompt
+        if multi_nightly and written_notes:
+            seg_prompt = (
+                seg_prompt
+                + "\n\n<already_written_notes>\n"
+                + "\n".join(written_notes[-20:])
+                + "\n</already_written_notes>\n"
+                + "（这些笔记本次复盘已经写过。同一条事实不要再新建文件：确有补充就沿用同一主题，"
+                "宁可少写，也不要为了凑数再开一条。）"
+            )
+        if multi_nightly and is_last_seg and earlier_digests:
+            seg_prompt = (
+                seg_prompt
+                + "\n\n<earlier_segment_digests>\n"
+                + "\n".join(earlier_digests)
+                + "\n</earlier_segment_digests>\n"
+                + "（以上是前面几个分段已经整理过的当天轨迹摘要，写整天的公账/私账时一并考虑。）"
+            )
+        model_out = _call_model_with_heartbeat(
+            seg_prompt,
+            allow_diary=not (multi_nightly and not is_last_seg),
+        )
+        _refresh_leases()
+        if multi_nightly and not is_last_seg:
+            # 分段轮次不该写日记：即使模型不听话写了，这里也剔掉，避免一天写成七八条流水账。
+            model_out, stripped = _strip_diary_ops(model_out)
+            total_skipped += stripped
+            digest = ""
+            if isinstance(model_out, dict):
+                digest = str(model_out.get("digest") or "").strip().replace("\n", " ")[:200]
+            if digest:
+                earlier_digests.append(f"- 分段 {seg_idx + 1}：{digest}")
         if job.job_type == "nightly" and is_last_seg:
             missing = _missing_nightly_diary_ledgers(
                 model_out,
@@ -640,20 +846,39 @@ def process_claimed_job(
                 )
                 if missing_after:
                     raise NightlyMissingDiaryError(missing_after)
-        summary: ApplySummary = validate_and_apply_batch(
-            config,
-            store,
-            job,
-            seg_events,
-            model_out,
-            write_lock=write_lock,
-            clock=clock or SystemClock(),
-            dry_run=dry_run,
-            snapshot_hashes=snapshot_hashes,
-            initial_snapshot_hashes=initial_snapshot_hashes,
-            trusted_post_write_hashes=trusted_post_write_hashes,
-            lease_check=(lambda: store.has_valid_lease(job.job_id, job.lease_token)) if not dry_run else None,
-        )
+        def _apply_batch(payload: Any) -> ApplySummary:
+            return validate_and_apply_batch(
+                config,
+                store,
+                job,
+                seg_events,
+                payload,
+                write_lock=write_lock,
+                clock=clock or SystemClock(),
+                dry_run=dry_run,
+                snapshot_hashes=snapshot_hashes,
+                initial_snapshot_hashes=initial_snapshot_hashes,
+                trusted_post_write_hashes=trusted_post_write_hashes,
+                lease_check=(lambda: store.has_valid_lease(job.job_id, job.lease_token)) if not dry_run else None,
+            )
+
+        try:
+            summary: ApplySummary = _apply_batch(model_out)
+        except BatchValidationError as exc:
+            # 模型偶尔漏字段（最典型是某个操作没带 source_refs）。整批判死会白掉一整天证据，
+            # 所以给一次「只修格式」的机会：把校验错误原文回灌，仍不合格才真失败。
+            repair_hint = load_prompt("review_repair").replace("<ERROR>", f"{type(exc).__name__}: {exc}")
+            repaired = _call_model_with_heartbeat(
+                seg_prompt + "\n\n" + repair_hint,
+                allow_compact_retry=False,
+                allow_diary=not (multi_nightly and not is_last_seg),
+            )
+            _refresh_leases()
+            if multi_nightly and not is_last_seg:
+                repaired, stripped2 = _strip_diary_ops(repaired)
+                total_skipped += stripped2
+            model_out = repaired
+            summary = _apply_batch(model_out)
         if job.job_type == "nightly":
             satisfied_ledgers |= set(
                 _extract_nightly_diary_ops(model_out, window_id=job.window_id).keys()
@@ -661,6 +886,10 @@ def process_claimed_job(
         if summary.post_write_hashes:
             snapshot_hashes.update(summary.post_write_hashes)
             trusted_post_write_hashes.update(summary.post_write_hashes)
+        for rel in summary.post_write_hashes or {}:
+            clean_rel = str(rel).strip()
+            if clean_rel.startswith("20_LongTerm/") and clean_rel not in written_notes:
+                written_notes.append(clean_rel)
         total_applied += summary.applied_count
         total_skipped += summary.skipped_dedupe_count
         if summary.outcome == "applied" or summary.applied_count > 0:
@@ -676,6 +905,8 @@ def process_claimed_job(
                     "total_skipped": total_skipped,
                     "has_applied": has_applied,
                     "nightly_diary_ledgers": sorted(satisfied_ledgers),
+                    "earlier_digests": list(earlier_digests),
+                    "written_notes": list(written_notes),
                     "snapshot_hashes": snapshot_hashes,
                     "initial_snapshot_hashes": initial_snapshot_hashes,
                     "trusted_post_write_hashes": trusted_post_write_hashes,
@@ -707,6 +938,7 @@ def process_claimed_job(
         applied_count=total_applied,
         skipped_dedupe_count=total_skipped,
         dry_run=dry_run,
+        model_route=dict(last_model_route) if last_model_route else None,
     )
 
 
@@ -743,16 +975,41 @@ def run_worker_once(
             hermes_runner=hermes_runner,
         )
         if not dry_run:
+            summary_payload: dict[str, Any] = {
+                "segments": res.segments_processed,
+                "applied": res.applied_count,
+                "skipped_dedupe": res.skipped_dedupe_count,
+            }
+            if res.model_route:
+                summary_payload["model_route"] = res.model_route
             store.ack_job_success(
                 job.job_id,
                 job.lease_token,
                 outcome=res.outcome,
-                summary={
-                    "segments": res.segments_processed,
-                    "applied": res.applied_count,
-                    "skipped_dedupe": res.skipped_dedupe_count,
-                },
+                summary=summary_payload,
             )
+            # 先写复盘结果，再跑归档；仅在夜间复盘且 archive_enabled=true 时执行，
+            # 归档异常绝不把已成功的复盘改成失败。
+            if job.job_type == "nightly" and config.memory.proactive.archive_enabled:
+                try:
+                    eff_clock = clock or SystemClock()
+                    now_utc = ensure_utc(eff_clock.now_utc())
+                    now_us = dt_to_us(now_utc)
+                    plan = plan_archive(
+                        config,
+                        now_us,
+                        days=config.memory.proactive.archive_after_days,
+                    )
+                    if plan:
+                        apply_archive(config, plan, store=store, now_utc=now_utc)
+                except Exception as arch_exc:  # noqa: BLE001
+                    try:
+                        store.record_archive_failed_receipt(
+                            job_id=job.job_id,
+                            error=f"{type(arch_exc).__name__}: {arch_exc}",
+                        )
+                    except Exception:
+                        pass
         return res
     except (
         BatchValidationError,

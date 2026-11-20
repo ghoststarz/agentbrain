@@ -248,7 +248,7 @@ def test_hermes_timeout_triggers_retry_wait_and_budget_enforced(
     assert st["jobs"][0]["status"] == "retry_wait"
     assert "超时" in (st["jobs"][0]["last_error"] or "")
 
-    # 超单段预算时显式失败，绝不调用 runner
+    # 单条事件超出单段预算时确定性切分，不再整单失败（需求 1：证据不许丢，也不许挂死）
     called: list[int] = []
     store2 = ProactiveStore(tmp_path / "budget.db", clock=ManualClock(dt.datetime(2026, 11, 17, 6, 30, 0, tzinfo=dt.timezone.utc)))
     _seed_incremental_job(store2, count=5, content="x" * 2000)
@@ -258,9 +258,10 @@ def test_hermes_timeout_triggers_retry_wait_and_budget_enforced(
         worker_id="w-budget",
         hermes_runner=lambda **kw: called.append(1) or {"outcome": "no_change", "operations": []},
     )
-    assert res2 is None
-    assert called == []
-    assert "ContextBudgetExceededError" in (store2.get_status()["jobs"][0]["last_error"] or "")
+    assert res2 is not None
+    assert res2.segments_processed >= 2
+    assert called, "切分后必须照常调用 runner，不许因预算把整批证据判死"
+    assert store2.get_status()["jobs"][0]["status"] == "succeeded"
 
 
 def test_disabled_proactive_never_spawns_hermes_subprocess(

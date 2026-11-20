@@ -122,6 +122,8 @@ class ProactiveConfig:
     model_timeout_seconds: float = 30.0
     model_max_context_chars: int = 24000
     model_max_output_tokens: int = 8192
+    archive_enabled: bool = False
+    archive_after_days: int = 14
 
 
 _VALID_MODEL_BACKENDS = frozenset({"", "auto", "hermes", "openai_compatible"})
@@ -360,6 +362,8 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
         model_timeout_seconds=model_timeout_seconds,
         model_max_context_chars=model_max_context_chars,
         model_max_output_tokens=model_max_output_tokens,
+        archive_enabled=_require_bool(proactive_raw, "archive_enabled", False),
+        archive_after_days=max(1, int(proactive_raw.get("archive_after_days", 14))),
     )
     if enabled:
         validate_proactive_worker_config(proactive)

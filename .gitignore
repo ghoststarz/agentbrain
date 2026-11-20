@@ -32,3 +32,6 @@ docs/hero-shot.html
 docs/preview*.html
 docs/preview*.png
 docs/*.visual-check.*
+
+# 本地派活与排障临时目录（任务书、探针脚本、agy 原始输出），不入库
+_handoff/

@@ -321,7 +321,10 @@ def test_longterm_upsert_requires_hash_rechecks_under_lock_preserves_manual_and_
     assert "Manual outro." in updated_manual
     assert "updated managed body" in updated_manual
 
-    new_note = (cfg.profile_dir / "20_LongTerm" / "Facts" / "Trusted Note.md").read_text(encoding="utf-8")
+    fact_dir = cfg.profile_dir / "20_LongTerm" / "Facts"
+    new_files = sorted(fact_dir.glob("FACT-*-Trusted-Note.md"))
+    assert len(new_files) == 1, [p.name for p in fact_dir.iterdir()]
+    new_note = new_files[0].read_text(encoding="utf-8")
     assert "source: hermes" in new_note
     assert "domain: work" in new_note
     assert "created:" in new_note and "updated:" in new_note
@@ -414,14 +417,16 @@ def test_overview_preserves_manual_project_clamps_verified_and_requires_valid_so
         },
         clock=clock,
     )
-    beta_text = (cfg.profile_dir / "20_LongTerm" / "Projects" / "Beta.md").read_text(encoding="utf-8")
+    proj_files = sorted((cfg.profile_dir / "20_LongTerm" / "Projects").glob("PROJ-Beta*.md"))
+    assert len(proj_files) == 1, [p.name for p in (cfg.profile_dir / "20_LongTerm" / "Projects").iterdir()]
+    beta_text = proj_files[0].read_text(encoding="utf-8")
     assert "evidence_level: report" in beta_text
     assert "status: verified" not in beta_text
 
     ov_text = overview.read_text(encoding="utf-8")
     assert "Manual overview intro." in ov_text
     assert "Manual overview footer." in ov_text
-    assert "[[Beta]]" in ov_text
+    assert "[[PROJ-Beta]]" in ov_text
 
 
 # --- Item 4: State A->B->A, diary cross-job update, no substring match, date validation ---
@@ -748,7 +753,7 @@ def test_periodic_heartbeat_during_model_call_renews_both_leases_across_expiry(
     assert res.applied_count == 1
     assert runner_renew_count >= 3
     assert all(recovered == 0 and stolen is None for recovered, stolen in competing_steal_attempts)
-    assert (cfg.profile_dir / "20_LongTerm" / "Facts" / "Heartbeat Kept Alive.md").exists()
+    assert list((cfg.profile_dir / "20_LongTerm" / "Facts").glob("FACT-*-Heartbeat-Kept-Alive.md"))
     assert not any(t.name == f"proactive-hb-{job.job_id}" and t.is_alive() for t in threading.enumerate())
 
 

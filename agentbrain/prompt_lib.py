@@ -23,6 +23,38 @@ def prompt_dir() -> Path:
 
 
 _CACHE: dict[str, tuple[float, int, str]] = {}
+_SOUL_CACHE: dict[str, tuple[float, int, str]] = {}
+
+
+def _strip_yaml_frontmatter(text: str) -> str:
+    """若首行是 ---，剥离 YAML frontmatter，只保留正文。"""
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                return "\n".join(lines[idx + 1 :])
+    return text
+
+
+def load_soul(path: Path | str) -> str:
+    """按 mtime+size 热读 SOUL.md 正文（剥离 YAML frontmatter）；缺失或为空明确报错。"""
+    soul_path = Path(path)
+    try:
+        stat = soul_path.stat()
+    except OSError as exc:
+        raise PromptAssetError(f"SOUL 文件不存在: {soul_path}") from exc
+
+    cache_key = str(soul_path.resolve())
+    cached = _SOUL_CACHE.get(cache_key)
+    if cached is not None and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+
+    raw = soul_path.read_text(encoding="utf-8-sig")
+    body = _strip_yaml_frontmatter(raw).strip()
+    if not body:
+        raise PromptAssetError(f"SOUL 文件为空: {soul_path}")
+    _SOUL_CACHE[cache_key] = (stat.st_mtime, stat.st_size, body)
+    return body
 
 
 def load_prompt(name: str) -> str:

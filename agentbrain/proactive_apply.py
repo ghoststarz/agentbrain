@@ -52,6 +52,8 @@ _FORBIDDEN_NAMES = frozenset({
 
 _FORBIDDEN_DIRS = ("30_Diary", "90_Archive", ".git", ".obsidian")
 _SAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+_TITLE_SEP_RE = re.compile(r'[：:，,（）()、/\\*?"<>|\x00-\x1f\s]+')
+_MULTI_DASH_RE = re.compile(r"-{2,}")
 _EVIDENCE_LEVELS = frozenset({"report", "delivered", "verified"})
 _DIARY_LINE_RE = re.compile(r"^-\s*\[\d{2}:\d{2}:\d{2}\](?:\s*\([^)]*\))?\s+(.*)$")
 _PROJECT_EV_LINE_RE = re.compile(r"(?im)^\s*(?:evidence_level|verification_status)\s*:\s*.*$")
@@ -87,9 +89,49 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def normalize_note_title(title: str) -> str:
+    """规范化新建笔记标题：标点与空白统一为单连字符，保留中文，主体截断至 20 字。"""
+    cleaned = _TITLE_SEP_RE.sub("-", str(title or "").strip())
+    cleaned = _MULTI_DASH_RE.sub("-", cleaned).strip("-.")
+    if len(cleaned) > 20:
+        cleaned = cleaned[:20].rstrip("-.")
+    return cleaned if cleaned else "note"
+
+
 def _sanitize_filename(name: str) -> str:
     cleaned = _SAFE_FILENAME_RE.sub("-", str(name or "").strip()).strip().strip(".")
     return cleaned[:80] if cleaned else "note"
+
+
+def _resolve_note_date_compact(op: dict[str, Any], job: ClaimedJob, clock: Clock) -> str:
+    """确定性解析新建笔记日期（YYYYMMDD）：op.event_date -> job.window_id -> 当天本地日期。"""
+    for raw in (op.get("event_date"), job.window_id):
+        s = str(raw or "").strip()
+        if s:
+            try:
+                return dt.date.fromisoformat(s[:10]).strftime("%Y%m%d")
+            except ValueError:
+                continue
+    return clock.to_local(clock.now_utc()).strftime("%Y%m%d")
+
+
+def _build_new_note_filename(note_type: str, title: str, date_ymd: str) -> str:
+    """按统一命名规范构造新建文件名（不追溯已有文件）。"""
+    norm = normalize_note_title(title)
+    nt = str(note_type or "").strip().lower()
+    if nt == "fact":
+        return f"FACT-{date_ymd}-{norm}.md"
+    if nt == "decision":
+        return f"ADR-{date_ymd}-{norm}.md"
+    if nt == "entity":
+        return f"ENTITY-{norm}.md"
+    if nt == "moc":
+        return f"MOC-{norm}.md"
+    if nt == "project":
+        return f"PROJ-{norm}.md"
+    if nt == "work":
+        return f"WORK-{date_ymd}-{norm}.md"
+    return f"{norm}.md"
 
 
 def _assert_no_symlink_escape(config: AppConfig, rel_path: str) -> Path:
@@ -699,7 +741,16 @@ def validate_and_apply_batch(
                 )
             fact_key = str(op.get("fact_key") or "").strip() or None
             existing_rel = _find_existing_fact_key_path(config, fact_key) if fact_key else None
-            rel = existing_rel or f"{_LONGTERM_DIRS[note_type]}/{_sanitize_filename(title)}.md"
+            if existing_rel is None:
+                legacy_rel = f"{_LONGTERM_DIRS[note_type]}/{_sanitize_filename(title)}.md"
+                legacy_target = _assert_safe_profile_subpath(config, legacy_rel)
+                if legacy_target.exists():
+                    existing_rel = legacy_rel
+            if existing_rel is not None:
+                rel = existing_rel
+            else:
+                date_ymd = _resolve_note_date_compact(op, job, eff_clock)
+                rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, date_ymd)}"
             target = _assert_safe_profile_subpath(config, rel)
             expected_hash = str(op.get("expected_hash") or "").strip()
             req_hash = _check_hash_conflict(
@@ -727,8 +778,17 @@ def validate_and_apply_batch(
                 raise BatchValidationError(
                     f"operation[{idx}] project_update 超出字符上限 ({len(raw_managed)} > {MAX_PROJECT_MANAGED_CHARS})"
                 )
-            slug = _sanitize_filename(project)
-            rel = f"20_LongTerm/Projects/{slug}.md"
+            legacy_slug = _sanitize_filename(project)
+            legacy_rel = f"20_LongTerm/Projects/{legacy_slug}.md"
+            legacy_target = _assert_safe_profile_subpath(config, legacy_rel)
+            if legacy_target.exists():
+                rel = legacy_rel
+                slug = legacy_slug
+            else:
+                date_ymd = _resolve_note_date_compact(op, job, eff_clock)
+                new_name = _build_new_note_filename("project", project, date_ymd)
+                rel = f"20_LongTerm/Projects/{new_name}"
+                slug = Path(new_name).stem
             target = _assert_safe_profile_subpath(config, rel)
             expected_hash = str(op.get("expected_hash") or "").strip()
             req_hash = _check_hash_conflict(

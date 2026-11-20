@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -12,8 +13,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from agentbrain.config import AppConfig, RetrievalConfig
-from agentbrain.index import connect_db
+from agentbrain.index import _ensure_notes_columns, connect_db
 from agentbrain.segment import segment_query, segment_text
+
+_logger = logging.getLogger(__name__)
 
 _IDENTIFIER_SPAN_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 
@@ -610,7 +613,7 @@ def search_notes(
             ret_cfg=ret_cfg,
             today=ref_date,
         )
-        return rank_and_budget(
+        result = rank_and_budget(
             conn,
             trigger_hits,
             fts_hits,
@@ -620,3 +623,16 @@ def search_notes(
             cooldown_blocked=cooldown_blocked,
             evidence_bypassed=evidence_bypassed,
         )
+        hit_paths = [str(h["path"]) for h in (result.get("hits") or []) if h.get("path")]
+        if hit_paths:
+            try:
+                _ensure_notes_columns(conn)
+                now_us = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1_000_000)
+                conn.executemany(
+                    "UPDATE notes SET last_access_us = MAX(COALESCE(last_access_us, 0), ?) WHERE path = ?",
+                    [(now_us, p) for p in hit_paths],
+                )
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                _logger.debug("search_notes failed to update last_access_us (ignored): %s", exc)
+        return result

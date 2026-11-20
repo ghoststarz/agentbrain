@@ -174,7 +174,7 @@ AGENTBRAIN_PLUGIN_PATH=integrations/hermes/obsidian-broker/__init__.py pytest -q
 
 ## 主动记忆整理（Proactive Review，默认关闭）
 
-在 `memory.yaml` 中显式开启 `proactive.enabled: true` 后，broker 可在后台按**每 5 轮人类对话增量触发**与**本地 23:00 夜间窗口**整理对话证据并受限投影到长期记忆与日记：
+在 `memory.yaml` 中显式开启 `proactive.enabled: true` 后，broker 可在后台按**每 5 轮人类对话增量触发**与**本地 22:30 夜间窗口**整理对话证据并受限投影到长期记忆与日记：
 
 - **默认复用 Hermes 框架路由**：通过随包发布的隔离桥接脚本（[`agentbrain/integrations/hermes_review_bridge.py`](agentbrain/integrations/hermes_review_bridge.py)）发现 Hermes 受管 Python（`installs/*/facts.json`），以 `HERMES_DISABLE_LAZY_INSTALLS=1`、无工具、纯结构化 JSON 模式调用 `agent.auxiliary_client.call_llm(task="background_review", ...)`，复用 `auxiliary.background_review` 或主 profile 模型与框架鉴权，无需额外配置端点或密钥（也保留可选 `model_backend: "openai_compatible"` 向后兼容）。
 - **多源基线采集**：支持 Hermes `obsidian-broker` 插件持久化 outbox、可选 `agy` IDE `transcript.jsonl` 增量扫描（首次默认从 EOF 建立基线，不追溯历史），以及 `review-cli-event`。
@@ -183,8 +183,11 @@ AGENTBRAIN_PLUGIN_PATH=integrations/hermes/obsidian-broker/__init__.py pytest -q
 
   | 文件 | 作用 |
   | --- | --- |
-  | `review_system.md` | 复盘主提示词（5 轮增量与 23:00 夜间**共用**） |
-  | `review_retry_compact.md` | 模型输出被截断时的重试指令 |
+  | `review_system.md` | 复盘主提示词（5 轮增量与 22:30 夜间**共用**） |
+  | `review_nightly_addendum.md` | 夜间整轮追加要求（必须公账+私账） |
+| `review_nightly_segment.md` | 夜间多分段时的分段要求（只出 digest，不写日记） |
+| `review_repair.md` | 批量校验失败后的一次「只修格式」重试指令 |
+| `review_retry_compact.md` | 模型输出被截断时的重试指令 |
   | `agy_tool_rules.md` | 写进 agy `GEMINI.md` 的记忆工具规则（改后执行 `agentbrain sync-agy`） |
 
 ## 已知边界
@@ -192,7 +195,7 @@ AGENTBRAIN_PLUGIN_PATH=integrations/hermes/obsidian-broker/__init__.py pytest -q
 - Windows 优先：文件锁走 `msvcrt`，脚本是计划任务；POSIX 分支有实现但未实测。
 - 单人单机单 vault：没有冲突合并协议，两个 broker 同时写同一 vault 没有保护。
 - `integrations/hermes/obsidian-broker/` 只依赖 HTTP 契约，不 import broker 的包；契约变了必须两边一起改，这是唯一的耦合点。本机是通过目录联接（junction）把 profile 的 plugins 目录指到这里的，删掉仓库那份插件就会一起消失。
-- 已完成一次真实 Hermes 框架模型桥接调用（无记忆写入），并在本机启用采集、建立 IDE 历史尾随基线；真实五轮写入质量与 23:00 跨夜触发仍待持续验证。
+- 已完成一次真实 Hermes 框架模型桥接调用（无记忆写入），并在本机启用采集、建立 IDE 历史尾随基线；真实五轮写入质量与 22:30 跨夜触发仍待持续验证。
 - Codex 侧接线已就位，但受其自身模型配置限制。
 
 ## License

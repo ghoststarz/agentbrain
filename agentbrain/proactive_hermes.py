@@ -143,7 +143,28 @@ def build_hermes_bridge_env(profile: str, profile_home: Path) -> dict[str, str]:
     return env
 
 
-def _parse_bridge_response(raw_stdout: str) -> dict[str, Any]:
+_SAFE_ROUTE_STR_KEYS = ("route_source", "resolved_provider", "resolved_model", "provider", "model", "api_mode")
+
+
+def _sanitize_route_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """仅提取非敏感路由元数据，绝不透传任何密钥或 token。"""
+    raw_route = payload.get("route")
+    route_obj = raw_route if isinstance(raw_route, dict) else {}
+    out: dict[str, Any] = {}
+    for key in _SAFE_ROUTE_STR_KEYS:
+        val = route_obj.get(key)
+        if not isinstance(val, str) or not val.strip():
+            val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            out[key] = redact_secrets(val.strip())
+    if "route_resolved" in route_obj and isinstance(route_obj["route_resolved"], bool):
+        out["route_resolved"] = route_obj["route_resolved"]
+    elif "route_resolved" in payload and isinstance(payload["route_resolved"], bool):
+        out["route_resolved"] = payload["route_resolved"]
+    return out
+
+
+def _parse_bridge_response_with_route(raw_stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
     lines = [line.strip() for line in raw_stdout.splitlines() if line.strip()]
     if not lines:
         raise HermesBridgeError("Hermes 桥接进程未返回任何输出")
@@ -162,6 +183,11 @@ def _parse_bridge_response(raw_stdout: str) -> dict[str, Any]:
     content = payload.get("content")
     if not isinstance(content, dict):
         raise HermesBridgeError("Hermes 桥接返回 content 不是 JSON 对象")
+    return content, _sanitize_route_payload(payload)
+
+
+def _parse_bridge_response(raw_stdout: str) -> dict[str, Any]:
+    content, _ = _parse_bridge_response_with_route(raw_stdout)
     return content
 
 
@@ -171,6 +197,7 @@ def call_hermes_framework_model(
     user_prompt: str,
     *,
     runner: Callable[..., dict[str, Any]] | None = None,
+    route_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """通过 Hermes 运行时受管解释器与桥接脚本执行结构化 JSON 评审。"""
     cfg = config.memory.proactive
@@ -202,7 +229,16 @@ def call_hermes_framework_model(
         if not isinstance(raw_res, dict):
             raise HermesBridgeError("fake/custom runner 必须返回 dict")
         if "ok" in raw_res:
-            return _parse_bridge_response(json.dumps(raw_res, ensure_ascii=False))
+            content, route = _parse_bridge_response_with_route(json.dumps(raw_res, ensure_ascii=False))
+            if route_out is not None and route:
+                route_out.clear()
+                route_out.update(route)
+            return content
+        if route_out is not None:
+            route = _sanitize_route_payload(raw_res)
+            if route:
+                route_out.clear()
+                route_out.update(route)
         return raw_res
 
     if not hermes_agent_dir.is_dir():
@@ -236,7 +272,11 @@ def call_hermes_framework_model(
         raise HermesBridgeError(f"启动 Hermes 桥接进程失败: {redact_secrets(str(exc))}") from exc
 
     if completed.stdout.strip():
-        return _parse_bridge_response(completed.stdout)
+        content, route = _parse_bridge_response_with_route(completed.stdout)
+        if route_out is not None and route:
+            route_out.clear()
+            route_out.update(route)
+        return content
 
     stderr_msg = redact_secrets(completed.stderr.strip())[:400]
     raise HermesBridgeError(

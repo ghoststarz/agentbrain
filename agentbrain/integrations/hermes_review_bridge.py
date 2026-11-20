@@ -10,11 +10,118 @@ Never reads, logs, or prints secrets or API keys.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any
+
+
+_MODEL_BLOCK_KEYS = ("default", "provider", "base_url", "api_mode")
+
+
+def _parse_model_block_stub(text: str) -> dict[str, str] | None:
+    """无 PyYAML/ruamel 时的最小解析器：只扫顶层 `model:` 块下的四个标量键。
+
+    运行期（Hermes 受管解释器，`-I` 隔离模式）**没有 PyYAML**，只有 ruamel.yaml，
+    所以不能假设 `import yaml` 可用；这个兜底保证路由解析在任何宿主里都能工作。
+    """
+    in_model = False
+    found: dict[str, str] = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if indent == 0:
+            in_model = stripped.startswith("model:")
+            if in_model and ":" in stripped:
+                inline = stripped.split(":", 1)[1].strip()
+                if inline.startswith("{") and inline.endswith("}"):
+                    body = inline[1:-1]
+                    for pair in body.split(","):
+                        if ":" not in pair:
+                            continue
+                        k, v = pair.split(":", 1)
+                        k = k.strip().strip("'\"")
+                        v = v.strip().strip("'\"")
+                        if k in _MODEL_BLOCK_KEYS and v:
+                            found[k] = v
+            continue
+        if not in_model:
+            continue
+        if ":" not in stripped:
+            continue
+        key, val = stripped.split(":", 1)
+        key = key.strip().strip("'\"")
+        val = val.strip().strip("'\"").strip()
+        if key in _MODEL_BLOCK_KEYS and val:
+            found[key] = val
+    if not found.get("default") or not found.get("provider"):
+        return None
+    return found
+
+
+def _read_profile_default_model(hermes_home: str) -> dict[str, str] | None:
+    """从 HERMES_HOME/config.yaml 读取 profile 默认模型配置（绝不读取任何密钥字段）。"""
+    home_str = str(hermes_home or "").strip()
+    if not home_str:
+        return None
+    cfg_path = Path(home_str) / "config.yaml"
+    if not cfg_path.is_file():
+        return None
+    try:
+        raw_text = cfg_path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+
+    parsed: Any = None
+    try:  # 开发环境（仓库 venv）通常有 PyYAML
+        import yaml  # type: ignore[import-untyped]
+
+        parsed = yaml.safe_load(raw_text)
+    except Exception:
+        try:  # Hermes 受管解释器只带 ruamel.yaml
+            from ruamel.yaml import YAML  # type: ignore[import-untyped]
+
+            parsed = YAML(typ="safe").load(raw_text)
+        except Exception:
+            parsed = None
+
+    model_cfg: Any = None
+    if isinstance(parsed, dict):
+        model_cfg = parsed.get("model")
+    if not isinstance(model_cfg, dict):
+        # 两种 YAML 库都不可用时退回最小解析器（只认 model 块里的标量键）。
+        model_cfg = _parse_model_block_stub(raw_text)
+    if not isinstance(model_cfg, dict):
+        return None
+    default_model = str(model_cfg.get("default") or "").strip()
+    provider = str(model_cfg.get("provider") or "").strip()
+    if not default_model or not provider:
+        return None
+    out: dict[str, str] = {"provider": provider, "model": default_model}
+    base_url = str(model_cfg.get("base_url") or "").strip()
+    if base_url:
+        out["base_url"] = base_url
+    api_mode = str(model_cfg.get("api_mode") or "").strip()
+    if api_mode:
+        out["api_mode"] = api_mode
+    return out
+
+
+def _filter_supported_kwargs(fn: Any, extra: dict[str, Any]) -> dict[str, Any]:
+    """仅传入 call_llm 签名支持的可选参数，避免老版本签名报 TypeError。"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return dict(extra)
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(extra)
+    return {k: v for k, v in extra.items() if k in params}
 
 
 def _strip_code_fence(text: str) -> str:
@@ -198,6 +305,20 @@ def main() -> int:
 
         from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 
+        profile_model = _read_profile_default_model(hermes_home)
+        route_source = "profile_default" if profile_model is not None else "framework_fallback"
+        route_resolved = profile_model is not None
+
+        explicit_route_kwargs: dict[str, Any] = {}
+        if profile_model is not None:
+            explicit_route_kwargs["provider"] = profile_model["provider"]
+            explicit_route_kwargs["model"] = profile_model["model"]
+            if "base_url" in profile_model:
+                explicit_route_kwargs["base_url"] = profile_model["base_url"]
+            if "api_mode" in profile_model:
+                explicit_route_kwargs["api_mode"] = profile_model["api_mode"]
+            explicit_route_kwargs = _filter_supported_kwargs(call_llm, explicit_route_kwargs)
+
         route_info: dict[str, Any] = {}
         response = call_llm(
             task="background_review",
@@ -214,13 +335,22 @@ def main() -> int:
             extra_body=None,
             stream=False,
             route_info=route_info,
+            **explicit_route_kwargs,
         )
         raw_content = extract_content_or_reasoning(response) or ""
         parsed_content = _normalize_batch(_extract_json_object(str(raw_content)))
+        safe_route: dict[str, Any] = _safe_route_metadata(route_info)
+        if profile_model is not None:
+            safe_route.setdefault("resolved_provider", profile_model["provider"])
+            safe_route.setdefault("resolved_model", profile_model["model"])
+        safe_route["route_source"] = route_source
+        safe_route["route_resolved"] = route_resolved
         result = {
             "ok": True,
             "content": parsed_content,
-            "route": _safe_route_metadata(route_info),
+            "route": safe_route,
+            "route_source": route_source,
+            "route_resolved": route_resolved,
         }
         # ensure_ascii=True：模型偶尔返回孤立代理字符，直接写 UTF-8 会抛 UnicodeEncodeError
         _write_result(real_stdout, result)

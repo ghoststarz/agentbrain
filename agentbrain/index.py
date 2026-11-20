@@ -5,10 +5,14 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 from agentbrain.atomic import atomic_write_json
 from agentbrain.config import AppConfig
@@ -40,7 +44,8 @@ CREATE TABLE IF NOT EXISTS notes (
     trigger_order INTEGER DEFAULT 100,
     fm_json TEXT NOT NULL,
     mtime REAL NOT NULL,
-    hash TEXT NOT NULL
+    hash TEXT NOT NULL,
+    last_access_us INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -139,6 +144,7 @@ def _ensure_notes_columns(conn: sqlite3.Connection) -> None:
         ("keys_json", "TEXT DEFAULT '[]'"),
         ("keys2_json", "TEXT DEFAULT '[]'"),
         ("trigger_order", "INTEGER DEFAULT 100"),
+        ("last_access_us", "INTEGER NOT NULL DEFAULT 0"),
     )
     for col_name, col_def in migrations:
         if col_name not in existing_cols:
@@ -487,3 +493,56 @@ def reindex(config: AppConfig) -> ReindexStats:
         converged_facts=converged,
         revision=new_rev,
     )
+
+
+def touch_notes_access(
+    config: AppConfig,
+    rel_paths: Iterable[str],
+    *,
+    now_us: int | None = None,
+) -> None:
+    """批量刷新笔记的 last_access_us；失败时吞掉异常并记 debug 日志（不影响检索/复盘）。"""
+    clean_paths = sorted({str(p).replace("\\", "/").strip() for p in rel_paths if str(p).strip()})
+    if not clean_paths:
+        return
+    db_path = config.broker.db_path
+    if not db_path.exists():
+        return
+    ts_us = (
+        int(now_us)
+        if now_us is not None
+        else int(dt.datetime.now(dt.timezone.utc).timestamp() * 1_000_000)
+    )
+    try:
+        with connect_db(db_path) as conn:
+            _ensure_notes_columns(conn)
+            conn.executemany(
+                "UPDATE notes SET last_access_us = MAX(COALESCE(last_access_us, 0), ?) WHERE path = ?",
+                [(ts_us, p) for p in clean_paths],
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        _logger.debug("touch_notes_access failed (ignored): %s", exc)
+
+
+def delete_notes_from_index(config: AppConfig, rel_paths: Iterable[str]) -> int:
+    """从索引库删除指定路径的 notes / chunks / links 行。"""
+    clean_paths = sorted({str(p).replace("\\", "/").strip() for p in rel_paths if str(p).strip()})
+    if not clean_paths:
+        return 0
+    db_path = config.broker.db_path
+    if not db_path.exists():
+        return 0
+    removed = 0
+    with connect_db(db_path) as conn:
+        for rel in clean_paths:
+            row = conn.execute("SELECT id FROM notes WHERE path = ?", (rel,)).fetchone()
+            if row is None:
+                continue
+            nid = int(row["id"])
+            conn.execute("DELETE FROM links WHERE src_id = ? OR dst_id = ?", (nid, nid))
+            conn.execute("DELETE FROM chunks WHERE note_id = ?", (nid,))
+            cur = conn.execute("DELETE FROM notes WHERE id = ?", (nid,))
+            removed += int(cur.rowcount)
+        conn.commit()
+    return removed

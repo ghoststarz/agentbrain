@@ -240,6 +240,16 @@ CREATE TABLE IF NOT EXISTS review_receipts (
 
 CREATE INDEX IF NOT EXISTS idx_review_receipts_pending
     ON review_receipts(delivered_at_utc, client, session_id, id);
+
+CREATE TABLE IF NOT EXISTS archive_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_path TEXT NOT NULL,
+    archived_path TEXT NOT NULL,
+    mtime_us INTEGER NOT NULL,
+    last_access_us INTEGER NOT NULL,
+    archived_at_utc TEXT NOT NULL,
+    archive_version INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -305,6 +315,7 @@ class TickResult:
     windows_skipped_empty: int
     jobs_created: int
     windows_reopened: int
+    windows_requeued_dead: int = 0
 
 
 class LeaseMismatchError(RuntimeError):
@@ -737,6 +748,7 @@ class ProactiveStore:
         windows_skipped_empty = 0
         jobs_created = 0
         windows_reopened = 0
+        windows_requeued_dead = 0
 
         with self._tx() as conn:
             self._ensure_baseline(conn)
@@ -899,8 +911,77 @@ class ProactiveStore:
                 ):
                     jobs_created += 1
 
-            # 3. 兜底补齐：窗口存在、当前 revision 还没完成，但根本没有对应任务
-            #    （外部手改状态、任务被清理、或上次 enqueue 失败）。否则窗口会永久卡在 pending。
+            # 3. 兜底补齐：窗口存在、当前 revision 还没完成
+            #    3a) 若同 window_id + 同 last_revision 的 nightly 任务处于 dead，则原位复位为 pending
+            dead_nightly = conn.execute(
+                """
+                SELECT j.id, j.window_id, j.revision, j.last_error
+                FROM nightly_windows nw
+                JOIN jobs j
+                  ON j.job_type = 'nightly'
+                 AND j.window_id = nw.window_id
+                 AND j.revision = nw.last_revision
+                 AND j.status = 'dead'
+                WHERE nw.last_revision > nw.completed_revision
+                  AND nw.status IN ('pending', 'scheduled', 'reopened')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jobs j2
+                      WHERE j2.job_type = 'nightly'
+                        AND j2.window_id = nw.window_id
+                        AND j2.revision = nw.last_revision
+                        AND j2.status != 'dead'
+                  )
+                ORDER BY nw.window_end_us ASC, nw.window_id ASC, j.id ASC
+                """
+            ).fetchall()
+            for drow in dead_nightly:
+                dead_job_id = int(drow["id"])
+                cur = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?,
+                        attempts = 0,
+                        lease_token = NULL,
+                        worker_id = NULL,
+                        lease_expires_at_us = NULL,
+                        next_retry_at_us = NULL,
+                        finished_at_us = NULL
+                    WHERE id = ? AND status = 'dead'
+                    """,
+                    (JOB_STATUS_PENDING, dead_job_id),
+                )
+                if cur.rowcount > 0:
+                    conn.execute(
+                        "DELETE FROM adapter_cursors WHERE adapter_name = 'worker_segment' AND source_key = ?",
+                        (f"job_segment_progress:{dead_job_id}",),
+                    )
+                    err_summary = redact_secrets(str(drow["last_error"] or "dead_nightly_requeued"))[:160]
+                    conn.execute(
+                        """
+                        INSERT INTO review_receipts (
+                            job_id, client, session_id, job_type, outcome,
+                            applied_count, categories_json, error_summary,
+                            created_at_utc, created_at_us
+                        ) VALUES (?, 'nightly', '', 'nightly', 'retrying_after_dead', 0, '{}', ?, ?, ?)
+                        ON CONFLICT(job_id) DO UPDATE SET
+                            client = excluded.client,
+                            session_id = excluded.session_id,
+                            job_type = excluded.job_type,
+                            outcome = excluded.outcome,
+                            applied_count = excluded.applied_count,
+                            categories_json = excluded.categories_json,
+                            error_summary = excluded.error_summary,
+                            created_at_utc = excluded.created_at_utc,
+                            created_at_us = excluded.created_at_us,
+                            delivered_at_utc = NULL,
+                            delivered_to_client = NULL,
+                            delivered_to_session_id = NULL
+                        """,
+                        (dead_job_id, err_summary, now_utc.isoformat(), now_us),
+                    )
+                    windows_requeued_dead += 1
+
+            #    3b) 若根本没有对应任务（外部手改状态、任务被清理、或上次 enqueue 失败），补插任务。
             outstanding = conn.execute(
                 """
                 SELECT nw.window_id, nw.last_revision, nw.completed_revision,
@@ -953,6 +1034,7 @@ class ProactiveStore:
             windows_skipped_empty=windows_skipped_empty,
             jobs_created=jobs_created,
             windows_reopened=windows_reopened,
+            windows_requeued_dead=windows_requeued_dead,
         )
 
     def _enqueue_nightly_job(
@@ -1685,8 +1767,20 @@ class ProactiveStore:
                     "SELECT * FROM nightly_windows ORDER BY window_end_us ASC"
                 ).fetchall()
             ]
-            jobs = [
-                {
+            jobs: list[dict[str, Any]] = []
+            last_model_route: dict[str, Any] | None = None
+            for r in conn.execute("SELECT * FROM jobs ORDER BY id ASC").fetchall():
+                model_route: dict[str, Any] | None = None
+                raw_summary = r["result_summary_json"]
+                if raw_summary:
+                    try:
+                        parsed_summary = json.loads(str(raw_summary))
+                        if isinstance(parsed_summary, dict) and isinstance(parsed_summary.get("model_route"), dict):
+                            model_route = parsed_summary["model_route"]
+                            last_model_route = model_route
+                    except json.JSONDecodeError:
+                        pass
+                job_entry: dict[str, Any] = {
                     "id": int(r["id"]),
                     "idempotency_key": str(r["idempotency_key"]),
                     "job_type": str(r["job_type"]),
@@ -1702,6 +1796,7 @@ class ProactiveStore:
                     "max_attempts": int(r["max_attempts"]),
                     "last_error": r["last_error"],
                     "outcome": r["outcome"],
+                    "model_route": model_route,
                     "next_retry_at_utc": (
                         us_to_iso(int(r["next_retry_at_us"]))
                         if r["next_retry_at_us"] is not None
@@ -1709,14 +1804,14 @@ class ProactiveStore:
                     ),
                     "created_at_utc": str(r["created_at_utc"]),
                 }
-                for r in conn.execute("SELECT * FROM jobs ORDER BY id ASC").fetchall()
-            ]
+                jobs.append(job_entry)
 
             return {
                 "enabled": self.config.enabled,
                 "schema_version": int(meta.get("schema_version", SCHEMA_VERSION)),
                 "activation_baseline_utc": meta.get("activation_baseline_utc"),
                 "baseline_last_closed_date": meta.get("baseline_last_closed_date"),
+                "last_model_route": last_model_route,
                 "job_counts": counts_by_status,
                 "sessions": sessions,
                 "nightly_windows": windows,
@@ -2144,3 +2239,62 @@ class ProactiveStore:
                 "sessions_updated": sessions_updated,
                 "total_countable_turns": total_countable_turns,
             }
+
+    def record_archive_log(
+        self,
+        *,
+        note_path: str,
+        archived_path: str,
+        mtime_us: int,
+        last_access_us: int,
+        archived_at_utc: str,
+        archive_version: int = 1,
+    ) -> None:
+        """写入一条归档审计记录到 archive_log 表。"""
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO archive_log (
+                    note_path, archived_path, mtime_us, last_access_us, archived_at_utc, archive_version
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    note_path,
+                    archived_path,
+                    int(mtime_us),
+                    int(last_access_us),
+                    archived_at_utc,
+                    int(archive_version),
+                ),
+            )
+
+    def record_archive_failed_receipt(
+        self,
+        *,
+        job_id: int,
+        error: str,
+    ) -> None:
+        """单独记录归档失败回执，不覆盖已成功复盘的回执与任务状态。"""
+        now_utc = ensure_utc(self.clock.now_utc())
+        now_us = dt_to_us(now_utc)
+        safe_err = redact_secrets(str(error or "archive_error"))[:160]
+        receipt_job_id = -abs(int(job_id)) if int(job_id) != 0 else -1
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_receipts (
+                    job_id, client, session_id, job_type, outcome,
+                    applied_count, categories_json, error_summary,
+                    created_at_utc, created_at_us
+                ) VALUES (?, 'nightly', '', 'nightly', 'archive_failed', 0, '{}', ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    outcome = excluded.outcome,
+                    error_summary = excluded.error_summary,
+                    created_at_utc = excluded.created_at_utc,
+                    created_at_us = excluded.created_at_us,
+                    delivered_at_utc = NULL,
+                    delivered_to_client = NULL,
+                    delivered_to_session_id = NULL
+                """,
+                (receipt_job_id, safe_err, now_utc.isoformat(), now_us),
+            )

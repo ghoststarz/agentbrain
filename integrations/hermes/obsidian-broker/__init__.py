@@ -194,17 +194,62 @@ _INJECTED_BLOCK_RE = re.compile(
     r"\[DIARY\][^\n]*\n?)"
 )
 
+_SYSTEM_NOTICE_PREFIXES = (
+    "[IMPORTANT:",
+    "[INTERNAL NOTIFICATION",
+    "[PREVIOUS_REVIEW_RESULT]",
+    "[DIARY]",
+)
+_MULTI_BLANK_LINES_RE = re.compile(r"(?:\n[ \t]*){2,}")
+_DEFAULT_MAX_PAYLOAD_CHARS = 16000
+
+
+def _extract_user_segment(text: str) -> str:
+    """从 'User: ...\\nAssistant: ...' 格式中提取首段 User 正文；若无前缀则返回原文。"""
+    s = (text or "").lstrip()
+    if s.startswith("User:"):
+        after_user = s[len("User:") :]
+        idx = after_user.find("\nAssistant:")
+        if idx >= 0:
+            return after_user[:idx]
+        return after_user
+    return text or ""
+
+
+def _normalize_user_text(text: str) -> str:
+    """归一化用户文本：统一换行、去首尾空白、合并连续空行。"""
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+    return _MULTI_BLANK_LINES_RE.sub("\n\n", normalized)
+
+
+def classify_user_turn(text: str) -> str:
+    """与 agentbrain.proactive.classify_user_turn 等价的纯标准库实现。"""
+    user_part = _extract_user_segment(text)
+    norm = _normalize_user_text(user_part)
+    if norm.startswith(_SYSTEM_NOTICE_PREFIXES) or "heartbeat #" in norm.lower():
+        return "system_notice"
+    return "user"
+
 
 def _read_proactive_capture_flags(memory_yaml_path: Path) -> tuple[bool, bool]:
     """Pure-stdlib parser for proactive.enabled and proactive.event_capture (no PyYAML)."""
+    enabled, event_capture, _ = _read_proactive_capture_settings(memory_yaml_path)
+    return enabled, event_capture
+
+
+def _read_proactive_capture_settings(memory_yaml_path: Path) -> tuple[bool, bool, int]:
+    """Pure-stdlib parser for proactive.enabled, event_capture, and max_payload_chars."""
     try:
         if not memory_yaml_path.exists():
-            return False, False
+            return False, False, _DEFAULT_MAX_PAYLOAD_CHARS
         text = memory_yaml_path.read_text(encoding="utf-8")
         in_proactive = False
         proactive_indent = -1
         enabled = False
         event_capture = False
+        max_payload_chars = _DEFAULT_MAX_PAYLOAD_CHARS
         for raw_line in text.splitlines():
             code = raw_line.split("#", 1)[0].rstrip()
             if not code.strip():
@@ -223,9 +268,17 @@ def _read_proactive_capture_flags(memory_yaml_path: Path) -> tuple[bool, bool]:
                     enabled = _parse_bool(stripped.split(":", 1)[1].strip().strip('"').strip("'"))
                 elif stripped.startswith("event_capture:"):
                     event_capture = _parse_bool(stripped.split(":", 1)[1].strip().strip('"').strip("'"))
-        return enabled, event_capture
+                elif stripped.startswith("max_payload_chars:"):
+                    raw_val = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                    try:
+                        parsed = int(raw_val)
+                        if parsed >= 256:
+                            max_payload_chars = parsed
+                    except ValueError:
+                        pass
+        return enabled, event_capture, max_payload_chars
     except Exception:
-        return False, False
+        return False, False, _DEFAULT_MAX_PAYLOAD_CHARS
 
 
 def _strip_thinking_and_memory(text: str) -> str:
@@ -263,6 +316,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
         self._turn_capture: bool = False
         self._proactive_enabled: bool = False
         self._proactive_event_capture: bool = False
+        self._proactive_max_payload_chars: int = _DEFAULT_MAX_PAYLOAD_CHARS
         self._outbox_lock = threading.Lock()
         self._session_turn_seq: dict[str, int] = {}
         self._closed: bool = False
@@ -359,14 +413,18 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             return False
 
     def _load_proactive_flags(self, cfg_path: Path) -> tuple[bool, bool]:
+        enabled, event_capture, _ = self._load_proactive_settings(cfg_path)
+        return enabled, event_capture
+
+    def _load_proactive_settings(self, cfg_path: Path) -> tuple[bool, bool, int]:
         try:
             mem_path = self._resolve_memory_yaml_path(cfg_path)
             if mem_path is None:
-                return False, False
-            return _read_proactive_capture_flags(mem_path)
+                return False, False, _DEFAULT_MAX_PAYLOAD_CHARS
+            return _read_proactive_capture_settings(mem_path)
         except Exception as exc:
             self._logger.warning("failed to load proactive capture flags: %s", exc)
-            return False, False
+            return False, False, _DEFAULT_MAX_PAYLOAD_CHARS
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         try:
@@ -380,7 +438,11 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             self._last_revision = None
             self._last_recall = None
             self._turn_capture = self._load_turn_capture(cfg_path)
-            self._proactive_enabled, self._proactive_event_capture = self._load_proactive_flags(cfg_path)
+            (
+                self._proactive_enabled,
+                self._proactive_event_capture,
+                self._proactive_max_payload_chars,
+            ) = self._load_proactive_settings(cfg_path)
             if self._proactive_enabled and self._proactive_event_capture and self._outbox_path().exists():
                 threading.Thread(
                     target=self._flush_outbox,
@@ -632,22 +694,35 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                 clean_u = _strip_thinking_and_memory(user_content)
                 clean_a = _strip_thinking_and_memory(assistant_content)
                 if clean_u or clean_a:
-                    ev_id = self._derive_turn_event_id(eff_session, messages)
-                    ev_payload = {
-                        "client": "hermes",
-                        "session_id": eff_session,
-                        "event_id": ev_id,
-                        "event_kind": "human_turn",
-                        "content": f"User: {clean_u}\nAssistant: {clean_a}".strip(),
-                        "occurred_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        "qualifies_nightly": True,
-                    }
-                    self._enqueue_outbox(ev_payload)
-                    threading.Thread(
-                        target=self._flush_outbox,
-                        name="obsidian-broker-proactive-flush",
-                        daemon=True,
-                    ).start()
+                    content_text = f"User: {clean_u}\nAssistant: {clean_a}".strip()
+                    is_system_notice = (
+                        classify_user_turn(user_content or "") == "system_notice"
+                        or classify_user_turn(content_text) == "system_notice"
+                    )
+                    if is_system_notice and len(content_text) > self._proactive_max_payload_chars:
+                        self._logger.warning(
+                            "skip oversized system_notice turn (%d > %d chars): session=%s",
+                            len(content_text),
+                            self._proactive_max_payload_chars,
+                            eff_session,
+                        )
+                    else:
+                        ev_id = self._derive_turn_event_id(eff_session, messages)
+                        ev_payload = {
+                            "client": "hermes",
+                            "session_id": eff_session,
+                            "event_id": ev_id,
+                            "event_kind": "reference_only" if is_system_notice else "human_turn",
+                            "content": content_text,
+                            "occurred_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            "qualifies_nightly": True,
+                        }
+                        self._enqueue_outbox(ev_payload)
+                        threading.Thread(
+                            target=self._flush_outbox,
+                            name="obsidian-broker-proactive-flush",
+                            daemon=True,
+                        ).start()
 
             # 2. 旧版 raw turn_capture（保持默认关闭，互不干扰）
             if not self._turn_capture:
