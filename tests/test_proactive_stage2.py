@@ -206,13 +206,13 @@ def test_hermes_provider_outbox_retry_identical_turns_and_filtering(
 ) -> None:
     raw_plugin_env = os.environ.get("AGENTBRAIN_PLUGIN_PATH", "").strip()
     plugin_path = (
-        Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "obsidian-broker" / "__init__.py"
+        Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "agentbrain" / "__init__.py"
         if raw_plugin_env == "source"
         else Path(raw_plugin_env or "__missing__")
     )
     if not plugin_path.exists():
         pytest.skip("AGENTBRAIN_PLUGIN_PATH not set")
-    spec = importlib.util.spec_from_file_location("obsidian_broker_plugin_s2", plugin_path)
+    spec = importlib.util.spec_from_file_location("agentbrain_plugin_plugin_s2", plugin_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

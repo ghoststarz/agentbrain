@@ -645,11 +645,11 @@ def test_disabled_endpoints_cli_runner_status_poll_interval_and_outbox_redaction
     assert "sk-1234567890" not in (st["runner"]["last_error"] or "")
 
     # Outbox redacts secrets before persistence
-    plugin_path = Path("E:/Code/mem-broker/integrations/hermes/obsidian-broker/__init__.py")
-    spec = importlib.util.spec_from_file_location("obsidian_broker_test_mod", plugin_path)
+    plugin_path = Path("E:/Code/mem-broker/integrations/hermes/agentbrain/__init__.py")
+    spec = importlib.util.spec_from_file_location("agentbrain_plugin_test_mod", plugin_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["obsidian_broker_test_mod"] = mod
+    sys.modules["agentbrain_plugin_test_mod"] = mod
     spec.loader.exec_module(mod)
     p = mod.ObsidianBrokerMemoryProvider()
     p._hermes_home = str(tmp_path / "hermes_home")

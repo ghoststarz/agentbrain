@@ -2298,3 +2298,34 @@ class ProactiveStore:
                 """,
                 (receipt_job_id, safe_err, now_utc.isoformat(), now_us),
             )
+
+    def record_section_audit_failed_receipt(
+        self,
+        *,
+        job_id: int,
+        error: str,
+    ) -> None:
+        """单独记录夜间小节体检失败回执，不覆盖已成功复盘或归档回执。"""
+        now_utc = ensure_utc(self.clock.now_utc())
+        now_us = dt_to_us(now_utc)
+        safe_err = redact_secrets(str(error or "section_audit_error"))[:160]
+        receipt_job_id = -(abs(int(job_id)) + 1_000_000_000)
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_receipts (
+                    job_id, client, session_id, job_type, outcome,
+                    applied_count, categories_json, error_summary,
+                    created_at_utc, created_at_us
+                ) VALUES (?, 'nightly', '', 'nightly', 'section_audit_failed', 0, '{}', ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    outcome = excluded.outcome,
+                    error_summary = excluded.error_summary,
+                    created_at_utc = excluded.created_at_utc,
+                    created_at_us = excluded.created_at_us,
+                    delivered_at_utc = NULL,
+                    delivered_to_client = NULL,
+                    delivered_to_session_id = NULL
+                """,
+                (receipt_job_id, safe_err, now_utc.isoformat(), now_us),
+            )

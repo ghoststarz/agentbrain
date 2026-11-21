@@ -1,4 +1,4 @@
-"""Hermes MemoryProvider 插件：obsidian-broker（全钩子 try/except + fail-open）。"""
+"""Hermes MemoryProvider 插件：agentbrain（全钩子 try/except + fail-open）。"""
 
 from __future__ import annotations
 
@@ -109,7 +109,7 @@ def _default_broker_yaml() -> Path:
 
 
 def _provider_logger() -> logging.Logger:
-    logger = logging.getLogger("agentbrain.obsidian_broker")
+    logger = logging.getLogger("agentbrain.provider")
     if not logger.handlers:
         local_app = os.environ.get("LOCALAPPDATA")
         base_dir = Path(local_app) / "agentbrain" / "logs" if local_app else Path.home() / "AppData" / "Local" / "agentbrain" / "logs"
@@ -356,7 +356,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
 
     @property
     def name(self) -> str:
-        return "obsidian-broker"
+        return "agentbrain"
 
     def _load_broker_settings(self) -> tuple[Path, int, str]:
         cfg_path = _default_broker_yaml()
@@ -479,7 +479,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             if self._proactive_enabled and self._proactive_event_capture and self._outbox_path().exists():
                 threading.Thread(
                     target=self._flush_outbox,
-                    name="obsidian-broker-proactive-init-flush",
+                    name="agentbrain-proactive-init-flush",
                     daemon=True,
                 ).start()
         except Exception as exc:
@@ -771,7 +771,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                         self._enqueue_outbox(ev_payload)
                         threading.Thread(
                             target=self._flush_outbox,
-                            name="obsidian-broker-proactive-flush",
+                            name="agentbrain-proactive-flush",
                             daemon=True,
                         ).start()
 
@@ -795,7 +795,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
                 except Exception as inner_exc:
                     self._logger.warning("sync_turn background post failed: %s", inner_exc)
 
-            threading.Thread(target=_post_bg, name="obsidian-broker-sync", daemon=True).start()
+            threading.Thread(target=_post_bg, name="agentbrain-sync", daemon=True).start()
         except Exception as exc:
             self._logger.warning("sync_turn failed: %s", exc)
 
@@ -834,7 +834,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             self._enqueue_outbox(ev_payload)
             threading.Thread(
                 target=self._flush_outbox,
-                name="obsidian-broker-proactive-flush",
+                name="agentbrain-proactive-flush",
                 daemon=True,
             ).start()
         except Exception as exc:

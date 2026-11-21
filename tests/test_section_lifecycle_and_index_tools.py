@@ -87,10 +87,10 @@ def _load_plugin_cls() -> type[Any]:
         Path(__file__).resolve().parent.parent
         / "integrations"
         / "hermes"
-        / "obsidian-broker"
+        / "agentbrain"
         / "__init__.py"
     )
-    spec = importlib.util.spec_from_file_location("obsidian_broker_plugin_s7", plugin_path)
+    spec = importlib.util.spec_from_file_location("agentbrain_plugin_plugin_s7", plugin_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

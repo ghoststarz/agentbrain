@@ -164,8 +164,8 @@ def test_req2_hermes_plugin_classifies_system_notice_and_guards_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = _load_module(
-        "obsidian_broker_req2",
-        "integrations/hermes/obsidian-broker/__init__.py",
+        "agentbrain_plugin_req2",
+        "integrations/hermes/agentbrain/__init__.py",
     )
     assert (
         plugin.classify_user_turn("User: [IMPORTANT: You are running as a scheduled cron job ...]")

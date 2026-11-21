@@ -34,6 +34,7 @@ from agentbrain.proactive_hermes import HermesBridgeError, call_hermes_framework
 from agentbrain.proactive_redaction import redact_secrets
 from agentbrain.prompt_lib import PromptAssetError, load_prompt, load_soul
 from agentbrain.retrieve import search_notes
+from agentbrain.section_audit import run_section_audit
 
 _EXCLUDED_CONTEXT_PREFIXES = ("30_Diary/", "30_Diary\\", "SOUL.md", "USER.md", "RULES.md")
 
@@ -63,6 +64,9 @@ def _system_prompt(
             raise PromptAssetError("soul_text 不能为空，禁止静默退化为空人格")
 
     persona_block = f"## 你是谁（运行时读取自 SOUL.md，此处不得写死）\n\n{resolved_soul}"
+    if job_type == "section_audit":
+        audit_rules = load_prompt("section_audit")
+        return f"{persona_block}\n\n{audit_rules}"
     base = load_prompt("review_system")
     if job_type == "nightly":
         if idle_nightly:
@@ -1008,8 +1012,24 @@ def run_worker_once(
                 outcome=res.outcome,
                 summary=summary_payload,
             )
-            # 先写复盘结果，再跑归档；仅在夜间复盘且 archive_enabled=true 时执行，
-            # 归档异常绝不把已成功的复盘改成失败。
+            # 先写复盘结果，再依次跑夜间小节体检与归档；异常绝不把已成功的复盘改成失败。
+            if job.job_type == "nightly" and config.memory.proactive.section_audit_enabled:
+                try:
+                    run_section_audit(
+                        config,
+                        job_id=job.job_id,
+                        clock=clock or SystemClock(),
+                        write_lock=write_lock,
+                        hermes_runner=hermes_runner,
+                    )
+                except Exception as audit_exc:  # noqa: BLE001
+                    try:
+                        store.record_section_audit_failed_receipt(
+                            job_id=job.job_id,
+                            error=f"{type(audit_exc).__name__}: {audit_exc}",
+                        )
+                    except Exception:
+                        pass
             if job.job_type == "nightly" and config.memory.proactive.archive_enabled:
                 try:
                     eff_clock = clock or SystemClock()

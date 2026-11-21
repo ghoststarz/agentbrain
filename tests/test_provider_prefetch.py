@@ -1,4 +1,4 @@
-"""Hermes obsidian-broker 插件 prefetch 单元测试。
+"""Hermes agentbrain 插件 prefetch 单元测试。
 
 插件本身不在本仓库（它是宿主侧的适配层）。设置环境变量
 ``AGENTBRAIN_PLUGIN_PATH`` 指向插件的 ``__init__.py`` 才会运行这组测试，
@@ -15,14 +15,14 @@ from typing import Any
 import pytest
 
 _RAW_PLUGIN_ENV = os.environ.get("AGENTBRAIN_PLUGIN_PATH", "").strip()
-_REPO_PLUGIN_PATH = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "obsidian-broker" / "__init__.py"
+_REPO_PLUGIN_PATH = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "agentbrain" / "__init__.py"
 _PLUGIN_PATH = _REPO_PLUGIN_PATH if _RAW_PLUGIN_ENV == "source" else Path(_RAW_PLUGIN_ENV or "__missing__")
 
 
 def _load_provider_cls() -> type[Any]:
     if not _PLUGIN_PATH.exists():
         pytest.skip(f"plugin not found at {_PLUGIN_PATH}")
-    spec = importlib.util.spec_from_file_location("obsidian_broker_plugin", _PLUGIN_PATH)
+    spec = importlib.util.spec_from_file_location("agentbrain_plugin_plugin", _PLUGIN_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

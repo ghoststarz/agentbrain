@@ -88,7 +88,7 @@ python -m agentbrain sync-agy                              # 重渲染 ~/.gemini
 
 ## 宿主接入：Hermes MemoryProvider
 
-MCP 是"agent 主动来查"的通道，Hermes 需要的是"每轮自动送过去"。这两种语义不一样，所以仓库里另带一份 Hermes 插件：[`integrations/hermes/obsidian-broker/`](integrations/hermes/obsidian-broker/)——单文件、无第三方依赖的 `MemoryProvider` 实现：
+MCP 是"agent 主动来查"的通道，Hermes 需要的是"每轮自动送过去"。这两种语义不一样，所以仓库里另带一份 Hermes 插件：[`integrations/hermes/agentbrain/`](integrations/hermes/agentbrain/)——单文件、无第三方依赖的 `MemoryProvider` 实现：
 
 - `prefetch` 在每次用户输入前打 `POST /v1/search`，命中注入成 `[MEMORY_PREFETCH]` 块（1200 字硬顶，revision 变了多带一行 delta）；仅当后台记忆整理任务完成时，在下一轮注入一次性 `[PREVIOUS_REVIEW_RESULT]` 完成回执并立即 ack，其余轮次保持静默；
 - `system_prompt_block` 给出静态协议，这是每轮都在上下文里的那一层；
@@ -146,7 +146,7 @@ agentbrain/            内核与服务
 tests/                 单元与隔离性回归测试
 docs/                  架构图规格（architecture.json）与渲染产物
 examples/              配置样例
-integrations/          宿主侧接入（hermes/obsidian-broker 记忆 provider；hermes/diary-note 桌面插件）
+integrations/          宿主侧接入（hermes/agentbrain 记忆 provider；hermes/diary-note 桌面插件）
 scripts/               Windows 计划任务自愈脚本
 ```
 
@@ -165,10 +165,10 @@ memory.yaml            记忆域策略
 ```bash
 pip install -e ".[dev]"
 pytest -q                                                                 # 102 passed, 8 skipped（插件测试默认跳过）
-AGENTBRAIN_PLUGIN_PATH=integrations/hermes/obsidian-broker/__init__.py pytest -q  # 110 passed
+AGENTBRAIN_PLUGIN_PATH=integrations/hermes/agentbrain/__init__.py pytest -q  # 110 passed
 ```
 
-默认 102 项通过、8 项跳过——跳过的是 Hermes 插件侧的 prefetch 与 outbox 测试。把 `AGENTBRAIN_PLUGIN_PATH` 指向 [`integrations/hermes/obsidian-broker/__init__.py`](integrations/hermes/obsidian-broker/__init__.py) 后全部 110 项都会运行。
+默认 102 项通过、8 项跳过——跳过的是 Hermes 插件侧的 prefetch 与 outbox 测试。把 `AGENTBRAIN_PLUGIN_PATH` 指向 [`integrations/hermes/agentbrain/__init__.py`](integrations/hermes/agentbrain/__init__.py) 后全部 110 项都会运行。
 
 其中一组是隔离性回归：日记写入后检索 0 命中、启动块不含日记、`reindex` 后笔记数不因日记增长。
 
@@ -177,7 +177,7 @@ AGENTBRAIN_PLUGIN_PATH=integrations/hermes/obsidian-broker/__init__.py pytest -q
 在 `memory.yaml` 中显式开启 `proactive.enabled: true` 后，broker 可在后台按**每 5 轮人类对话增量触发**与**本地 22:30 夜间窗口**整理对话证据并受限投影到长期记忆与日记：
 
 - **默认复用 Hermes 框架路由**：通过随包发布的隔离桥接脚本（[`agentbrain/integrations/hermes_review_bridge.py`](agentbrain/integrations/hermes_review_bridge.py)）发现 Hermes 受管 Python（`installs/*/facts.json`），以 `HERMES_DISABLE_LAZY_INSTALLS=1`、无工具、纯结构化 JSON 模式调用 `agent.auxiliary_client.call_llm(task="background_review", ...)`，复用 `auxiliary.background_review` 或主 profile 模型与框架鉴权，无需额外配置端点或密钥（也保留可选 `model_backend: "openai_compatible"` 向后兼容）。
-- **多源基线采集**：支持 Hermes `obsidian-broker` 插件持久化 outbox、可选 `agy` IDE `transcript.jsonl` 增量扫描（首次默认从 EOF 建立基线，不追溯历史），以及 `review-cli-event`。
+- **多源基线采集**：支持 Hermes `agentbrain` 插件持久化 outbox、可选 `agy` IDE `transcript.jsonl` 增量扫描（首次默认从 EOF 建立基线，不追溯历史），以及 `review-cli-event`。
 - **受限安全投影**：只允许 `longterm_upsert` / `project_update` / `hot_update` / `handoff_upsert` / `diary_append` / `no_change`，禁止修改 `SOUL.md` / `USER.md` / `RULES.md` 与配置文件，并发冲突由 `expected_hash` 拦截，详情见 [`docs/proactive-stage2-handoff.md`](docs/proactive-stage2-handoff.md)。
 - **提示词外置为 Markdown**：所有可调提示词放在 [`agentbrain/prompt_assets/`](agentbrain/prompt_assets/)，代码按 mtime 热读取——改完**不必重启** broker，下一次复盘就生效：
 
@@ -194,7 +194,7 @@ AGENTBRAIN_PLUGIN_PATH=integrations/hermes/obsidian-broker/__init__.py pytest -q
 
 - Windows 优先：文件锁走 `msvcrt`，脚本是计划任务；POSIX 分支有实现但未实测。
 - 单人单机单 vault：没有冲突合并协议，两个 broker 同时写同一 vault 没有保护。
-- `integrations/hermes/obsidian-broker/` 只依赖 HTTP 契约，不 import broker 的包；契约变了必须两边一起改，这是唯一的耦合点。本机是通过目录联接（junction）把 profile 的 plugins 目录指到这里的，删掉仓库那份插件就会一起消失。
+- `integrations/hermes/agentbrain/` 只依赖 HTTP 契约，不 import broker 的包；契约变了必须两边一起改，这是唯一的耦合点。本机是通过目录联接（junction）把 profile 的 plugins 目录指到这里的，删掉仓库那份插件就会一起消失。
 - 已完成一次真实 Hermes 框架模型桥接调用（无记忆写入），并在本机启用采集、建立 IDE 历史尾随基线；真实五轮写入质量与 22:30 跨夜触发仍待持续验证。
 - Codex 侧接线已就位，但受其自身模型配置限制。
 

@@ -19,8 +19,8 @@ MIRROR_TAGS = ["hermes-mirror", "memory"]
 def _load_plugin() -> ModuleType:
     root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
-        "obsidian_broker_mirror_probe",
-        root / "integrations" / "hermes" / "obsidian-broker" / "__init__.py",
+        "agentbrain_plugin_mirror_probe",
+        root / "integrations" / "hermes" / "agentbrain" / "__init__.py",
     )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

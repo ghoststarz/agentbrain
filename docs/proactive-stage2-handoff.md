@@ -32,7 +32,7 @@
 ### 已在离线隔离环境验证
 - Stage 1 调度核心强化：超长事件正文无损分块（`event_chunks`）与超硬上限显式 `PayloadTooLargeError` / HTTP `413` 拒绝（不再静默截断）；夜间补录跨不同 `window_id` 严格按时间先后顺序执行。
 - 配置 fail-closed：畸形 `enabled`、越界 `nightly_hour/minute`、在 `model_api_key_env` 中直接填入 `sk-...` 等密钥均在加载/启动阶段直接拒绝。
-- Hermes 插件源码（`integrations/hermes/obsidian-broker/__init__.py`）：纯标准库解析配置（无 PyYAML 依赖）、本地持久 outbox 重试、相同短句连续多轮独立计数、系统/bot/评审后台轮次过滤、`<think>` 与注入记忆块剥离、`on_delegation` 仅作 `reference_only` 采集。
+- Hermes 插件源码（`integrations/hermes/agentbrain/__init__.py`）：纯标准库解析配置（无 PyYAML 依赖）、本地持久 outbox 重试、相同短句连续多轮独立计数、系统/bot/评审后台轮次过滤、`<think>` 与注入记忆块剥离、`on_delegation` 仅作 `reference_only` 采集。
 - agy IDE 适配器：真实 `transcript.jsonl` 格式解析、工具链归并、部分行忽略、文件重写/截断保留未完成轮次、首次激活基线尾随不追溯历史、缺失 JSONL 可见标记 `source_unavailable_no_jsonl`（不解析 protobuf）。
 - 假本地 OpenAI 兼容 HTTP 服务器：结构化 JSON 响应校验、`no_change` 零写入、凭证脱敏、上下文预算确定性分段及单条超限显式失败。
 - 受限输出投影与安全边界：整批先校验后写入、禁止写入 `SOUL.md`/`USER.md`/`RULES.md`/配置文件与目录穿越/符号链接、未验证结论降级为 `report`、项目页受管块保留手工文本并由受管块生成 `_Overview.md`、`expected_hash` 冲突检测、崩溃重放日记不重复、日记按事件/窗口日期写入且不入索引。
@@ -41,7 +41,7 @@
 ### 尚未在真实环境验证（需由你亲自启用并验收）
 - 真实 Hermes 运行时 `background_review` / 主模型路由调用（或可选 OpenAI 兼容端点）与实际提取质量。
 - 真实 `agy` IDE 运行目录（`brain/*/.system_generated/logs/transcript.jsonl`）在实时对话中的增量捕获。
-- 真实 Hermes 运行时加载更新后的 `obsidian-broker` 插件与 `/new` 会话流转。
+- 真实 Hermes 运行时加载更新后的 `agentbrain` 插件与 `/new` 会话流转。
 - 真实 OS 本地时间 22:30 跨夜及漏夜追平运行。
 
 ---
@@ -51,7 +51,7 @@
 在修改任何真实配置前，建议先备份：
 1. Vault 中的 `profiles/<profile>/memory.yaml`（如 `profiles/lily/memory.yaml`）
 2. 运行时目录 `%LOCALAPPDATA%\agentbrain\`（POSIX 为 `~/.local/share/agentbrain/`，至少备份 `state/` 与 `broker.yaml`）
-3. 当前已安装的 Hermes `obsidian-broker` 插件文件（若为目录联接或复制文件，先保留原副本）
+3. 当前已安装的 Hermes `agentbrain` 插件文件（若为目录联接或复制文件，先保留原副本）
 
 ---
 
@@ -104,11 +104,11 @@ proactive:
 
 ## 4. Hermes 插件源码更新与启用
 
-本阶段**未改动**你已安装的 Hermes 插件。若你的 Hermes 插件目录不是指向 `<repo_root>/integrations/hermes/obsidian-broker/` 的目录联接，请手动将最新源码复制过去，并**重启 Hermes 进程**以确保真正重载新的 Python 插件模块（仅执行 `/new` 可能不会重载已导入的插件代码）：
+本阶段**未改动**你已安装的 Hermes 插件。若你的 Hermes 插件目录不是指向 `<repo_root>/integrations/hermes/agentbrain/` 的目录联接，请手动将最新源码复制过去，并**重启 Hermes 进程**以确保真正重载新的 Python 插件模块（仅执行 `/new` 可能不会重载已导入的插件代码）：
 
 ```powershell
 # 如需手动复制（请先确认目标路径并备份旧文件）
-Copy-Item "<repo_root>\integrations\hermes\obsidian-broker\__init__.py" "<你的_hermes_plugin_dir>\__init__.py"
+Copy-Item "<repo_root>\integrations\hermesgentbrain\__init__.py" "<你的_hermes_plugin_dir>\__init__.py"
 ```
 
 ---
@@ -153,7 +153,7 @@ HTTP 服务运行中也可通过鉴权请求查看状态：`GET http://127.0.0.1
 ### 0. 基线启用流程（不导入历史会话）
 1. **备份与配置**：完成第 2 节备份后，按第 3 节在 `memory.yaml` 中启用 `proactive`（默认 `model_backend: "hermes"`，`hermes_profile: "lily"`，无需额外模型/密钥配置）。
 2. **建立 IDE 基线（先于采集）**：在开启新对话前，先执行一次 `.\.venv\Scripts\python.exe -m agentbrain review-tick`（或重启 `AgentBrainBroker` 服务）。首次扫描会对已有 `agy_ide_roots` 下的 `transcript.jsonl` 从 **EOF** 记录基线游标，**不会**回溯导入历史对话（只有显式执行 `review-catchup` 才会导入历史）。
-3. **Hermes 新会话**：重启 Hermes 进程（确保加载最新 `obsidian-broker` 插件），并执行 `/new` 开启新会话，既有历史会话不会被采集。
+3. **Hermes 新会话**：重启 Hermes 进程（确保加载最新 `agentbrain` 插件），并执行 `/new` 开启新会话，既有历史会话不会被采集。
 
 ### A. 5 轮增量触发验收（Hermes 与 agy IDE）
 1. 确认 `proactive.enabled: true`、`proactive.event_capture: true`、`proactive.agy_ide_enabled: true`（如测 IDE）且已重启 `AgentBrainBroker` 与 Hermes 进程。

@@ -29,10 +29,10 @@ def _load_provider_cls() -> type[Any]:
         Path(__file__).resolve().parent.parent
         / "integrations"
         / "hermes"
-        / "obsidian-broker"
+        / "agentbrain"
         / "__init__.py"
     )
-    spec = importlib.util.spec_from_file_location("obsidian_broker_plugin_capture", plugin_path)
+    spec = importlib.util.spec_from_file_location("agentbrain_plugin_plugin_capture", plugin_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -428,8 +428,8 @@ def test_receipt_honesty_for_no_change_failure_and_nightly(tmp_path: Path) -> No
     from importlib import import_module
     lines, ids = import_module("agentbrain.proactive").__name__, []
     # 直接用插件模块格式化校验文案诚实性
-    plugin_path = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "obsidian-broker" / "__init__.py"
-    spec = importlib.util.spec_from_file_location("obsidian_broker_fmt", plugin_path)
+    plugin_path = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "agentbrain" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("agentbrain_plugin_fmt", plugin_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

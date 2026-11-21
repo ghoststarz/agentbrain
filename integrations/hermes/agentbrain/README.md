@@ -1,4 +1,4 @@
-# obsidian-broker · Hermes MemoryProvider 插件
+# agentbrain · Hermes MemoryProvider 插件
 
 把 [AgentBrain mem-broker](../../../README.md) 接到 Hermes Agent 的**每轮记忆注入**通道上。
 
@@ -24,12 +24,12 @@ Hermes 会扫描 `<hermes_home>/plugins/<name>/plugin.yaml` 并调用同目录 `
 ```bash
 # 方式一：目录联接 / 软链（推荐——仓库是唯一真源，改一处就生效）
 # Windows（PowerShell，无需管理员）：
-powershell -NoProfile -Command "New-Item -ItemType Junction -Path \"$env:LOCALAPPDATA\hermes\profiles\<profile>\plugins\obsidian-broker\" -Target \"<repo>\integrations\hermes\obsidian-broker\""
+powershell -NoProfile -Command "New-Item -ItemType Junction -Path \"$env:LOCALAPPDATA\hermes\profiles\<profile>\plugins\agentbrain\" -Target \"<repo>\integrations\hermesgentbrain\""
 # POSIX：
-ln -s <repo>/integrations/hermes/obsidian-broker ~/.hermes/profiles/<profile>/plugins/obsidian-broker
+ln -s <repo>/integrations/hermes/agentbrain ~/.hermes/profiles/<profile>/plugins/agentbrain
 
 # 方式二：复制（简单，但之后两边会漂移）
-cp -r integrations/hermes/obsidian-broker "%LOCALAPPDATA%\hermes\profiles\<profile>\plugins\"
+cp -r integrations/hermes/agentbrain "%LOCALAPPDATA%\hermes\profiles\<profile>\plugins\"
 ```
 
 先建链接、确认能读到目标目录里的 `plugin.yaml`，再删旧副本。注意在 MSYS/Git-Bash 里 `cmd //c mklink /J` 可能被路径转换吃掉、静默不执行。
@@ -44,7 +44,7 @@ cp -r integrations/hermes/obsidian-broker "%LOCALAPPDATA%\hermes\profiles\<profi
 
 ## 排查
 
-日志写在 `%LOCALAPPDATA%/agentbrain/logs/provider.log`，logger 名 `agentbrain.obsidian_broker`。常见症状：
+日志写在 `%LOCALAPPDATA%/agentbrain/logs/provider.log`，logger 名 `agentbrain.provider`。常见症状：
 
 - **完全没有注入**：先 `curl http://127.0.0.1:18765/healthz`；服务没起就 `python -m agentbrain serve`。
 - **只有 `[MEMORY_PREFETCH]` 没有内容**：检索命中全是 `weak_evidence`，插件会整段丢弃（证据不够就不占预算）。

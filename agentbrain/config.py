@@ -126,6 +126,9 @@ class ProactiveConfig:
     archive_after_days: int = 14
     nightly_always_diary: bool = False
     prefetch_min_score: float = 1.0
+    section_audit_enabled: bool = False
+    section_audit_min_similarity: float = 0.45
+    section_audit_max_files: int = 3
 
 
 _VALID_MODEL_BACKENDS = frozenset({"", "auto", "hermes", "openai_compatible"})
@@ -334,6 +337,14 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
     ):
         raise ProactiveConfigError("proactive 已启用但模型超时或上下文预算参数非法")
 
+    section_audit_enabled = _require_bool(proactive_raw, "section_audit_enabled", False)
+    section_audit_min_similarity = float(proactive_raw.get("section_audit_min_similarity", 0.45))
+    if not (0.0 <= section_audit_min_similarity <= 1.0):
+        raise ProactiveConfigError(
+            f"proactive.section_audit_min_similarity 必须在 [0.0, 1.0] 范围内，收到: {section_audit_min_similarity!r}"
+        )
+    section_audit_max_files = max(1, int(proactive_raw.get("section_audit_max_files", 3)))
+
     proactive = ProactiveConfig(
         enabled=enabled,
         event_capture=event_capture,
@@ -368,6 +379,9 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
         archive_after_days=max(1, int(proactive_raw.get("archive_after_days", 14))),
         nightly_always_diary=_require_bool(proactive_raw, "nightly_always_diary", False),
         prefetch_min_score=float(proactive_raw.get("prefetch_min_score", 1.0)),
+        section_audit_enabled=section_audit_enabled,
+        section_audit_min_similarity=section_audit_min_similarity,
+        section_audit_max_files=section_audit_max_files,
     )
     if enabled:
         validate_proactive_worker_config(proactive)

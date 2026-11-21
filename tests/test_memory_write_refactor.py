@@ -609,8 +609,8 @@ def test_7_recall_audit_and_inject_noise_suppression(tmp_path: Path, monkeypatch
     assert rows[1]["injected"] is False
 
     # 3) 验证插件 prefetch() 发送的 payload 带 inject=True
-    plugin_path = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "obsidian-broker" / "__init__.py"
-    spec = importlib.util.spec_from_file_location("obsidian_broker_plugin_inject_test", plugin_path)
+    plugin_path = Path(__file__).resolve().parent.parent / "integrations" / "hermes" / "agentbrain" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("agentbrain_plugin_plugin_inject_test", plugin_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
