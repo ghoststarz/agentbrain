@@ -61,6 +61,10 @@ _SEQ_PREFIX_BY_TYPE: dict[str, str] = {"fact": "FACT", "decision": "ADR", "proje
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
 _DIARY_LINE_RE = re.compile(r"^-\s*\[\d{2}:\d{2}:\d{2}\](?:\s*\([^)]*\))?\s+(.*)$")
 _PROJECT_EV_LINE_RE = re.compile(r"(?im)^\s*(?:evidence_level|verification_status)\s*:\s*.*$")
+_SECTION_KEY_COMMENT_RE = re.compile(r"^<!--\s*section_key:\s*(.+?)\s*-->$")
+_DEPRECATED_LINE_PREFIX = "> 已废止（"
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+_ASCII_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 MAX_BATCH_OPS = 25
 MAX_LONGTERM_CHARS = 16000
@@ -68,6 +72,11 @@ MAX_PROJECT_MANAGED_CHARS = 8000
 MAX_HANDOFF_SUMMARY_CHARS = 2000
 MAX_DIARY_CHARS = 4000
 MAX_SOURCE_REFS = 40
+MAX_DEPRECATED_LINES = 2
+MAX_DEPRECATED_SNIPPET_CHARS = 200
+SECTION_SIMILARITY_THRESHOLD = 0.62
+MAX_SUMMARY_CHARS = 120
+DERIVED_SUMMARY_CHARS = 100
 
 
 class BatchValidationError(ValueError):
@@ -547,9 +556,104 @@ def _higher_evidence_level(existing: Any, incoming: str) -> str:
     return inc if _EVIDENCE_RANK[inc] >= _EVIDENCE_RANK[cur] else cur
 
 
+@dataclass
+class _ManagedSection:
+    """受管块中的单个 ### 小节，含可选的稳定槽位键 section_key。"""
+
+    heading: str
+    body: str
+    section_key: str | None = None
+
+
+def _normalize_section_key(raw: Any) -> str | None:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    # 防止换行或注释结束符破坏 HTML 注释标记
+    s = " ".join(s.replace("-->", "").split())
+    return s or None
+
+
+def _normalize_summary(raw: Any, *, max_chars: int = MAX_SUMMARY_CHARS) -> str | None:
+    s = " ".join(str(raw or "").split()).strip()
+    if not s:
+        return None
+    if len(s) <= max_chars:
+        return s
+    return s[: max(1, max_chars - 1)].rstrip() + "…"
+
+
+def _derive_note_summary(content: str, max_chars: int = DERIVED_SUMMARY_CHARS) -> str:
+    """未显式提供 summary 时，从正文派生首句摘要（截断至 max_chars 字）。"""
+    first = ""
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if (
+            not line
+            or line.startswith("#")
+            or line.startswith("<!--")
+            or line.startswith("evidence_level:")
+            or line.startswith(_DEPRECATED_LINE_PREFIX)
+        ):
+            continue
+        if line.startswith(("- ", "* ")):
+            line = line[2:].strip()
+        if line:
+            first = line
+            break
+    if not first:
+        first = " ".join(str(content or "").split()).strip()
+    if not first:
+        return ""
+    m = re.search(r"[。！？!?]|(?<!\d)\.(?=\s|$)", first)
+    if m and m.start() > 0:
+        first = first[: m.end()].strip()
+    first = " ".join(first.split())
+    if len(first) <= max_chars:
+        return first
+    return first[: max(1, max_chars - 1)].rstrip() + "…"
+
+
+def _title_bigrams(title: str) -> set[str]:
+    """对规范化后的标题提取 CJK 二元组（及长度>=2 的 ASCII 词）用于相似度匹配。"""
+    norm = normalize_note_title(title).lower()
+    grams: set[str] = set()
+    for run in _CJK_RUN_RE.findall(norm):
+        if len(run) == 1:
+            grams.add(run)
+        else:
+            for i in range(len(run) - 1):
+                grams.add(run[i : i + 2])
+    for tok in _ASCII_TOKEN_RE.findall(norm):
+        if len(tok) >= 2:
+            grams.add(tok)
+    return grams
+
+
+def _title_jaccard(a: str, b: str) -> float:
+    ga = _title_bigrams(a)
+    gb = _title_bigrams(b)
+    if not ga or not gb:
+        return 0.0
+    return len(ga & gb) / len(ga | gb)
+
+
+def _split_section_body_and_deprecated(body: str) -> tuple[str, list[str]]:
+    """把小节正文拆分为现行正文与末尾的「> 已废止（...）」历史行列表。"""
+    active_lines: list[str] = []
+    deprecated_lines: list[str] = []
+    for raw_line in str(body or "").splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith(_DEPRECATED_LINE_PREFIX):
+            deprecated_lines.append(stripped)
+        else:
+            active_lines.append(raw_line.rstrip())
+    return "\n".join(active_lines).strip(), deprecated_lines
+
+
 def _parse_managed_sections(
     managed_text: str | None,
-) -> tuple[str, list[tuple[str, str]], list[str]]:
+) -> tuple[str, list[_ManagedSection], list[str]]:
     """把受管区块拆分为：前置概要 preamble、有序 ### 小节列表、末尾 ## 关联 链接行列表。
 
     `## 来源`（会话出处）小节也按链接行处理，和 `## 关联` 合并返回——
@@ -581,28 +685,99 @@ def _parse_managed_sections(
             preamble_lines.append(raw_line.rstrip())
 
     preamble = "\n".join(preamble_lines).strip()
-    clean_sections = [(h, "\n".join(lines).strip()) for h, lines in sections]
+    clean_sections: list[_ManagedSection] = []
+    for h, lines in sections:
+        sec_key: str | None = None
+        body_lines: list[str] = []
+        checked_first = False
+        for ln in lines:
+            if not checked_first and not ln.strip():
+                continue
+            if not checked_first:
+                checked_first = True
+                m_key = _SECTION_KEY_COMMENT_RE.match(ln.strip())
+                if m_key:
+                    sec_key = _normalize_section_key(m_key.group(1))
+                    continue
+            body_lines.append(ln)
+        clean_sections.append(
+            _ManagedSection(
+                heading=h,
+                body="\n".join(body_lines).strip(),
+                section_key=sec_key,
+            )
+        )
     return preamble, clean_sections, link_lines
 
 
+def _find_matching_section_index(
+    sections: list[_ManagedSection],
+    heading: str,
+    section_key: str | None,
+) -> int | None:
+    """严格按顺序定位目标小节：1. section_key 相等 -> 2. 标题逐字相等 -> 3. 标题二元组 Jaccard >= 0.62。"""
+    clean_heading = heading.strip()
+    clean_key = _normalize_section_key(section_key)
+
+    if clean_key:
+        for idx, sec in enumerate(sections):
+            if sec.section_key and sec.section_key == clean_key:
+                return idx
+
+    for idx, sec in enumerate(sections):
+        if sec.heading.strip() == clean_heading:
+            return idx
+
+    best_idx: int | None = None
+    best_sim = 0.0
+    for idx, sec in enumerate(sections):
+        sim = _title_jaccard(sec.heading, clean_heading)
+        if sim >= SECTION_SIMILARITY_THRESHOLD and sim > best_sim:
+            best_sim = sim
+            best_idx = idx
+    return best_idx
+
+
 def _upsert_managed_section(
-    sections: list[tuple[str, str]],
+    sections: list[_ManagedSection],
     heading: str,
     body: str,
-) -> list[tuple[str, str]]:
-    """在有序 ### 小节列表中按标题就地替换，若不存在则追加到末尾。"""
+    *,
+    section_key: str | None = None,
+    today_str: str = "",
+) -> list[_ManagedSection]:
+    """按三层规则匹配小节并就地替换；旧正文与新正文不同时追加「> 已废止」行（最多保留 2 条）。"""
     clean_heading = heading.strip()
     clean_body = body.strip()
-    updated: list[tuple[str, str]] = []
-    replaced = False
-    for h, b in sections:
-        if h == clean_heading:
-            updated.append((h, clean_body))
-            replaced = True
-        else:
-            updated.append((h, b))
-    if not replaced:
-        updated.append((clean_heading, clean_body))
+    clean_key = _normalize_section_key(section_key)
+    eff_today = today_str or dt.date.today().isoformat()
+
+    match_idx = _find_matching_section_index(sections, clean_heading, clean_key)
+    updated = list(sections)
+    if match_idx is None:
+        updated.append(_ManagedSection(heading=clean_heading, body=clean_body, section_key=clean_key))
+        return updated
+
+    old_sec = sections[match_idx]
+    old_active, deprecated_lines = _split_section_body_and_deprecated(old_sec.body)
+    norm_old = " ".join(old_active.split())
+    norm_new = " ".join(clean_body.split())
+    if norm_old and norm_old != norm_new:
+        snippet = norm_old[:MAX_DEPRECATED_SNIPPET_CHARS]
+        deprecated_lines.append(f"{_DEPRECATED_LINE_PREFIX}{eff_today}）：{snippet}")
+    deprecated_lines = deprecated_lines[-MAX_DEPRECATED_LINES:]
+
+    if deprecated_lines:
+        merged_body = f"{clean_body}\n\n" + "\n".join(deprecated_lines)
+    else:
+        merged_body = clean_body
+
+    resolved_key = clean_key if clean_key else old_sec.section_key
+    updated[match_idx] = _ManagedSection(
+        heading=clean_heading,
+        body=merged_body,
+        section_key=resolved_key,
+    )
     return updated
 
 
@@ -680,15 +855,19 @@ def _merge_link_lines(
 
 def _render_managed_sections(
     preamble: str,
-    sections: list[tuple[str, str]],
+    sections: list[_ManagedSection],
     link_lines: list[str],
     source_lines: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
     if preamble.strip():
         parts.append(preamble.strip())
-    for heading, body in sections:
-        parts.append(f"### {heading}\n\n{body.strip()}" if body.strip() else f"### {heading}")
+    for sec in sections:
+        header = f"### {sec.heading}"
+        if sec.section_key:
+            header = f"{header}\n<!-- section_key: {sec.section_key} -->"
+        body_clean = sec.body.strip()
+        parts.append(f"{header}\n\n{body_clean}" if body_clean else header)
     # 解析时「来源」行会随「关联」一起回来，这里按前缀把它们分回各自的小节
     derived_source = [ln for ln in link_lines if "来源：" in ln]
     derived_links = [ln for ln in link_lines if "来源：" not in ln]
@@ -813,16 +992,21 @@ def _format_longterm_note_content(
     exclude_link_names: set[str] | None = None,
     session_pairs: list[tuple[str, str]] | None = None,
     as_section: bool = False,
+    section_key: str | None = None,
+    summary: str | None = None,
 ) -> str:
     """生成或更新长期笔记：新建写正文+关联，已有文件在受管块内追加/替换 ### 小节并合并 frontmatter。"""
     excl = set(exclude_link_names or ())
     excl.add(title.strip())
     links_in = list(candidate_links or [])
+    clean_section_key = _normalize_section_key(section_key)
+    clean_summary = _normalize_summary(summary)
 
     if existing_text is None:
         fm: dict[str, Any] = {
             "type": note_type,
             "title": title,
+            "summary": clean_summary or _derive_note_summary(content),
             "proactive_owned": True,
             "created": today_str,
             "updated": today_str,
@@ -841,8 +1025,13 @@ def _format_longterm_note_content(
             fm["source_refs"] = _merge_str_list_ordered([], source_refs, limit=MAX_SOURCE_REFS)
         link_lines = _merge_link_lines([], links_in, exclude_names=excl)
         source_lines = _format_source_lines(session_pairs)
-        if as_section:
-            managed_body = _render_managed_sections("", [(title, content)], link_lines, source_lines)
+        if as_section or clean_section_key:
+            managed_body = _render_managed_sections(
+                "",
+                [_ManagedSection(heading=title, body=content, section_key=clean_section_key)],
+                link_lines,
+                source_lines,
+            )
         else:
             managed_body = _render_managed_sections(content, [], link_lines, source_lines)
         header = f"{_dump_frontmatter(fm)}\n# {title}\n\n"
@@ -853,6 +1042,10 @@ def _format_longterm_note_content(
         fm["type"] = note_type
     if not fm.get("title"):
         fm["title"] = title
+    if clean_summary:
+        fm["summary"] = clean_summary
+    elif not str(fm.get("summary") or "").strip():
+        fm["summary"] = _derive_note_summary(content)
     if not fm.get("created"):
         fm["created"] = today_str
     fm["updated"] = today_str
@@ -877,7 +1070,13 @@ def _format_longterm_note_content(
 
     existing_managed = _extract_managed_block(body)
     preamble, sections, existing_links = _parse_managed_sections(existing_managed)
-    sections = _upsert_managed_section(sections, title, content)
+    sections = _upsert_managed_section(
+        sections,
+        title,
+        content,
+        section_key=clean_section_key,
+        today_str=today_str,
+    )
     link_lines = _merge_link_lines(existing_links, links_in, exclude_names=excl)
     source_lines = _format_source_lines(session_pairs)
     managed_body = _render_managed_sections(preamble, sections, link_lines, source_lines)
@@ -1060,11 +1259,21 @@ def _derive_dedupe_key(op: dict[str, Any]) -> str:
         fact_key = str(op.get("fact_key") or "").strip()
         slot = fact_key or str(op.get("_dedupe_slot") or op.get("_resolved_rel") or "")
         content_hash = sha256_text(" ".join(str(op.get("content") or "").split()))[:16]
-        return f"slot:{slot}:{content_hash}"
+        extra = []
+        sec_key = _normalize_section_key(op.get("section_key"))
+        if sec_key:
+            extra.append(f"sk:{sec_key}")
+        summary_val = _normalize_summary(op.get("summary"))
+        if summary_val:
+            extra.append(f"sm:{sha256_text(summary_val)[:8]}")
+        suffix = (":" + ":".join(extra)) if extra else ""
+        return f"slot:{slot}:{content_hash}{suffix}"
     if op_type == "project_update":
         project = _sanitize_filename(str(op.get("project") or op.get("title") or ""))
         block_hash = sha256_text(str(op.get("managed_content") or "").strip())[:16]
-        return f"project:{project}:{block_hash}"
+        summary_val = _normalize_summary(op.get("summary"))
+        suffix = f":sm:{sha256_text(summary_val)[:8]}" if summary_val else ""
+        return f"project:{project}:{block_hash}{suffix}"
     if op_type == "hot_update":
         return f"hot:{sha256_text(str(op.get('content') or '').strip())[:16]}"
     if op_type == "handoff_upsert":
@@ -1234,6 +1443,8 @@ def validate_and_apply_batch(
                 raise BatchValidationError(f"operation[{idx}] 非法 scope: {scope!r}")
             op["scope"] = scope
             op["links"] = _normalize_str_list(op.get("links"))
+            op["section_key"] = _normalize_section_key(op.get("section_key"))
+            op["summary"] = _normalize_summary(op.get("summary"))
             fact_key = str(op.get("fact_key") or "").strip() or None
             merge_into = str(op.get("merge_into") or "").strip() or None
             op["_merge_into"] = merge_into
@@ -1348,6 +1559,8 @@ def validate_and_apply_batch(
             op["evidence_level"] = ev_level
             op["managed_content"] = _format_project_managed_body(raw_managed, ev_level)
             op["links"] = _normalize_str_list(op.get("links"))
+            op["summary"] = _normalize_summary(op.get("summary"))
+            op["_raw_managed_content"] = raw_managed
             op["_resolved_rel"] = rel
             op["_resolved_target"] = target
 
@@ -1628,6 +1841,7 @@ def validate_and_apply_batch(
                         fm_proj: dict[str, Any] = {
                             "type": "project",
                             "title": proj_title,
+                            "summary": op.get("summary") or _derive_note_summary(content),
                             "proactive_owned": True,
                             "created": today_str,
                             "updated": today_str,
@@ -1648,7 +1862,11 @@ def validate_and_apply_batch(
                         if proj_refs:
                             fm_proj["source_refs"] = proj_refs
                         link_lines = _merge_link_lines([], candidate_links, exclude_names=exclude_names)
-                        managed_body = _render_managed_sections("", [(title, content)], link_lines)
+                        managed_body = _render_managed_sections(
+                            "",
+                            [_ManagedSection(heading=title, body=content, section_key=op.get("section_key"))],
+                            link_lines,
+                        )
                         header = f"{_dump_frontmatter(fm_proj)}\n# {proj_title}\n\n"
                         rendered = _merge_managed_block(None, default_header=header, managed_body=managed_body)
                     else:
@@ -1669,6 +1887,8 @@ def validate_and_apply_batch(
                             exclude_link_names=exclude_names,
                             session_pairs=session_pairs,
                             as_section=True,
+                            section_key=op.get("section_key"),
+                            summary=op.get("summary"),
                         )
                     touched_project = True
                 else:
@@ -1688,6 +1908,8 @@ def validate_and_apply_batch(
                         candidate_links=candidate_links,
                         exclude_link_names=exclude_names,
                         session_pairs=session_pairs,
+                        section_key=op.get("section_key"),
+                        summary=op.get("summary"),
                     )
 
                 if existing is not None and existing == rendered:
@@ -1717,15 +1939,52 @@ def validate_and_apply_batch(
                 link_lines = _merge_link_lines(existing_links, candidate_links, exclude_names=exclude_names)
                 managed_body = _render_managed_sections(op["managed_content"], existing_sections, link_lines)
 
-                default_header = (
-                    f"---\ntype: project\ntitle: {json.dumps(title, ensure_ascii=False)}\n"
-                    f"proactive_owned: true\nstatus: active\n---\n\n# {title}\n\n"
-                )
-                merged = _merge_managed_block(
-                    existing,
-                    default_header=default_header,
-                    managed_body=managed_body,
-                )
+                explicit_summary = op.get("summary")
+                derived_summary = _derive_note_summary(op["managed_content"])
+                if existing is None:
+                    fm_new: dict[str, Any] = {
+                        "type": "project",
+                        "title": title,
+                        "summary": explicit_summary or derived_summary,
+                        "proactive_owned": True,
+                        "status": "active",
+                    }
+                    default_header = f"{_dump_frontmatter(fm_new)}\n# {title}\n\n"
+                    merged = _merge_managed_block(
+                        None,
+                        default_header=default_header,
+                        managed_body=managed_body,
+                    )
+                else:
+                    fm_cur, body_cur = _parse_frontmatter_and_body(existing)
+                    fm_changed = False
+                    if explicit_summary and str(fm_cur.get("summary") or "").strip() != explicit_summary:
+                        fm_cur["summary"] = explicit_summary
+                        fm_changed = True
+                    elif not str(fm_cur.get("summary") or "").strip() and derived_summary:
+                        fm_cur["summary"] = derived_summary
+                        fm_changed = True
+                    if fm_changed:
+                        if not fm_cur.get("type"):
+                            fm_cur["type"] = "project"
+                        if not fm_cur.get("title"):
+                            fm_cur["title"] = title
+                        merged_body = _merge_managed_block(
+                            body_cur.lstrip("\r\n"),
+                            default_header=f"# {fm_cur.get('title') or title}\n\n",
+                            managed_body=managed_body,
+                        )
+                        merged = f"{_dump_frontmatter(fm_cur)}\n{merged_body}"
+                    else:
+                        default_header = (
+                            f"---\ntype: project\ntitle: {json.dumps(title, ensure_ascii=False)}\n"
+                            f"proactive_owned: true\nstatus: active\n---\n\n# {title}\n\n"
+                        )
+                        merged = _merge_managed_block(
+                            existing,
+                            default_header=default_header,
+                            managed_body=managed_body,
+                        )
                 if existing is not None and existing == merged:
                     skipped_dedupe += 1
                     op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})

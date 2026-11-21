@@ -36,6 +36,33 @@ _TYPE_DIR_MAP: dict[str, str] = {
 
 _SAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 _TITLE_ID_ANCHOR_RE = re.compile(r"[A-Za-z]+[-_]?\d+(?:[-_]\d+)*")
+_NOTE_API_ALLOWED_PREFIXES = ("20_longterm/", "10_working/")
+_NOTE_API_MAX_CONTENT_CHARS = 20000
+
+
+def _derive_fallback_summary(body: str, max_chars: int = 100) -> str:
+    """从正文首句派生摘要（截断至 max_chars 字）。"""
+    first = ""
+    for raw_line in str(body or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("<!--"):
+            continue
+        if line.startswith(("- ", "* ")):
+            line = line[2:].strip()
+        if line:
+            first = line
+            break
+    if not first:
+        first = " ".join(str(body or "").split()).strip()
+    if not first:
+        return ""
+    m = re.search(r"[。！？!?]|(?<!\d)\.(?=\s|$)", first)
+    if m and m.start() > 0:
+        first = first[: m.end()].strip()
+    first = " ".join(first.split())
+    if len(first) <= max_chars:
+        return first
+    return first[: max(1, max_chars - 1)].rstrip() + "…"
 
 
 def _parse_str_list(raw: Any) -> list[str]:
@@ -393,6 +420,135 @@ class BrokerService:
             ).fetchone()
             return str(row["path"]) if row else None
 
+    def _validate_note_api_path(self, rel_path: str) -> tuple[Path, str]:
+        """校验 /v1/note 路径：必须落在 profile_dir 内的 20_LongTerm/ 或 10_Working/ 下，禁止穿越与受限目录。"""
+        raw = str(rel_path or "").replace("\\", "/").strip()
+        while raw.startswith("./"):
+            raw = raw[2:]
+        if not raw or raw.startswith("/") or ":" in raw:
+            raise ServiceError(403, "forbidden", f"path outside allowed directories: {rel_path}")
+        parts = Path(raw).parts
+        if any(p in ("..", ".", "") for p in parts):
+            raise ServiceError(403, "forbidden", f"invalid path segment: {rel_path}")
+        if any(p.startswith(".") for p in parts):
+            raise ServiceError(403, "forbidden", f"hidden path is not allowed: {rel_path}")
+
+        profile_root = self.config.profile_dir.resolve()
+        cur = self.config.profile_dir
+        for part in parts:
+            cur = cur / part
+            if cur.exists() and cur.is_symlink():
+                raise ServiceError(403, "forbidden", f"symlink access denied: {rel_path}")
+
+        candidate = (self.config.profile_dir / Path(*parts)).resolve()
+        if not candidate.is_relative_to(profile_root):
+            raise ServiceError(403, "forbidden", "path outside profile directory")
+
+        canonical_rel = candidate.relative_to(profile_root).as_posix()
+        lower_rel = canonical_rel.lower()
+        if not any(lower_rel.startswith(prefix) for prefix in _NOTE_API_ALLOWED_PREFIXES):
+            raise ServiceError(403, "forbidden", f"path not in 20_LongTerm/ or 10_Working/: {canonical_rel}")
+        return candidate, canonical_rel
+
+    def _resolve_note_by_title(self, title_ref: str) -> str | None:
+        """在 20_LongTerm/ 与 10_Working/ 中按标题或 stem 查找笔记相对路径。"""
+        stem = title_ref[:-3] if title_ref.lower().endswith(".md") else title_ref
+        db_path = self.config.broker.db_path
+        if db_path.exists():
+            with connect_db(db_path) as conn:
+                row = conn.execute(
+                    "SELECT path FROM notes WHERE title = ? OR path = ? LIMIT 1",
+                    (stem, title_ref.replace("\\", "/")),
+                ).fetchone()
+                if row:
+                    return str(row["path"])
+                all_rows = conn.execute("SELECT path, title, fm_json FROM notes").fetchall()
+                for r in all_rows:
+                    rel = str(r["path"])
+                    if Path(rel).stem == stem:
+                        return rel
+                    try:
+                        fm = json.loads(r["fm_json"] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        fm = {}
+                    if isinstance(fm, dict):
+                        if str(fm.get("title") or "").strip() == stem:
+                            return rel
+                        aliases = fm.get("aliases") or []
+                        if isinstance(aliases, list) and any(str(a).strip() == stem for a in aliases):
+                            return rel
+
+        # 索引库未命中或尚未建库时，回退扫描允许目录
+        for subdir in ("20_LongTerm", "10_Working"):
+            base = self.config.profile_dir / subdir
+            if not base.exists() or base.is_symlink():
+                continue
+            for md in sorted(base.rglob("*.md")):
+                if md.is_symlink():
+                    continue
+                rel_parts = md.relative_to(self.config.profile_dir).parts
+                if any(p.startswith(".") for p in rel_parts):
+                    continue
+                if md.stem == stem or md.name == title_ref:
+                    return "/".join(rel_parts)
+                try:
+                    parsed = parse_note(md, md.read_text(encoding="utf-8", errors="replace"))
+                    if str(parsed.frontmatter.get("title") or "").strip() == stem:
+                        return "/".join(rel_parts)
+                except OSError:
+                    continue
+        return None
+
+    def get_note(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST /v1/note：按 title 或 path 读取 20_LongTerm/ 与 10_Working/ 下的单篇笔记。"""
+        raw_path = str(payload.get("path") or "").strip()
+        raw_title = str(payload.get("title") or "").strip()
+        if not raw_path and not raw_title:
+            raise ServiceError(400, "invalid_request", "title or path is required")
+
+        if raw_path:
+            candidate, rel_path = self._validate_note_api_path(raw_path)
+            if not candidate.exists() or not candidate.is_file():
+                raise ServiceError(404, "not_found", f"note not found: {rel_path}")
+        else:
+            found_rel = self._resolve_note_by_title(raw_title)
+            if found_rel is None:
+                raise ServiceError(404, "not_found", f"note not found: {raw_title}")
+            candidate, rel_path = self._validate_note_api_path(found_rel)
+            if not candidate.exists() or not candidate.is_file():
+                raise ServiceError(404, "not_found", f"note file missing: {rel_path}")
+
+        raw = candidate.read_text(encoding="utf-8")
+        parsed = parse_note(candidate, raw)
+        fm = parsed.frontmatter
+        summary = " ".join(str(fm.get("summary") or "").split()).strip()
+        if not summary:
+            summary = _derive_fallback_summary(parsed.body, max_chars=100)
+        updated = str(fm.get("updated") or "").strip()
+
+        seen_links: set[tuple[str, str]] = set()
+        links: list[dict[str, str]] = []
+        for lnk in parsed.links:
+            key = (lnk.dst_title, lnk.relation)
+            if key not in seen_links:
+                seen_links.add(key)
+                links.append({"title": lnk.dst_title, "relation": lnk.relation})
+
+        truncated = len(raw) > _NOTE_API_MAX_CONTENT_CHARS
+        content = raw[:_NOTE_API_MAX_CONTENT_CHARS] if truncated else raw
+
+        result: dict[str, Any] = {
+            "title": str(fm.get("title") or parsed.title),
+            "path": rel_path,
+            "summary": summary,
+            "content": content,
+            "links": links,
+            "updated": updated,
+        }
+        if truncated:
+            result["truncated"] = True
+        return result
+
     def write_note(
         self,
         payload: dict[str, Any],
@@ -477,9 +633,16 @@ class BrokerService:
                 stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                 target_file = target_dir / f"{safe_stem}-{stamp}.md"
 
+        summary_raw = " ".join(str(payload.get("summary") or "").split()).strip()
+        if summary_raw:
+            summary_val = summary_raw[:120] if len(summary_raw) <= 120 else (summary_raw[:119].rstrip() + "…")
+        else:
+            summary_val = _derive_fallback_summary(content, max_chars=100)
+
         fm_lines = [
             "---",
             f"type: {note_type}",
+            f"summary: {json.dumps(summary_val, ensure_ascii=False)}",
             f"created: {created_str}",
             f"updated: {today_str}",
             f"source: {identity.display_source}",
@@ -927,6 +1090,9 @@ class BrokerHTTPHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/v1/read":
                     self._send_json(200, svc.read_note(payload, can_casual=identity.can_casual))
+                    return
+                if path == "/v1/note":
+                    self._send_json(200, svc.get_note(payload))
                     return
                 if path == "/v1/write":
                     self._send_json(200, svc.write_note(payload, identity=identity))

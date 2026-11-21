@@ -317,16 +317,32 @@ def render_delta(
 
 
 def render_prefetch(hits: list[dict[str, Any]], max_chars: int = 1200) -> str:
-    """将检索命中格式化为紧凑的预取上下文块（<=prefetch_chars）。"""
+    """将检索命中格式化为紧凑的摘要索引块（[MEMORY_INDEX]，<=max_chars）。
+
+    注：保留函数名与签名，行为已由原先的 [MEMORY_PREFETCH] 正文片段改为只输出
+    `- <文件名去 .md> — <summary≤120 字>` 的索引行，不再注入正文 excerpt。
+    """
     if not hits:
         return ""
-    lines = ["[MEMORY_PREFETCH]"]
+    ordered = sorted(
+        hits,
+        key=lambda h: (float(h.get("score") or 0.0), str(h.get("updated") or "")),
+        reverse=True,
+    )
+    lines = ["[MEMORY_INDEX]"]
     used = len(lines[0])
-    for h in hits:
-        title = str(h.get("title") or "")
-        excerpt = str(h.get("excerpt") or "")
-        score = h.get("score", 0.0)
-        entry = f"- {title} (score={score}): {excerpt}"
+    for h in ordered:
+        raw_path = str(h.get("path") or "").strip()
+        if raw_path:
+            name = Path(raw_path).stem
+        else:
+            raw_title = str(h.get("title") or "").strip()
+            name = raw_title[:-3] if raw_title.lower().endswith(".md") else raw_title
+        raw_summary = " ".join(str(h.get("summary") or "").split()).strip()
+        if not raw_summary:
+            raw_summary = " ".join(str(h.get("excerpt") or "").split()).strip()[:100]
+        summary = _truncate_text(raw_summary, 120)
+        entry = f"- {name} — {summary}"
         if used + len(entry) + 1 > max_chars:
             break
         lines.append(entry)

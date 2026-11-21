@@ -54,6 +54,7 @@ _INJECTED_BLOCK_RE = re.compile(
     r"(?:\[SHARED_BRAIN[^\]]*\][\s\S]*?(?=\n\n|\Z)|"
     r"\[MEMORY_DELTA\][^\n]*\n?|"
     r"\[MEMORY_PREFETCH\][\s\S]*?(?=\n\n|\Z)|"
+    r"\[MEMORY_INDEX\][\s\S]*?(?=\n\n|\Z)|"
     r"\[PREVIOUS_REVIEW_RESULT\][^\n]*\n?|"
     r"\[DIARY\][^\n]*\n?)"
 )

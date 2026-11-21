@@ -34,7 +34,8 @@ _STATIC_PROTOCOL_BLOCK = (
     "[SHARED_BRAIN 记忆协议]\n"
     "- 跨端共享记忆由本地 agentbrain broker 托管，按需通过 prefetch 自动注入相关事实与决策。\n"
     "- 本块为静态协议说明，不包含动态记忆或日记正文。\n"
-    "- 重要事实或偏好变更可由后台评审自动沉淀；会话压缩前自动同步接力状态。"
+    "- 重要事实或偏好变更可由后台评审自动沉淀；会话压缩前自动同步接力状态。\n"
+    "- 需要细节时调用 memory_search / memory_read；不要只凭 MEMORY_INDEX 的摘要推断事实。"
 )
 
 _CATEGORY_LABELS = {
@@ -190,6 +191,7 @@ _INJECTED_BLOCK_RE = re.compile(
     r"(?:\[SHARED_BRAIN[^\]]*\][\s\S]*?(?=\n\n|\Z)|"
     r"\[MEMORY_DELTA\][^\n]*\n?|"
     r"\[MEMORY_PREFETCH\][\s\S]*?(?=\n\n|\Z)|"
+    r"\[MEMORY_INDEX\][\s\S]*?(?=\n\n|\Z)|"
     r"\[PREVIOUS_REVIEW_RESULT\][^\n]*\n?|"
     r"\[DIARY\][^\n]*\n?)"
 )
@@ -588,13 +590,27 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             if rev is not None and prev_revision is not None and rev != prev_revision:
                 lines.append(f"[MEMORY_DELTA] revision {prev_revision} -> {rev}")
             lines.extend(receipt_lines)
-            lines.append("[MEMORY_PREFETCH]")
+            lines.append("[MEMORY_INDEX]")
             used = sum(len(line) + 1 for line in lines) - 1
             count = 0
-            for hit in hits:
-                title = str(hit.get("title") or "")
-                excerpt = str(hit.get("excerpt") or "")
-                entry = f"- {title}: {excerpt}"
+            ordered_hits = sorted(
+                hits,
+                key=lambda h: (float(h.get("score") or 0.0), str(h.get("updated") or "")),
+                reverse=True,
+            )
+            for hit in ordered_hits:
+                raw_path = str(hit.get("path") or "").strip()
+                if raw_path:
+                    name = Path(raw_path).stem
+                else:
+                    raw_title = str(hit.get("title") or "").strip()
+                    name = raw_title[:-3] if raw_title.lower().endswith(".md") else raw_title
+                raw_summary = " ".join(str(hit.get("summary") or "").split()).strip()
+                if not raw_summary:
+                    raw_summary = " ".join(str(hit.get("excerpt") or "").split()).strip()[:100]
+                if len(raw_summary) > 120:
+                    raw_summary = raw_summary[:119].rstrip() + "…"
+                entry = f"- {name} — {raw_summary}"
                 if used + len(entry) + 1 > 1200:
                     break
                 lines.append(entry)
@@ -898,7 +914,129 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
         return ""
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return []
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "按关键词检索长期记忆与工作记忆，返回匹配的笔记摘要列表。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "检索关键词或问题",
+                            },
+                            "k": {
+                                "type": "integer",
+                                "description": "返回条数上限，默认 5",
+                                "default": 5,
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_read",
+                    "description": "按标题或路径读取单篇长期记忆或工作记忆的完整正文与关联链接。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": "笔记标题或文件名（不含 .md），与 path 二选一",
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "相对 profile 的笔记路径（仅限 20_LongTerm/ 或 10_Working/），与 title 二选一",
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+            },
+        ]
+
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
+        """分发 memory_search / memory_read 工具调用，一律返回 JSON 字符串，错误返回 {"error": ...}。"""
+        try:
+            if self._closed:
+                return json.dumps({"error": "provider is closed"}, ensure_ascii=False)
+            params = args if isinstance(args, dict) else {}
+
+            if tool_name == "memory_search":
+                query = str(params.get("query") or "").strip()
+                if not query:
+                    return json.dumps({"error": "query is required"}, ensure_ascii=False)
+                raw_k = params.get("k", 5)
+                try:
+                    k = max(1, int(raw_k))
+                except (TypeError, ValueError):
+                    k = 5
+                # 主动检索工具不带 inject，不走 prefetch 过滤
+                res = self._http_json("POST", "/v1/search", {"query": query, "k": k}, timeout=2.0)
+                raw_hits = res.get("hits") if isinstance(res, dict) else []
+                hits_out: list[dict[str, Any]] = []
+                for h in raw_hits or []:
+                    if not isinstance(h, dict):
+                        continue
+                    summary = " ".join(str(h.get("summary") or "").split()).strip()
+                    if not summary:
+                        summary = " ".join(str(h.get("excerpt") or "").split()).strip()[:100]
+                    hits_out.append(
+                        {
+                            "title": str(h.get("title") or ""),
+                            "path": str(h.get("path") or ""),
+                            "summary": summary,
+                            "score": h.get("score", 0.0),
+                        }
+                    )
+                return json.dumps({"hits": hits_out, "total": len(hits_out)}, ensure_ascii=False)
+
+            if tool_name == "memory_read":
+                title = str(params.get("title") or "").strip()
+                path = str(params.get("path") or "").strip()
+                if not title and not path:
+                    return json.dumps({"error": "title or path is required"}, ensure_ascii=False)
+                req_payload: dict[str, Any] = {}
+                if title:
+                    req_payload["title"] = title
+                if path:
+                    req_payload["path"] = path
+                res = self._http_json("POST", "/v1/note", req_payload, timeout=2.0)
+                out: dict[str, Any] = {
+                    "title": str(res.get("title") or ""),
+                    "path": str(res.get("path") or ""),
+                    "summary": str(res.get("summary") or ""),
+                    "content": str(res.get("content") or ""),
+                    "links": res.get("links") if isinstance(res.get("links"), list) else [],
+                    "updated": str(res.get("updated") or ""),
+                }
+                if res.get("truncated"):
+                    out["truncated"] = True
+                return json.dumps(out, ensure_ascii=False)
+
+            return json.dumps({"error": f"unknown tool: {tool_name}"}, ensure_ascii=False)
+        except urllib.error.HTTPError as http_exc:
+            detail = ""
+            try:
+                body = http_exc.read().decode("utf-8", errors="replace")
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    err_code = str(parsed.get("error") or f"http_{http_exc.code}")
+                    err_detail = str(parsed.get("detail") or "").strip()
+                    detail = f"{err_code}: {err_detail}" if err_detail else err_code
+                else:
+                    detail = body.strip() or f"http_{http_exc.code}"
+            except Exception:
+                detail = f"http_{http_exc.code}"
+            return json.dumps({"error": detail}, ensure_ascii=False)
+        except Exception as exc:
+            self._logger.warning("handle_tool_call(%s) failed: %s", tool_name, exc)
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
     def shutdown(self) -> None:
         try:

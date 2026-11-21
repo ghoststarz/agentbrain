@@ -34,6 +34,29 @@ class CandidateHit:
     source: str
     trigger_order: int = 100
     weak_evidence: bool = False
+    summary: str = ""
+    updated: str = ""
+
+
+_MANAGED_MARKER_RE = re.compile(r"<!--\s*agentbrain:managed:(?:start|end)\s*-->")
+_HEADING_PREFIX_RE = re.compile(r"^#{1,6}\s*")
+
+
+def _clean_summary_text(text: str) -> str:
+    """把受管块标记、标题行、多余空白从摘要里剔掉，避免注入出一行 `<!-- ... -->`。"""
+    cleaned = _MANAGED_MARKER_RE.sub(" ", str(text or ""))
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned
+
+
+def _resolve_hit_summary(fm: dict[str, Any], excerpt: str) -> str:
+    """优先取 frontmatter.summary，缺失时退回清理过的 excerpt 前 100 字。"""
+    raw_summary = _clean_summary_text(fm.get("summary"))
+    if raw_summary:
+        return raw_summary
+    fallback = _clean_summary_text(excerpt)
+    fallback = _HEADING_PREFIX_RE.sub("", fallback).strip()
+    return fallback[:100]
 
 
 def _parse_date(val: str | None) -> dt.date | None:
@@ -280,7 +303,7 @@ def recall_trigger(
     query_lower = query.lower()
     rows = conn.execute(
         """
-        SELECT id, path, title, type, keys_json, keys2_json, trigger_order
+        SELECT id, path, title, type, updated, keys_json, keys2_json, trigger_order, fm_json
         FROM notes
         WHERE keys_json IS NOT NULL AND keys_json != '[]'
         """
@@ -317,6 +340,14 @@ def recall_trigger(
             (nid,),
         ).fetchone()
         excerpt = _make_excerpt(str(chunk_row["text"]), title=title) if chunk_row else title
+        try:
+            fm = json.loads(row["fm_json"] or "{}")
+            if not isinstance(fm, dict):
+                fm = {}
+        except (TypeError, json.JSONDecodeError):
+            fm = {}
+        summary = _resolve_hit_summary(fm, excerpt)
+        updated = str(row["updated"] or "")
         order = int(row["trigger_order"]) if row["trigger_order"] is not None else 100
         clamped_order = max(0, min(order, 200))
         score = round(1.2 + 0.6 * (1.0 - clamped_order / 200.0), 4)
@@ -332,6 +363,8 @@ def recall_trigger(
                 source="trigger",
                 trigger_order=order,
                 weak_evidence=False,
+                summary=summary,
+                updated=updated,
             )
         )
 
@@ -458,6 +491,7 @@ def recall_fts(
         superseded_by = fm.get("superseded_by")
         final_score = base_score * ret_cfg.superseded_penalty if superseded_by else base_score
 
+        excerpt = _make_excerpt(note_best_chunk[nid][1], title=str(note_row["title"]))
         scored_hits.append(
             CandidateHit(
                 note_id=nid,
@@ -465,9 +499,11 @@ def recall_fts(
                 title=str(note_row["title"]),
                 note_type=note_row["type"] or "note",
                 score=round(final_score, 4),
-                excerpt=_make_excerpt(note_best_chunk[nid][1], title=str(note_row["title"])),
+                excerpt=excerpt,
                 source="fts",
                 weak_evidence=False,
+                summary=_resolve_hit_summary(fm, excerpt),
+                updated=str(note_row["updated"] or ""),
             )
         )
 
@@ -486,6 +522,13 @@ def recall_fts(
                 norm_score = round(max(1e-6, raw_bm25 / max_raw), 6)
             else:
                 norm_score = round(1.0 / (idx + 2), 6)
+            try:
+                fm_weak = json.loads(note_row["fm_json"] or "{}")
+                if not isinstance(fm_weak, dict):
+                    fm_weak = {}
+            except (TypeError, json.JSONDecodeError):
+                fm_weak = {}
+            weak_excerpt = _make_excerpt(best_text, title=str(note_row["title"]))
             scored_hits.append(
                 CandidateHit(
                     note_id=nid,
@@ -493,13 +536,15 @@ def recall_fts(
                     title=str(note_row["title"]),
                     note_type=note_row["type"] or "note",
                     score=norm_score,
-                    excerpt=_make_excerpt(best_text, title=str(note_row["title"])),
+                    excerpt=weak_excerpt,
                     source="fts_weak",
                     weak_evidence=True,
+                    summary=_resolve_hit_summary(fm_weak, weak_excerpt),
+                    updated=str(note_row["updated"] or ""),
                 )
             )
     else:
-        scored_hits.sort(key=lambda h: h.score, reverse=True)
+        scored_hits.sort(key=lambda h: (h.score, h.updated), reverse=True)
 
     return scored_hits, evidence_bypassed
 
@@ -545,7 +590,9 @@ def rank_and_budget(
             "type": cand.note_type,
             "score": cand.score,
             "source": source,
+            "summary": cand.summary or cand.excerpt[:100],
             "excerpt": cand.excerpt,
+            "updated": cand.updated,
             "connected": connected,
         }
         if cand.weak_evidence and cand.source != "trigger":

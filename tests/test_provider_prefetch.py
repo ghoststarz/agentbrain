@@ -46,7 +46,7 @@ def test_prefetch_runs_every_turn_when_revision_unchanged(monkeypatch: pytest.Mo
 
     for q in ("ADR-03 的结论", "同步器 中枢", "幂等 记忆"):
         out = provider.prefetch(q)
-        assert "[MEMORY_PREFETCH]" in out
+        assert "[MEMORY_INDEX]" in out
         assert "[MEMORY_DELTA]" not in out
         assert "ADR-03" in out
 
@@ -74,7 +74,7 @@ def test_prefetch_injects_memory_delta_only_on_revision_change(monkeypatch: pyte
     assert "[MEMORY_DELTA]" in out2
     assert "10 -> 12" in out2
     assert "[MEMORY_DELTA]" not in out3
-    assert "[MEMORY_PREFETCH]" in out3
+    assert "[MEMORY_INDEX]" in out3
 
 
 def test_prefetch_returns_empty_when_all_hits_weak_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -162,8 +162,8 @@ def test_prefetch_delivers_and_acks_review_receipt_once(monkeypatch: pytest.Monk
     assert out2 == ""
 
 
-def test_prefetch_returns_empty_when_hits_exceed_budget_without_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
-    """命中存在但第一条就超 1200 字预算且无回执时，不退化输出 [DIARY]。"""
+def test_prefetch_index_lines_stay_short_even_with_huge_excerpt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """索引模式只注入「文件名 + 摘要」，正文再长也不会撑爆预算。"""
     cls = _load_provider_cls()
     provider = cls()
 
@@ -173,6 +173,25 @@ def test_prefetch_returns_empty_when_hits_exceed_budget_without_receipt(monkeypa
                 "hits": [{"title": "巨长笔记", "excerpt": "字" * 2000}],
                 "revision": 5,
             }
+        return {}
+
+    monkeypatch.setattr(provider, "_http_json", fake_http)
+
+    out = provider.prefetch("任意查询")
+    assert out.startswith("[MEMORY_INDEX]")
+    assert "巨长笔记" in out
+    assert "字" * 200 not in out
+    assert len(out) <= 1200
+
+
+def test_prefetch_returns_empty_when_a_single_line_exceeds_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """单行就超预算时宁可空，也不吐半行。"""
+    cls = _load_provider_cls()
+    provider = cls()
+
+    def fake_http(method: str, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 1.5) -> dict[str, Any]:
+        if path == "/v1/search":
+            return {"hits": [{"title": "长" * 2000, "summary": "短摘要"}], "revision": 5}
         return {}
 
     monkeypatch.setattr(provider, "_http_json", fake_http)

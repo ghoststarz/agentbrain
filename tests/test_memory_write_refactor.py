@@ -400,7 +400,8 @@ def test_4_project_scope_routing_and_section_replace_and_project_update_coexist(
     assert "当前阶段：核心战斗原型调优。" in managed
     assert managed.count("### 弹幕冷却参数") == 1
     assert "调整后冷却 0.5 秒，手感更紧凑。" in managed
-    assert "初版冷却 0.8 秒。" not in managed
+    # §6.3 新契约：覆盖时不丢旧结论，降级为「已废止」行保留（便于回溯"当时为什么这么定"）
+    assert "> 已废止（" in managed and "初版冷却 0.8 秒。" in managed
     assert "## 关联" in managed
     assert "- related_to [[MOC-游戏设计]]" in managed
 
