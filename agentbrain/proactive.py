@@ -796,7 +796,7 @@ class ProactiveStore:
                     cnt = int(stats["cnt"])
                     max_id = int(stats["max_id"])
 
-                    if cnt == 0:
+                    if cnt == 0 and not self.config.nightly_always_diary:
                         windows_skipped_empty += 1
                         conn.execute(
                             """

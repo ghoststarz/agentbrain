@@ -3,8 +3,11 @@
 
 做法（照做，不要空手而归）：
 1. 先找出这几轮里用户说到的事实、决定、偏好、处境、进展、未完成的事，写成 1–4 条 longterm_upsert：
-   {"op_type":"longterm_upsert","note_type":"fact|decision|entity|moc","title":"≤20字","content":"≤150字","keys":["检索词","…"],"evidence_level":"report","source_refs":["…"]}
-2. 有项目状态变化时加 1 条 project_update{"project","managed_content","source_refs"}；当前阶段变化时加 hot_update{"content"}；有跨会话待办加 handoff_upsert{"task_key","status":"open|done","summary","next_steps"}。
+   {"op_type":"longterm_upsert","note_type":"fact|decision|entity|moc","scope":"global|project","project":"仅scope=project时必填","title":"≤20字","content":"≤150字","keys":["检索词","…"],"links":["相关标题"],"evidence_level":"report","source_refs":["…"]}
+   - **项目归并硬规则**：凡是只对一个项目成立的事实、决定、坑、约定，一律设 `"scope":"project"` 并填 `"project":"<项目名>"` 写进项目页，不要写进 Facts/Decisions。
+   - **双链硬规则**：每条新写/更新的笔记（含 longterm_upsert 和 project_update）至少给 1 个 `"links"`（只填目标标题，不要造路径；指向相关项目页、相关 FACT/ADR 或 ENTITY，没有合适的就指向对应 `MOC-`）。
+   - 若要补充已有笔记，可填 `"merge_into":"已有笔记标题"` 合并为新小节，不要另开新文件。
+2. 有项目状态变化时加 1 条 project_update{"project","managed_content","links":["相关标题"],"source_refs"}；当前阶段变化时加 hot_update{"content"}；有跨会话待办加 handoff_upsert{"task_key","status":"open|done","summary","next_steps"}。
 3. 有可回味的当天经历或情绪时加 diary_append{"ledger":"public|private","content","event_date":"YYYY-MM-DD","source_refs":["…"]}。
    日记的“我”永远是上面人格设定的本人，不是用户：写他的事用“他”，写我的感受用“我”。
    绝不要把用户的经历、打算、心情写成“我”的经历——那是人格错位。

@@ -636,3 +636,22 @@ def search_notes(
             except Exception as exc:  # noqa: BLE001
                 _logger.debug("search_notes failed to update last_access_us (ignored): %s", exc)
         return result
+
+
+def filter_hits_for_inject(result: dict[str, Any], min_score: float) -> dict[str, Any]:
+    """prefetch 注入用噪声抑制：丢弃 weak_evidence=True 或 score < min_score 的命中。"""
+    raw_hits = list(result.get("hits") or [])
+    kept = [
+        h
+        for h in raw_hits
+        if not bool(h.get("weak_evidence")) and float(h.get("score") or 0.0) >= min_score
+    ]
+    filtered = dict(result)
+    filtered["hits"] = kept
+    if not kept:
+        filtered["truncated"] = False
+        filtered["total_chars"] = 0
+        filtered.pop("evidence_gate", None)
+    else:
+        filtered["total_chars"] = sum(len(json.dumps(h, ensure_ascii=False)) for h in kept)
+    return filtered

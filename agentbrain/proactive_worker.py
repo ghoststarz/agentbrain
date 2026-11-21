@@ -45,11 +45,13 @@ def _system_prompt(
     soul_text: str | None = None,
     soul_path: Path | str | None = None,
     allow_diary: bool = True,
+    idle_nightly: bool = False,
 ) -> str:
     """复盘主提示词：人格从 SOUL.md 运行时热读，与「怎么写」操作规则分离；夜间任务前置专用要求。
 
     `allow_diary=False` 用于夜间复盘的分段轮次：那几轮只产出 digest，日记留给最后一个分段统一写，
     避免多分段各写一份日记，把一天写成七八条重复流水账。
+    `idle_nightly=True` 用于无新对话的空窗口夜间日记，使用 `review_nightly_idle`。
     """
     if soul_text is None:
         if soul_path is None:
@@ -63,7 +65,12 @@ def _system_prompt(
     persona_block = f"## 你是谁（运行时读取自 SOUL.md，此处不得写死）\n\n{resolved_soul}"
     base = load_prompt("review_system")
     if job_type == "nightly":
-        addendum_name = "review_nightly_addendum" if allow_diary else "review_nightly_segment"
+        if idle_nightly:
+            addendum_name = "review_nightly_idle"
+        elif allow_diary:
+            addendum_name = "review_nightly_addendum"
+        else:
+            addendum_name = "review_nightly_segment"
         addendum = load_prompt(addendum_name)
         if window_id:
             addendum = addendum.replace("<窗口日期>", str(window_id))
@@ -78,9 +85,9 @@ def _nightly_system_prompt_overhead_chars(
     soul_text: str | None = None,
     soul_path: Path | str | None = None,
 ) -> int:
-    """预算估算用：取「完整版」与「分段版」两种提示词里更长的那个长度。"""
+    """预算估算用：取「完整版」「分段版」「空窗口版」三种夜间提示词里最长的那个长度。"""
     lengths = []
-    for allow in (True, False):
+    for allow, idle in ((True, False), (False, False), (True, True)):
         lengths.append(
             len(
                 _system_prompt(
@@ -89,6 +96,7 @@ def _nightly_system_prompt_overhead_chars(
                     soul_text=soul_text,
                     soul_path=soul_path,
                     allow_diary=allow,
+                    idle_nightly=idle,
                 )
             )
         )
@@ -411,10 +419,17 @@ def segment_job_prompts_with_snapshots(
         )
 
     if not ordered_events:
-        prompt = (
-            f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
-            "<untrusted_evidence>\n</untrusted_evidence>"
-        )
+        if job.job_type == "nightly":
+            prompt = (
+                f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
+                "<untrusted_evidence>\n</untrusted_evidence>\n\n"
+                "说明：本窗口没有任何新对话，请只基于你自己的近况、想法与已有记忆写今天的公账与私账日记，严禁编造用户当天做过什么。"
+            )
+        else:
+            prompt = (
+                f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
+                "<untrusted_evidence>\n</untrusted_evidence>"
+            )
         return [([], prompt)], snapshot_hashes
 
     segments: list[tuple[list[StoredEvent], str]] = []
@@ -548,6 +563,7 @@ def call_proactive_model(
     window_id: str | None = None,
     route_out: dict[str, Any] | None = None,
     allow_diary: bool = True,
+    idle_nightly: bool = False,
 ) -> dict[str, Any]:
     """根据配置路由调用后台评审模型（默认 Hermes 框架路由，可选 OpenAI 兼容端点）。"""
     cfg = config.memory.proactive
@@ -558,6 +574,7 @@ def call_proactive_model(
         window_id=window_id,
         soul_path=config.broker.soul_path,
         allow_diary=allow_diary,
+        idle_nightly=idle_nightly,
     )
     if backend == "openai_compatible":
         if route_out is not None:
@@ -708,6 +725,7 @@ def process_claimed_job(
 
     _COMPACT_RETRY_HINT = "\n\n" + load_prompt("review_retry_compact")
     last_model_route: dict[str, Any] = {}
+    is_idle_nightly = job.job_type == "nightly" and not events
 
     def _call_model_with_heartbeat(
         prompt: str,
@@ -725,6 +743,7 @@ def process_claimed_job(
                 window_id=job.window_id,
                 route_out=call_route,
                 allow_diary=allow_diary,
+                idle_nightly=is_idle_nightly,
             )
             if call_route:
                 last_model_route.clear()
@@ -759,6 +778,7 @@ def process_claimed_job(
                     window_id=job.window_id,
                     route_out=call_route,
                     allow_diary=allow_diary,
+                    idle_nightly=is_idle_nightly,
                 )
                 if call_route:
                     last_model_route.clear()

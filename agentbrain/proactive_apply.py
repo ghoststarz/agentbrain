@@ -21,6 +21,7 @@ from agentbrain.handoff import handoff_path, read_handoff, upsert_handoff
 from agentbrain.index import reindex
 from agentbrain.proactive import ClaimedJob, LeaseMismatchError, ProactiveStore, StoredEvent
 from agentbrain.proactive_clock import Clock, SystemClock, ensure_utc
+from agentbrain.retrieve import search_notes
 
 MANAGED_START = "<!-- agentbrain:managed:start -->"
 MANAGED_END = "<!-- agentbrain:managed:end -->"
@@ -55,6 +56,9 @@ _SAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 _TITLE_SEP_RE = re.compile(r'[：:，,（）()、/\\*?"<>|\x00-\x1f\s]+')
 _MULTI_DASH_RE = re.compile(r"-{2,}")
 _EVIDENCE_LEVELS = frozenset({"report", "delivered", "verified"})
+_EVIDENCE_RANK: dict[str, int] = {"report": 0, "delivered": 1, "verified": 2}
+_SEQ_PREFIX_BY_TYPE: dict[str, str] = {"fact": "FACT", "decision": "ADR"}
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
 _DIARY_LINE_RE = re.compile(r"^-\s*\[\d{2}:\d{2}:\d{2}\](?:\s*\([^)]*\))?\s+(.*)$")
 _PROJECT_EV_LINE_RE = re.compile(r"(?im)^\s*(?:evidence_level|verification_status)\s*:\s*.*$")
 
@@ -63,6 +67,7 @@ MAX_LONGTERM_CHARS = 16000
 MAX_PROJECT_MANAGED_CHARS = 8000
 MAX_HANDOFF_SUMMARY_CHARS = 2000
 MAX_DIARY_CHARS = 4000
+MAX_SOURCE_REFS = 40
 
 
 class BatchValidationError(ValueError):
@@ -115,23 +120,89 @@ def _resolve_note_date_compact(op: dict[str, Any], job: ClaimedJob, clock: Clock
     return clock.to_local(clock.now_utc()).strftime("%Y%m%d")
 
 
-def _build_new_note_filename(note_type: str, title: str, date_ymd: str) -> str:
-    """按统一命名规范构造新建文件名（不追溯已有文件）。"""
+def _format_seq(seq: int) -> str:
+    """格式化序号：两位补零（07、12），达到 100 起三位（100）。"""
+    return f"{max(1, int(seq)):02d}"
+
+
+def _allocate_next_seq(config: AppConfig, note_type: str) -> int:
+    """在写入锁内扫描同目录及归档目录的同前缀文件，取最大序号 + 1（全局单调递增）。"""
+    prefix = _SEQ_PREFIX_BY_TYPE.get(str(note_type or "").strip().lower())
+    if not prefix:
+        return 1
+    pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:-|$)", re.IGNORECASE)
+    max_seq = 0
+    scan_paths: list[Path] = []
+
+    target_dir = config.profile_dir / _LONGTERM_DIRS[note_type]
+    if target_dir.exists() and not target_dir.is_symlink():
+        scan_paths.extend(target_dir.glob(f"{prefix}-*.md"))
+        scan_paths.extend(target_dir.glob(f"{prefix.lower()}-*.md"))
+
+    archive_dir = config.profile_dir / "90_Archive"
+    if archive_dir.exists() and not archive_dir.is_symlink():
+        for md in archive_dir.rglob("*.md"):
+            if md.is_symlink():
+                continue
+            if md.stem.upper().startswith(f"{prefix}-"):
+                scan_paths.append(md)
+
+    seen_files: set[Path] = set()
+    for md in scan_paths:
+        if md in seen_files or md.is_symlink():
+            continue
+        seen_files.add(md)
+        m = pat.match(md.stem)
+        if not m:
+            continue
+        digits = m.group(1)
+        val = int(digits)
+        # 跳过旧式 8 位日期前缀（YYYYMMDD），避免污染两位/三位序号序列
+        if len(digits) == 8 and 19000101 <= val <= 29991231:
+            continue
+        if val > max_seq:
+            max_seq = val
+    return max_seq + 1
+
+
+def _build_new_note_filename(
+    note_type: str,
+    title: str,
+    date_ymd: str = "",
+    *,
+    seq: int | None = None,
+) -> str:
+    """按统一命名规范构造新建文件名（fact/decision 使用序号，project 保留中文与空格）。"""
     norm = normalize_note_title(title)
     nt = str(note_type or "").strip().lower()
     if nt == "fact":
-        return f"FACT-{date_ymd}-{norm}.md"
+        return f"FACT-{_format_seq(seq if seq is not None else 1)}-{norm}.md"
     if nt == "decision":
-        return f"ADR-{date_ymd}-{norm}.md"
+        return f"ADR-{_format_seq(seq if seq is not None else 1)}-{norm}.md"
     if nt == "entity":
         return f"ENTITY-{norm}.md"
     if nt == "moc":
         return f"MOC-{norm}.md"
     if nt == "project":
-        return f"PROJ-{norm}.md"
+        clean = _sanitize_filename(title)
+        stem = clean if clean.upper().startswith("PROJ-") else f"PROJ-{clean}"
+        return f"{stem}.md"
     if nt == "work":
         return f"WORK-{date_ymd}-{norm}.md"
     return f"{norm}.md"
+
+
+def _resolve_project_note_rel(config: AppConfig, project: str) -> tuple[str, str]:
+    """解析项目页路径：保留中文与空格，兼容已有无 PROJ- 前缀的旧文件。"""
+    clean = _sanitize_filename(project)
+    legacy_rel = f"20_LongTerm/Projects/{clean}.md"
+    legacy_target = _assert_safe_profile_subpath(config, legacy_rel)
+    if legacy_target.exists():
+        return legacy_rel, clean
+    stem = clean if clean.upper().startswith("PROJ-") else f"PROJ-{clean}"
+    rel = f"20_LongTerm/Projects/{stem}.md"
+    _assert_safe_profile_subpath(config, rel)
+    return rel, stem
 
 
 def _assert_no_symlink_escape(config: AppConfig, rel_path: str) -> Path:
@@ -358,6 +429,239 @@ def _find_existing_fact_key_path(config: AppConfig, fact_key: str) -> str | None
     return None
 
 
+def _find_merge_target_path(config: AppConfig, merge_into: str) -> str | None:
+    """按 merge_into（标题或文件名）在 20_LongTerm 下查找目标合并笔记。"""
+    raw = str(merge_into or "").strip()
+    if not raw:
+        return None
+    lt_dir = config.profile_dir / "20_LongTerm"
+    if not lt_dir.exists() or lt_dir.is_symlink():
+        return None
+    target_stem = raw[:-3] if raw.lower().endswith(".md") else raw
+    norm_target = normalize_note_title(target_stem)
+    norm_match: str | None = None
+
+    for md in sorted(lt_dir.rglob("*.md")):
+        if md.name == "_Overview.md" or md.is_symlink():
+            continue
+        try:
+            rel = md.relative_to(config.profile_dir).as_posix()
+            _assert_safe_profile_subpath(config, rel)
+        except Exception:
+            continue
+        fm, _ = _parse_frontmatter_and_body(md.read_text(encoding="utf-8", errors="replace"))
+        fm_title = str(fm.get("title") or "").strip()
+        if rel == raw or md.name == raw or md.stem == target_stem or fm_title == target_stem:
+            return rel
+        if norm_match is None and fm_title and normalize_note_title(fm_title) == norm_target:
+            norm_match = rel
+    return norm_match
+
+
+def _find_exact_title_target_path(config: AppConfig, note_type: str, title: str) -> str | None:
+    """按标题/stem 精确匹配同目录下的既有笔记（entity/moc 亦匹配目标标准文件名）。"""
+    clean_title = str(title or "").strip()
+    if not clean_title:
+        return None
+    sub_dir = config.profile_dir / _LONGTERM_DIRS[note_type]
+    if not sub_dir.exists() or sub_dir.is_symlink():
+        return None
+    sanitized = _sanitize_filename(clean_title)
+    expected_name = (
+        _build_new_note_filename(note_type, clean_title)
+        if note_type in ("entity", "moc")
+        else None
+    )
+    for md in sorted(sub_dir.glob("*.md")):
+        if md.name == "_Overview.md" or md.is_symlink():
+            continue
+        try:
+            rel = md.relative_to(config.profile_dir).as_posix()
+            _assert_safe_profile_subpath(config, rel)
+        except Exception:
+            continue
+        if md.stem == clean_title or md.stem == sanitized:
+            return rel
+        if expected_name and md.name == expected_name:
+            return rel
+        fm, _ = _parse_frontmatter_and_body(md.read_text(encoding="utf-8", errors="replace"))
+        if str(fm.get("title") or "").strip() == clean_title:
+            return rel
+    return None
+
+
+def _merge_str_list_ordered(
+    existing: Any,
+    incoming: list[str],
+    *,
+    limit: int | None = None,
+) -> list[str]:
+    """合并字符串列表：去重、保序；超限时保留最新 limit 条。"""
+    base = _normalize_str_list(existing) if isinstance(existing, list) else []
+    seen = set(base)
+    out = list(base)
+    for item in incoming:
+        s = str(item or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    if limit is not None and len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+def _higher_evidence_level(existing: Any, incoming: str) -> str:
+    cur = str(existing or "").strip().lower()
+    inc = str(incoming or "report").strip().lower()
+    if cur not in _EVIDENCE_RANK:
+        return inc if inc in _EVIDENCE_RANK else "report"
+    if inc not in _EVIDENCE_RANK:
+        return cur
+    return inc if _EVIDENCE_RANK[inc] >= _EVIDENCE_RANK[cur] else cur
+
+
+def _parse_managed_sections(
+    managed_text: str | None,
+) -> tuple[str, list[tuple[str, str]], list[str]]:
+    """把受管区块拆分为三部分：前置概要 preamble、有序 ### 小节列表、末尾 ## 关联 链接行列表。"""
+    if not managed_text or not managed_text.strip():
+        return "", [], []
+    preamble_lines: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    link_lines: list[str] = []
+    mode = "preamble"
+
+    for raw_line in managed_text.splitlines():
+        stripped = raw_line.strip()
+        if re.match(r"^##\s+关联\s*$", stripped):
+            mode = "links"
+            continue
+        m_sec = re.match(r"^###\s+(.+?)\s*$", stripped)
+        if m_sec and mode != "links":
+            mode = "section"
+            sections.append((m_sec.group(1).strip(), []))
+            continue
+        if mode == "links":
+            if stripped:
+                link_lines.append(raw_line.rstrip())
+        elif mode == "section":
+            sections[-1][1].append(raw_line.rstrip())
+        else:
+            preamble_lines.append(raw_line.rstrip())
+
+    preamble = "\n".join(preamble_lines).strip()
+    clean_sections = [(h, "\n".join(lines).strip()) for h, lines in sections]
+    return preamble, clean_sections, link_lines
+
+
+def _upsert_managed_section(
+    sections: list[tuple[str, str]],
+    heading: str,
+    body: str,
+) -> list[tuple[str, str]]:
+    """在有序 ### 小节列表中按标题就地替换，若不存在则追加到末尾。"""
+    clean_heading = heading.strip()
+    clean_body = body.strip()
+    updated: list[tuple[str, str]] = []
+    replaced = False
+    for h, b in sections:
+        if h == clean_heading:
+            updated.append((h, clean_body))
+            replaced = True
+        else:
+            updated.append((h, b))
+    if not replaced:
+        updated.append((clean_heading, clean_body))
+    return updated
+
+
+def _clean_link_title(raw: str) -> str:
+    s = str(raw or "").strip().strip("[]").strip()
+    if s.lower().endswith(".md"):
+        s = s[:-3].strip()
+    return s
+
+
+def _collect_candidate_links(
+    config: AppConfig,
+    *,
+    op_links: list[str],
+    title: str,
+    content: str,
+    self_rel: str,
+    self_stem: str,
+    extra_excludes: set[str] | None = None,
+) -> tuple[list[str], set[str]]:
+    """汇总 op 显式 links 与检索自动命中的候选标题（排除自身）。"""
+    excludes = {x for x in (title.strip(), self_stem.strip()) if x}
+    if extra_excludes:
+        excludes.update(x.strip() for x in extra_excludes if x and x.strip())
+
+    candidates: list[str] = []
+    for lk in op_links:
+        clean = _clean_link_title(lk)
+        if clean and clean not in excludes and clean not in candidates:
+            candidates.append(clean)
+
+    query = f"{title} {content[:60]}".strip()
+    if query:
+        try:
+            res = search_notes(config, query, k_override=2)
+            for hit in res.get("hits") or []:
+                hit_path = str(hit.get("path") or "").replace("\\", "/")
+                hit_title = _clean_link_title(str(hit.get("title") or ""))
+                if not hit_title:
+                    continue
+                if hit_path == self_rel or Path(hit_path).stem == self_stem:
+                    continue
+                if hit_title in excludes or hit_title in candidates:
+                    continue
+                candidates.append(hit_title)
+        except Exception:
+            pass
+
+    return candidates, excludes
+
+
+def _merge_link_lines(
+    existing_link_lines: list[str],
+    candidate_links: list[str],
+    *,
+    exclude_names: set[str],
+) -> list[str]:
+    """保留所有已有链接行（含手写），仅补充不重复的 - related_to [[标题]]。"""
+    out = list(existing_link_lines)
+    seen_targets: set[str] = set()
+    for line in existing_link_lines:
+        for m in _WIKILINK_RE.finditer(line):
+            target = m.group(1).strip()
+            if target:
+                seen_targets.add(target)
+
+    for raw in candidate_links:
+        clean = _clean_link_title(raw)
+        if not clean or clean in exclude_names or clean in seen_targets:
+            continue
+        out.append(f"- related_to [[{clean}]]")
+        seen_targets.add(clean)
+    return out
+
+
+def _render_managed_sections(
+    preamble: str,
+    sections: list[tuple[str, str]],
+    link_lines: list[str],
+) -> str:
+    parts: list[str] = []
+    if preamble.strip():
+        parts.append(preamble.strip())
+    for heading, body in sections:
+        parts.append(f"### {heading}\n\n{body.strip()}" if body.strip() else f"### {heading}")
+    if link_lines:
+        parts.append("## 关联\n" + "\n".join(link_lines))
+    return "\n\n".join(parts).strip()
+
+
 def _format_longterm_note_content(
     *,
     existing_text: str | None,
@@ -372,8 +676,15 @@ def _format_longterm_note_content(
     trusted_source: str,
     trusted_domain: str,
     today_str: str,
+    candidate_links: list[str] | None = None,
+    exclude_link_names: set[str] | None = None,
+    as_section: bool = False,
 ) -> str:
-    """生成或更新长期笔记：新笔记含完整 parse contract 键，已有笔记保留原 frontmatter 与手工正文。"""
+    """生成或更新长期笔记：新建写正文+关联，已有文件在受管块内追加/替换 ### 小节并合并 frontmatter。"""
+    excl = set(exclude_link_names or ())
+    excl.add(title.strip())
+    links_in = list(candidate_links or [])
+
     if existing_text is None:
         fm: dict[str, Any] = {
             "type": note_type,
@@ -389,13 +700,18 @@ def _format_longterm_note_content(
         if fact_key:
             fm["fact_key"] = fact_key
         if keys:
-            fm["keys"] = keys
+            fm["keys"] = _merge_str_list_ordered([], keys)
         if tags:
-            fm["tags"] = tags
+            fm["tags"] = _merge_str_list_ordered([], tags)
         if source_refs:
-            fm["source_refs"] = source_refs
+            fm["source_refs"] = _merge_str_list_ordered([], source_refs, limit=MAX_SOURCE_REFS)
+        link_lines = _merge_link_lines([], links_in, exclude_names=excl)
+        if as_section:
+            managed_body = _render_managed_sections("", [(title, content)], link_lines)
+        else:
+            managed_body = _render_managed_sections(content, [], link_lines)
         header = f"{_dump_frontmatter(fm)}\n# {title}\n\n"
-        return _merge_managed_block(None, default_header=header, managed_body=content)
+        return _merge_managed_block(None, default_header=header, managed_body=managed_body)
 
     fm, body = _parse_frontmatter_and_body(existing_text)
     if not fm.get("type"):
@@ -411,20 +727,29 @@ def _format_longterm_note_content(
         fm["domain"] = trusted_domain
     if not fm.get("status"):
         fm["status"] = "active"
-    fm["evidence_level"] = evidence_level
+    fm["evidence_level"] = _higher_evidence_level(fm.get("evidence_level"), evidence_level)
     if fact_key:
         fm["fact_key"] = fact_key
-    if keys:
-        fm["keys"] = keys
-    if tags:
-        fm["tags"] = tags
-    if source_refs:
-        fm["source_refs"] = source_refs
+    merged_keys = _merge_str_list_ordered(fm.get("keys"), keys)
+    if merged_keys:
+        fm["keys"] = merged_keys
+    merged_tags = _merge_str_list_ordered(fm.get("tags"), tags)
+    if merged_tags:
+        fm["tags"] = merged_tags
+    merged_refs = _merge_str_list_ordered(fm.get("source_refs"), source_refs, limit=MAX_SOURCE_REFS)
+    if merged_refs:
+        fm["source_refs"] = merged_refs
+
+    existing_managed = _extract_managed_block(body)
+    preamble, sections, existing_links = _parse_managed_sections(existing_managed)
+    sections = _upsert_managed_section(sections, title, content)
+    link_lines = _merge_link_lines(existing_links, links_in, exclude_names=excl)
+    managed_body = _render_managed_sections(preamble, sections, link_lines)
 
     merged_body = _merge_managed_block(
         body.lstrip("\r\n"),
-        default_header=f"# {title}\n\n",
-        managed_body=content,
+        default_header=f"# {fm.get('title') or title}\n\n",
+        managed_body=managed_body,
     )
     return f"{_dump_frontmatter(fm)}\n{merged_body}"
 
@@ -580,7 +905,7 @@ def _derive_dedupe_key(op: dict[str, Any]) -> str:
         return f"diary:{ledger}:{date_hint}:refs:{refs_digest}"
     if op_type == "longterm_upsert":
         fact_key = str(op.get("fact_key") or "").strip()
-        slot = fact_key or str(op.get("_resolved_rel") or "")
+        slot = fact_key or str(op.get("_dedupe_slot") or op.get("_resolved_rel") or "")
         content_hash = sha256_text(" ".join(str(op.get("content") or "").split()))[:16]
         return f"slot:{slot}:{content_hash}"
     if op_type == "project_update":
@@ -714,12 +1039,24 @@ def validate_and_apply_batch(
             raise BatchValidationError(f"operation[{idx}] 不支持的 op_type: {op_type!r}")
 
         op = dict(raw_op)
-        source_refs, canonical_refs, matched_events = _resolve_source_refs(
-            op.get("source_refs"),
-            events,
-            idx,
-            op_type,
-        )
+        if job.job_type == "nightly" and not events and op_type == "diary_append":
+            raw_refs = _normalize_str_list(op.get("source_refs"))
+            if raw_refs:
+                source_refs, canonical_refs, matched_events = _resolve_source_refs(
+                    raw_refs,
+                    events,
+                    idx,
+                    op_type,
+                )
+            else:
+                source_refs, canonical_refs, matched_events = [], [], []
+        else:
+            source_refs, canonical_refs, matched_events = _resolve_source_refs(
+                op.get("source_refs"),
+                events,
+                idx,
+                op_type,
+            )
         op["source_refs"] = source_refs
         op["_canonical_source_refs"] = canonical_refs
         op["_matched_events"] = matched_events
@@ -739,35 +1076,97 @@ def validate_and_apply_batch(
                 raise BatchValidationError(
                     f"operation[{idx}] longterm_upsert 超出字符上限 ({len(content)} > {MAX_LONGTERM_CHARS})"
                 )
+            scope = str(op.get("scope") or "global").strip().lower()
+            if scope not in ("global", "project"):
+                raise BatchValidationError(f"operation[{idx}] 非法 scope: {scope!r}")
+            op["scope"] = scope
+            op["links"] = _normalize_str_list(op.get("links"))
             fact_key = str(op.get("fact_key") or "").strip() or None
-            existing_rel = _find_existing_fact_key_path(config, fact_key) if fact_key else None
-            if existing_rel is None:
-                legacy_rel = f"{_LONGTERM_DIRS[note_type]}/{_sanitize_filename(title)}.md"
-                legacy_target = _assert_safe_profile_subpath(config, legacy_rel)
-                if legacy_target.exists():
-                    existing_rel = legacy_rel
-            if existing_rel is not None:
-                rel = existing_rel
-            else:
-                date_ymd = _resolve_note_date_compact(op, job, eff_clock)
-                rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, date_ymd)}"
-            target = _assert_safe_profile_subpath(config, rel)
+            merge_into = str(op.get("merge_into") or "").strip() or None
+            op["_merge_into"] = merge_into
             expected_hash = str(op.get("expected_hash") or "").strip()
-            req_hash = _check_hash_conflict(
-                rel=rel,
-                target=target,
-                expected_hash=expected_hash,
-                snapshot_hashes=snapshot_hashes,
-                initial_snapshot_hashes=initial_snapshot_hashes,
-                trusted_post_write_hashes=trusted_post_write_hashes,
-            )
-            pre_lock_checks.append((target, rel, req_hash))
+
+            if scope == "project":
+                project_raw = str(op.get("project") or "").strip()
+                if not project_raw:
+                    raise BatchValidationError(
+                        f"operation[{idx}] longterm_upsert scope=project 时必须提供 project"
+                    )
+                rel, proj_stem = _resolve_project_note_rel(config, project_raw)
+                target = _assert_safe_profile_subpath(config, rel)
+                req_hash = _check_hash_conflict(
+                    rel=rel,
+                    target=target,
+                    expected_hash=expected_hash,
+                    snapshot_hashes=snapshot_hashes,
+                    initial_snapshot_hashes=initial_snapshot_hashes,
+                    trusted_post_write_hashes=trusted_post_write_hashes,
+                )
+                pre_lock_checks.append((target, rel, req_hash))
+                op["_project_raw"] = project_raw
+                op["_project_stem"] = proj_stem
+                op["_needs_seq_alloc"] = False
+                op["_resolved_rel"] = rel
+                op["_resolved_target"] = target
+                op["_dedupe_slot"] = f"{rel}#{title}"
+            else:
+                # 严格按顺序解析：1. fact_key -> 2. merge_into -> 3. 精确标题/stem -> 4. 新建
+                existing_rel = _find_existing_fact_key_path(config, fact_key) if fact_key else None
+                if existing_rel is None and merge_into:
+                    existing_rel = _find_merge_target_path(config, merge_into)
+                if existing_rel is None:
+                    existing_rel = _find_exact_title_target_path(config, note_type, title)
+
+                if existing_rel is not None:
+                    rel = existing_rel
+                    target = _assert_safe_profile_subpath(config, rel)
+                    req_hash = _check_hash_conflict(
+                        rel=rel,
+                        target=target,
+                        expected_hash=expected_hash,
+                        snapshot_hashes=snapshot_hashes,
+                        initial_snapshot_hashes=initial_snapshot_hashes,
+                        trusted_post_write_hashes=trusted_post_write_hashes,
+                    )
+                    pre_lock_checks.append((target, rel, req_hash))
+                    op["_needs_seq_alloc"] = False
+                    op["_resolved_rel"] = rel
+                    op["_resolved_target"] = target
+                    op["_dedupe_slot"] = f"{rel}#{title}"
+                elif note_type in _SEQ_PREFIX_BY_TYPE:
+                    if expected_hash:
+                        raise ConflictError(
+                            f"创建冲突：新建 {note_type} 笔记 {title!r} 不存在但提供了 expected_hash={expected_hash[:12]}"
+                        )
+                    preview_seq = _allocate_next_seq(config, note_type)
+                    preview_rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, seq=preview_seq)}"
+                    _assert_safe_profile_subpath(config, preview_rel)
+                    op["_needs_seq_alloc"] = True
+                    op["_resolved_rel"] = preview_rel
+                    op["_resolved_target"] = config.profile_dir / preview_rel
+                    op["_dedupe_slot"] = f"new:{note_type}:{normalize_note_title(title)}"
+                else:
+                    date_ymd = _resolve_note_date_compact(op, job, eff_clock)
+                    rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, date_ymd)}"
+                    target = _assert_safe_profile_subpath(config, rel)
+                    req_hash = _check_hash_conflict(
+                        rel=rel,
+                        target=target,
+                        expected_hash=expected_hash,
+                        snapshot_hashes=snapshot_hashes,
+                        initial_snapshot_hashes=initial_snapshot_hashes,
+                        trusted_post_write_hashes=trusted_post_write_hashes,
+                    )
+                    pre_lock_checks.append((target, rel, req_hash))
+                    op["_needs_seq_alloc"] = False
+                    op["_resolved_rel"] = rel
+                    op["_resolved_target"] = target
+                    op["_dedupe_slot"] = rel
+
             op["evidence_level"] = _resolve_evidence_level(op.get("evidence_level"), matched_events, idx)
             trusted_source, trusted_domain = _trusted_source_and_domain(config, matched_events)
             op["_trusted_source"] = trusted_source
             op["_trusted_domain"] = trusted_domain
-            op["_resolved_rel"] = rel
-            op["_resolved_target"] = target
 
         elif op_type == "project_update":
             project = str(op.get("project") or op.get("title") or "").strip()
@@ -778,17 +1177,7 @@ def validate_and_apply_batch(
                 raise BatchValidationError(
                     f"operation[{idx}] project_update 超出字符上限 ({len(raw_managed)} > {MAX_PROJECT_MANAGED_CHARS})"
                 )
-            legacy_slug = _sanitize_filename(project)
-            legacy_rel = f"20_LongTerm/Projects/{legacy_slug}.md"
-            legacy_target = _assert_safe_profile_subpath(config, legacy_rel)
-            if legacy_target.exists():
-                rel = legacy_rel
-                slug = legacy_slug
-            else:
-                date_ymd = _resolve_note_date_compact(op, job, eff_clock)
-                new_name = _build_new_note_filename("project", project, date_ymd)
-                rel = f"20_LongTerm/Projects/{new_name}"
-                slug = Path(new_name).stem
+            rel, slug = _resolve_project_note_rel(config, project)
             target = _assert_safe_profile_subpath(config, rel)
             expected_hash = str(op.get("expected_hash") or "").strip()
             req_hash = _check_hash_conflict(
@@ -802,8 +1191,10 @@ def validate_and_apply_batch(
             pre_lock_checks.append((target, rel, req_hash))
             ev_level = _resolve_evidence_level(op.get("evidence_level"), matched_events, idx)
             op["project"] = slug
+            op["_project_raw"] = project
             op["evidence_level"] = ev_level
             op["managed_content"] = _format_project_managed_body(raw_managed, ev_level)
+            op["links"] = _normalize_str_list(op.get("links"))
             op["_resolved_rel"] = rel
             op["_resolved_target"] = target
 
@@ -1032,34 +1423,117 @@ def validate_and_apply_batch(
                 )
 
             elif op_type == "longterm_upsert":
-                target: Path = op["_resolved_target"]
+                note_type = str(op["note_type"]).strip().lower()
+                title = str(op["title"]).strip()
+                content = str(op["content"]).strip()
+                scope = str(op.get("scope") or "global").strip().lower()
+                fact_key = str(op.get("fact_key") or "").strip() or None
+                merge_into = op.get("_merge_into")
+
+                if op.get("_needs_seq_alloc"):
+                    # 写锁内重新解析（避免同批次前序 op 已新建同名/同键文件，并在锁内单调分配序号）
+                    locked_rel = _find_existing_fact_key_path(config, fact_key) if fact_key else None
+                    if locked_rel is None and merge_into:
+                        locked_rel = _find_merge_target_path(config, merge_into)
+                    if locked_rel is None:
+                        locked_rel = _find_exact_title_target_path(config, note_type, title)
+                    if locked_rel is not None:
+                        rel = locked_rel
+                    else:
+                        seq = _allocate_next_seq(config, note_type)
+                        rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, seq=seq)}"
+                    target = _assert_safe_profile_subpath(config, rel)
+                    op["_resolved_rel"] = rel
+                    op["_resolved_target"] = target
+                else:
+                    target = op["_resolved_target"]
+
                 existing = target.read_text(encoding="utf-8") if target.exists() else None
-                if existing is not None:
-                    cur_managed = _extract_managed_block(existing)
-                    if cur_managed is not None and cur_managed == str(op["content"]).strip():
-                        fm_cur, _ = _parse_frontmatter_and_body(existing)
-                        if (
-                            str(fm_cur.get("evidence_level") or "") == op["evidence_level"]
-                            and str(fm_cur.get("fact_key") or "") == (str(op.get("fact_key") or "").strip())
-                        ):
-                            skipped_dedupe += 1
-                            op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
-                            continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                rendered = _format_longterm_note_content(
-                    existing_text=existing,
-                    note_type=str(op["note_type"]).strip().lower(),
-                    title=str(op["title"]).strip(),
-                    content=str(op["content"]).strip(),
-                    keys=_normalize_str_list(op.get("keys")),
-                    tags=_normalize_str_list(op.get("tags")),
-                    fact_key=str(op.get("fact_key") or "").strip() or None,
-                    evidence_level=op["evidence_level"],
-                    source_refs=op["source_refs"],
-                    trusted_source=op["_trusted_source"],
-                    trusted_domain=op["_trusted_domain"],
-                    today_str=today_str,
+                extra_excludes: set[str] = set()
+                if scope == "project":
+                    extra_excludes.add(str(op.get("_project_raw") or ""))
+                    extra_excludes.add(str(op.get("_project_stem") or ""))
+                candidate_links, exclude_names = _collect_candidate_links(
+                    config,
+                    op_links=list(op.get("links") or []),
+                    title=title,
+                    content=content,
+                    self_rel=rel,
+                    self_stem=target.stem,
+                    extra_excludes=extra_excludes,
                 )
+
+                if scope == "project":
+                    proj_title = str(op.get("_project_raw") or op.get("_project_stem") or title)
+                    if existing is None:
+                        fm_proj: dict[str, Any] = {
+                            "type": "project",
+                            "title": proj_title,
+                            "proactive_owned": True,
+                            "created": today_str,
+                            "updated": today_str,
+                            "source": op["_trusted_source"],
+                            "domain": op["_trusted_domain"],
+                            "status": "active",
+                            "evidence_level": op["evidence_level"],
+                        }
+                        if fact_key:
+                            fm_proj["fact_key"] = fact_key
+                        proj_keys = _merge_str_list_ordered([], _normalize_str_list(op.get("keys")))
+                        if proj_keys:
+                            fm_proj["keys"] = proj_keys
+                        proj_tags = _merge_str_list_ordered([], _normalize_str_list(op.get("tags")))
+                        if proj_tags:
+                            fm_proj["tags"] = proj_tags
+                        proj_refs = _merge_str_list_ordered([], op["source_refs"], limit=MAX_SOURCE_REFS)
+                        if proj_refs:
+                            fm_proj["source_refs"] = proj_refs
+                        link_lines = _merge_link_lines([], candidate_links, exclude_names=exclude_names)
+                        managed_body = _render_managed_sections("", [(title, content)], link_lines)
+                        header = f"{_dump_frontmatter(fm_proj)}\n# {proj_title}\n\n"
+                        rendered = _merge_managed_block(None, default_header=header, managed_body=managed_body)
+                    else:
+                        rendered = _format_longterm_note_content(
+                            existing_text=existing,
+                            note_type="project",
+                            title=title,
+                            content=content,
+                            keys=_normalize_str_list(op.get("keys")),
+                            tags=_normalize_str_list(op.get("tags")),
+                            fact_key=fact_key,
+                            evidence_level=op["evidence_level"],
+                            source_refs=op["source_refs"],
+                            trusted_source=op["_trusted_source"],
+                            trusted_domain=op["_trusted_domain"],
+                            today_str=today_str,
+                            candidate_links=candidate_links,
+                            exclude_link_names=exclude_names,
+                            as_section=True,
+                        )
+                    touched_project = True
+                else:
+                    rendered = _format_longterm_note_content(
+                        existing_text=existing,
+                        note_type=note_type,
+                        title=title,
+                        content=content,
+                        keys=_normalize_str_list(op.get("keys")),
+                        tags=_normalize_str_list(op.get("tags")),
+                        fact_key=fact_key,
+                        evidence_level=op["evidence_level"],
+                        source_refs=op["source_refs"],
+                        trusted_source=op["_trusted_source"],
+                        trusted_domain=op["_trusted_domain"],
+                        today_str=today_str,
+                        candidate_links=candidate_links,
+                        exclude_link_names=exclude_names,
+                    )
+
+                if existing is not None and existing == rendered:
+                    skipped_dedupe += 1
+                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(target, rendered)
                 post_write_hashes[rel] = sha256_text(rendered)
                 touched_non_diary = True
@@ -1067,12 +1541,21 @@ def validate_and_apply_batch(
             elif op_type == "project_update":
                 target = op["_resolved_target"]
                 existing = target.read_text(encoding="utf-8") if target.exists() else None
-                if existing is not None and _extract_managed_block(existing) == op["managed_content"]:
-                    skipped_dedupe += 1
-                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                title = str(op.get("title") or op["project"])
+                title = str(op.get("title") or op.get("_project_raw") or op["project"])
+                candidate_links, exclude_names = _collect_candidate_links(
+                    config,
+                    op_links=list(op.get("links") or []),
+                    title=title,
+                    content=op["managed_content"],
+                    self_rel=rel,
+                    self_stem=target.stem,
+                    extra_excludes={str(op.get("project") or ""), str(op.get("_project_raw") or "")},
+                )
+                existing_managed = _extract_managed_block(existing) if existing is not None else None
+                _, existing_sections, existing_links = _parse_managed_sections(existing_managed)
+                link_lines = _merge_link_lines(existing_links, candidate_links, exclude_names=exclude_names)
+                managed_body = _render_managed_sections(op["managed_content"], existing_sections, link_lines)
+
                 default_header = (
                     f"---\ntype: project\ntitle: {json.dumps(title, ensure_ascii=False)}\n"
                     f"proactive_owned: true\nstatus: active\n---\n\n# {title}\n\n"
@@ -1080,8 +1563,13 @@ def validate_and_apply_batch(
                 merged = _merge_managed_block(
                     existing,
                     default_header=default_header,
-                    managed_body=op["managed_content"],
+                    managed_body=managed_body,
                 )
+                if existing is not None and existing == merged:
+                    skipped_dedupe += 1
+                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(target, merged)
                 post_write_hashes[rel] = sha256_text(merged)
                 touched_non_diary = True

@@ -124,6 +124,8 @@ class ProactiveConfig:
     model_max_output_tokens: int = 8192
     archive_enabled: bool = False
     archive_after_days: int = 14
+    nightly_always_diary: bool = False
+    prefetch_min_score: float = 1.0
 
 
 _VALID_MODEL_BACKENDS = frozenset({"", "auto", "hermes", "openai_compatible"})
@@ -364,6 +366,8 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
         model_max_output_tokens=model_max_output_tokens,
         archive_enabled=_require_bool(proactive_raw, "archive_enabled", False),
         archive_after_days=max(1, int(proactive_raw.get("archive_after_days", 14))),
+        nightly_always_diary=_require_bool(proactive_raw, "nightly_always_diary", False),
+        prefetch_min_score=float(proactive_raw.get("prefetch_min_score", 1.0)),
     )
     if enabled:
         validate_proactive_worker_config(proactive)

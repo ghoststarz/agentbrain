@@ -518,7 +518,7 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
             rev: Optional[int] = None
 
             effective_session_id = str(session_id or self._session_id or "").strip()
-            search_payload: dict[str, Any] = {"query": query, "k": 5, "hops": 1}
+            search_payload: dict[str, Any] = {"query": query, "k": 5, "hops": 1, "inject": True}
             if effective_session_id:
                 search_payload["session_id"] = effective_session_id
             # 单次往返：revision 由 /v1/search 一并返回，不再单独探活

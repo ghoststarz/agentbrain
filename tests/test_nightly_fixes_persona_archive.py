@@ -659,8 +659,8 @@ def test_req7_unified_new_note_naming_and_fact_key_preservation(tmp_path: Path) 
         clock=clock,
     )
     assert summary.applied_count == 6
-    assert (cfg.profile_dir / "20_LongTerm" / "Facts" / "FACT-20261120-标题-含全角冒号-和空格.md").exists()
-    assert (cfg.profile_dir / "20_LongTerm" / "Decisions" / "ADR-20261120-采用新命名规范.md").exists()
+    assert (cfg.profile_dir / "20_LongTerm" / "Facts" / "FACT-01-标题-含全角冒号-和空格.md").exists()
+    assert (cfg.profile_dir / "20_LongTerm" / "Decisions" / "ADR-01-采用新命名规范.md").exists()
     assert (cfg.profile_dir / "20_LongTerm" / "Entities" / "ENTITY-AgentBrain.md").exists()
     assert (cfg.profile_dir / "20_LongTerm" / "MOC" / "MOC-记忆系统索引.md").exists()
     assert (cfg.profile_dir / "20_LongTerm" / "Projects" / "PROJ-新项目.md").exists()

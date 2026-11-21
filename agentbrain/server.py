@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,8 +20,11 @@ from agentbrain.diary import DiaryGateError, append_diary, read_diary, today_dia
 from agentbrain.handoff import read_handoff, upsert_handoff
 from agentbrain.index import connect_db, reindex
 from agentbrain.parse import normalize_trigger_order, parse_note
+from agentbrain.proactive_redaction import redact_secrets
 from agentbrain.render import _extract_section, get_current_revision, render_boot, render_delta
-from agentbrain.retrieve import search_notes
+from agentbrain.retrieve import filter_hits_for_inject, search_notes
+
+_logger = logging.getLogger(__name__)
 
 _TYPE_DIR_MAP: dict[str, str] = {
     "fact": "20_LongTerm/Facts",
@@ -210,6 +214,41 @@ class BrokerService:
         target = str(payload.get("target") or "codex")
         return render_delta(self.config, since_rev=since_rev, target=target)
 
+    def _write_recall_audit(
+        self,
+        *,
+        client_id: str,
+        session_id: str,
+        query: str,
+        raw_hits: list[dict[str, Any]],
+        final_hits: list[dict[str, Any]],
+        revision: int,
+    ) -> None:
+        """向 audit_dir/recall.jsonl 追加单行召回审计记录（fail-open，绝不拖垮检索）。"""
+        try:
+            audit_dir = self.config.broker.audit_dir
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            recall_path = audit_dir / "recall.jsonl"
+            safe_query = redact_secrets(query)[:120]
+            weak_count = sum(1 for h in raw_hits if bool(h.get("weak_evidence")))
+            top_score = max((float(h.get("score") or 0.0) for h in final_hits), default=0.0)
+            entry = {
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "client": client_id,
+                "session": session_id,
+                "query": safe_query,
+                "hits": len(final_hits),
+                "top_score": round(top_score, 4),
+                "weak": weak_count,
+                "injected": bool(final_hits),
+                "revision": revision,
+            }
+            line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+            with recall_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(line)
+        except Exception as exc:  # noqa: BLE001
+            _logger.debug("failed to write recall audit (ignored): %s", exc)
+
     def search(
         self,
         payload: dict[str, Any],
@@ -225,6 +264,7 @@ class BrokerService:
         k_override = int(k_val) if k_val is not None else None
         hops_override = int(hops_val) if hops_val is not None else None
         session_id = str(payload.get("session_id") or "").strip()
+        inject_mode = bool(payload.get("inject", False))
 
         if not session_id:
             result = search_notes(
@@ -233,7 +273,19 @@ class BrokerService:
                 k_override=k_override,
                 hops_override=hops_override,
             )
-            result["revision"] = get_current_revision(self.config)
+            raw_hits = list(result.get("hits") or [])
+            if inject_mode:
+                result = filter_hits_for_inject(result, self.config.memory.proactive.prefetch_min_score)
+            revision = get_current_revision(self.config)
+            result["revision"] = revision
+            self._write_recall_audit(
+                client_id=client_id,
+                session_id="",
+                query=query,
+                raw_hits=raw_hits,
+                final_hits=list(result.get("hits") or []),
+                revision=revision,
+            )
             return result
 
         cd_key = (client_id, session_id)
@@ -253,6 +305,9 @@ class BrokerService:
             hops_override=hops_override,
             cooldown_blocked=blocked,
         )
+        raw_hits = list(result.get("hits") or [])
+        if inject_mode:
+            result = filter_hits_for_inject(result, self.config.memory.proactive.prefetch_min_score)
 
         with self._cooldown_lock:
             session_cd = self._cooldowns.setdefault(cd_key, {})
@@ -261,7 +316,16 @@ class BrokerService:
                 if hit_path:
                     session_cd[hit_path] = self._default_cooldown_turns
 
-        result["revision"] = get_current_revision(self.config)
+        revision = get_current_revision(self.config)
+        result["revision"] = revision
+        self._write_recall_audit(
+            client_id=client_id,
+            session_id=session_id,
+            query=query,
+            raw_hits=raw_hits,
+            final_hits=list(result.get("hits") or []),
+            revision=revision,
+        )
         if self.config.memory.proactive.enabled:
             receipts = self._proactive_store().list_pending_receipts(
                 client_id=client_id,
