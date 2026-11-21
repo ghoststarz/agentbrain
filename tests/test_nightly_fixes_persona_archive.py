@@ -663,7 +663,7 @@ def test_req7_unified_new_note_naming_and_fact_key_preservation(tmp_path: Path) 
     assert (cfg.profile_dir / "20_LongTerm" / "Decisions" / "ADR-01-采用新命名规范.md").exists()
     assert (cfg.profile_dir / "20_LongTerm" / "Entities" / "ENTITY-AgentBrain.md").exists()
     assert (cfg.profile_dir / "20_LongTerm" / "MOC" / "MOC-记忆系统索引.md").exists()
-    assert (cfg.profile_dir / "20_LongTerm" / "Projects" / "PROJ-新项目.md").exists()
+    assert (cfg.profile_dir / "20_LongTerm" / "Projects" / "PROJ-01-新项目.md").exists()
 
     # fact_key 命中旧文件：不新建，原地更新
     assert "更新到旧文件" in old_note.read_text(encoding="utf-8")

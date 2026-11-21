@@ -417,7 +417,7 @@ def test_overview_preserves_manual_project_clamps_verified_and_requires_valid_so
         },
         clock=clock,
     )
-    proj_files = sorted((cfg.profile_dir / "20_LongTerm" / "Projects").glob("PROJ-Beta*.md"))
+    proj_files = sorted((cfg.profile_dir / "20_LongTerm" / "Projects").glob("PROJ-*-Beta.md"))
     assert len(proj_files) == 1, [p.name for p in (cfg.profile_dir / "20_LongTerm" / "Projects").iterdir()]
     beta_text = proj_files[0].read_text(encoding="utf-8")
     assert "evidence_level: report" in beta_text
@@ -426,7 +426,9 @@ def test_overview_preserves_manual_project_clamps_verified_and_requires_valid_so
     ov_text = overview.read_text(encoding="utf-8")
     assert "Manual overview intro." in ov_text
     assert "Manual overview footer." in ov_text
-    assert "[[PROJ-Beta]]" in ov_text
+    # 总览改成「链接 + 一句话摘要」的薄索引，不再整段复制项目页内容
+    assert "[[PROJ-01-Beta]]" in ov_text
+    assert "status: verified" not in ov_text
 
 
 # --- Item 4: State A->B->A, diary cross-job update, no substring match, date validation ---

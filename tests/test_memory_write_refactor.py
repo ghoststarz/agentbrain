@@ -107,8 +107,8 @@ def _seed_claimed_job(
     return store, job, store.get_job_events(job.job_id)
 
 
-def test_1_seq_numbering_monotonic_and_archive_never_releases(tmp_path: Path) -> None:
-    """需求 A：已有 ADR-01 / ADR-07 时，新 decision 依次为 ADR-08 / ADR-09，归档后不复用。"""
+def test_1_seq_numbering_follows_live_dir_not_archive(tmp_path: Path) -> None:
+    """需求 A：序号只看活目录（已有 01/07 → 新的是 08、09）；归档不动活目录编号。"""
     tz = dt.timezone(dt.timedelta(hours=8))
     clock = ManualClock(dt.datetime(2026, 11, 21, 6, 0, tzinfo=dt.timezone.utc), tz=tz)
     cfg = _make_cfg(tmp_path)
@@ -153,7 +153,7 @@ def test_1_seq_numbering_monotonic_and_archive_never_releases(tmp_path: Path) ->
     assert adr08.exists()
     assert adr09.exists()
 
-    # 将 ADR-09 移入 90_Archive，再写一条 decision 必须为 ADR-10（不复用 09）
+    # 将 ADR-09 移入 90_Archive：编号只看活目录，所以下一条又回到 09（归档不占用编号）
     archived_dir = cfg.profile_dir / "90_Archive" / "20_LongTerm" / "Decisions"
     archived_dir.mkdir(parents=True, exist_ok=True)
     adr09.rename(archived_dir / adr09.name)
@@ -175,15 +175,16 @@ def test_1_seq_numbering_monotonic_and_archive_never_releases(tmp_path: Path) ->
                 {
                     "op_type": "longterm_upsert",
                     "note_type": "decision",
-                    "title": "归档后继续递增",
-                    "content": "应该拿到 10 号。",
+                    "title": "归档后重新可用",
+                    "content": "活目录最大是 08，所以拿到 09。",
                     "source_refs": ["e3"],
                 }
             ],
         },
         clock=clock,
     )
-    assert (dec_dir / "ADR-10-归档后继续递增.md").exists()
+    assert (dec_dir / "ADR-09-归档后重新可用.md").exists()
+    assert not (dec_dir / "ADR-10-归档后重新可用.md").exists()
 
 
 def test_2_merge_same_title_appends_section_and_preserves_handwritten(tmp_path: Path) -> None:
@@ -320,7 +321,7 @@ def test_3_merge_into_appends_to_specified_target(tmp_path: Path) -> None:
 
 
 def test_4_project_scope_routing_and_section_replace_and_project_update_coexist(tmp_path: Path) -> None:
-    """需求 B：scope=project 路由到 PROJ-<项目名>.md，Facts 不增文件，同标题替换，与 project_update 互不破坏。"""
+    """需求 B：scope=project 路由到 PROJ-<NN>-<项目名>.md，Facts 不增文件，同标题替换，与 project_update 互不破坏。"""
     tz = dt.timezone(dt.timedelta(hours=8))
     clock = ManualClock(dt.datetime(2026, 11, 21, 6, 0, tzinfo=dt.timezone.utc), tz=tz)
     cfg = _make_cfg(tmp_path)
@@ -349,7 +350,7 @@ def test_4_project_scope_routing_and_section_replace_and_project_update_coexist(
         clock=clock,
     )
     fact_dir = cfg.profile_dir / "20_LongTerm" / "Facts"
-    proj_file = cfg.profile_dir / "20_LongTerm" / "Projects" / "PROJ-Galaxy Attacker.md"
+    proj_file = cfg.profile_dir / "20_LongTerm" / "Projects" / "PROJ-01-Galaxy Attacker.md"
     assert list(fact_dir.glob("*.md")) == []
     assert proj_file.exists()
 
@@ -625,3 +626,58 @@ def test_7_recall_audit_and_inject_noise_suppression(tmp_path: Path, monkeypatch
     provider.prefetch("测试一下召回")
     assert len(captured) == 1
     assert captured[0].get("inject") is True
+
+
+def test_8_session_links_point_back_to_source_session(tmp_path: Path) -> None:
+    """非日记笔记要用 Obsidian 双链指向来源会话；会话索引不进检索。"""
+    from agentbrain.index import reindex
+
+    tz = dt.timezone(dt.timedelta(hours=8))
+    clock = ManualClock(dt.datetime(2026, 11, 21, 6, 0, tzinfo=dt.timezone.utc), tz=tz)
+    cfg = _make_cfg(tmp_path)
+    sid = "local-0123456789abcdef0123456789abcdef"
+    store, job, events = _seed_claimed_job(
+        cfg, clock, session_id=sid, event_ids=("ev1", "ev2", "ev3", "ev4", "ev5")
+    )
+    ref = f"hermes:{sid}:ev1"
+
+    summary = validate_and_apply_batch(
+        cfg,
+        store,
+        job,
+        events,
+        {
+            "outcome": "operations",
+            "operations": [
+                {
+                    "op_type": "longterm_upsert",
+                    "note_type": "fact",
+                    "title": "会话出处可点",
+                    "content": "这条结论要能点回它来自哪次对话。",
+                    "source_refs": [ref],
+                }
+            ],
+        },
+        clock=clock,
+    )
+    assert summary.applied_count == 1
+
+    note_path = next((cfg.profile_dir / "20_LongTerm" / "Facts").glob("FACT-*-会话出处可点.md"))
+    note_text = note_path.read_text(encoding="utf-8")
+    stub = cfg.profile_dir / "40_Sessions" / f"S-{sid.split('-', 1)[1][:8]}.md"
+    assert stub.exists(), "必须生成会话索引笔记"
+    assert "## 来源" in note_text
+    assert f"[[{stub.stem}]]" in note_text
+    assert sid in note_text  # 完整会话号也留在正文里，方便定位
+
+    stub_text = stub.read_text(encoding="utf-8")
+    assert sid in stub_text
+    assert f"[[{note_path.stem}]]" in stub_text
+
+    stats = reindex(cfg)
+    assert stats.total_notes > 0
+    from agentbrain.index import connect_db
+
+    with connect_db(cfg.broker.db_path) as conn:
+        hit = conn.execute("SELECT COUNT(*) FROM notes WHERE path LIKE '40_Sessions/%'").fetchone()[0]
+    assert hit == 0, "会话索引不能进检索索引"

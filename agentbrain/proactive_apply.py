@@ -57,7 +57,7 @@ _TITLE_SEP_RE = re.compile(r'[：:，,（）()、/\\*?"<>|\x00-\x1f\s]+')
 _MULTI_DASH_RE = re.compile(r"-{2,}")
 _EVIDENCE_LEVELS = frozenset({"report", "delivered", "verified"})
 _EVIDENCE_RANK: dict[str, int] = {"report": 0, "delivered": 1, "verified": 2}
-_SEQ_PREFIX_BY_TYPE: dict[str, str] = {"fact": "FACT", "decision": "ADR"}
+_SEQ_PREFIX_BY_TYPE: dict[str, str] = {"fact": "FACT", "decision": "ADR", "project": "PROJ"}
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
 _DIARY_LINE_RE = re.compile(r"^-\s*\[\d{2}:\d{2}:\d{2}\](?:\s*\([^)]*\))?\s+(.*)$")
 _PROJECT_EV_LINE_RE = re.compile(r"(?im)^\s*(?:evidence_level|verification_status)\s*:\s*.*$")
@@ -126,26 +126,31 @@ def _format_seq(seq: int) -> str:
 
 
 def _allocate_next_seq(config: AppConfig, note_type: str) -> int:
-    """在写入锁内扫描同目录及归档目录的同前缀文件，取最大序号 + 1（全局单调递增）。"""
+    """在写入锁内扫描**本目录**的同前缀文件，取最大序号 + 1。
+
+    只看活目录、不看 90_Archive：归档是「这一条退役了」，编号跟着它一起退役，
+    否则归档一份旧 ADR-01 就会让新笔记的编号从 07 起步（实测用户把 Decisions
+    重排成 01–04 之后，扫描归档会算出 07）。
+    """
     prefix = _SEQ_PREFIX_BY_TYPE.get(str(note_type or "").strip().lower())
     if not prefix:
         return 1
     pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:-|$)", re.IGNORECASE)
     max_seq = 0
+
+    seq_dir = _LONGTERM_DIRS.get(str(note_type or "").strip().lower())
+    if not seq_dir:
+        # project 不在 _LONGTERM_DIRS 里（它走 project_update 的专用路径）
+        seq_dir = "20_LongTerm/Projects" if str(note_type or "").strip().lower() == "project" else ""
+    if not seq_dir:
+        return 1
+    target_dir = config.profile_dir / seq_dir
+    if not target_dir.exists() or target_dir.is_symlink():
+        return 1
+
     scan_paths: list[Path] = []
-
-    target_dir = config.profile_dir / _LONGTERM_DIRS[note_type]
-    if target_dir.exists() and not target_dir.is_symlink():
-        scan_paths.extend(target_dir.glob(f"{prefix}-*.md"))
-        scan_paths.extend(target_dir.glob(f"{prefix.lower()}-*.md"))
-
-    archive_dir = config.profile_dir / "90_Archive"
-    if archive_dir.exists() and not archive_dir.is_symlink():
-        for md in archive_dir.rglob("*.md"):
-            if md.is_symlink():
-                continue
-            if md.stem.upper().startswith(f"{prefix}-"):
-                scan_paths.append(md)
+    scan_paths.extend(target_dir.glob(f"{prefix}-*.md"))
+    scan_paths.extend(target_dir.glob(f"{prefix.lower()}-*.md"))
 
     seen_files: set[Path] = set()
     for md in scan_paths:
@@ -185,21 +190,43 @@ def _build_new_note_filename(
         return f"MOC-{norm}.md"
     if nt == "project":
         clean = _sanitize_filename(title)
-        stem = clean if clean.upper().startswith("PROJ-") else f"PROJ-{clean}"
-        return f"{stem}.md"
+        if clean.upper().startswith("PROJ-"):
+            return f"{clean}.md"
+        return f"PROJ-{_format_seq(seq if seq is not None else 1)}-{clean}.md"
     if nt == "work":
         return f"WORK-{date_ymd}-{norm}.md"
     return f"{norm}.md"
 
 
 def _resolve_project_note_rel(config: AppConfig, project: str) -> tuple[str, str]:
-    """解析项目页路径：保留中文与空格，兼容已有无 PROJ- 前缀的旧文件。"""
+    """解析项目页路径：`PROJ-<NN>-<项目名>.md`，按「项目名」复用，换序号不影响命中。
+
+    兼容迁移前的两种旧名：`<项目名>.md` 与 `PROJ-<项目名>.md`。
+    """
     clean = _sanitize_filename(project)
-    legacy_rel = f"20_LongTerm/Projects/{clean}.md"
-    legacy_target = _assert_safe_profile_subpath(config, legacy_rel)
-    if legacy_target.exists():
-        return legacy_rel, clean
-    stem = clean if clean.upper().startswith("PROJ-") else f"PROJ-{clean}"
+    for legacy_name in (f"{clean}.md", f"PROJ-{clean}.md"):
+        rel = f"20_LongTerm/Projects/{legacy_name}"
+        target = _assert_safe_profile_subpath(config, rel)
+        if target.exists():
+            return rel, Path(legacy_name).stem
+
+    proj_root = config.profile_dir / "20_LongTerm" / "Projects"
+    if proj_root.exists() and not proj_root.is_symlink():
+        pat = re.compile(r"^PROJ-(\d+)-(.+)$", re.IGNORECASE)
+        best: tuple[int, str] | None = None
+        for md in sorted(proj_root.glob("PROJ-*.md")):
+            if md.is_symlink():
+                continue
+            m = pat.match(md.stem)
+            if not m or m.group(2).strip() != clean:
+                continue
+            seq = int(m.group(1))
+            if best is None or seq < best[0]:
+                best = (seq, md.stem)
+        if best is not None:
+            return f"20_LongTerm/Projects/{best[1]}.md", best[1]
+
+    stem = f"PROJ-{_format_seq(_allocate_next_seq(config, 'project'))}-{clean}"
     rel = f"20_LongTerm/Projects/{stem}.md"
     _assert_safe_profile_subpath(config, rel)
     return rel, stem
@@ -523,7 +550,11 @@ def _higher_evidence_level(existing: Any, incoming: str) -> str:
 def _parse_managed_sections(
     managed_text: str | None,
 ) -> tuple[str, list[tuple[str, str]], list[str]]:
-    """把受管区块拆分为三部分：前置概要 preamble、有序 ### 小节列表、末尾 ## 关联 链接行列表。"""
+    """把受管区块拆分为：前置概要 preamble、有序 ### 小节列表、末尾 ## 关联 链接行列表。
+
+    `## 来源`（会话出处）小节也按链接行处理，和 `## 关联` 合并返回——
+    它同样只会在受管块末尾追加，不需要单独的手术。
+    """
     if not managed_text or not managed_text.strip():
         return "", [], []
     preamble_lines: list[str] = []
@@ -533,7 +564,7 @@ def _parse_managed_sections(
 
     for raw_line in managed_text.splitlines():
         stripped = raw_line.strip()
-        if re.match(r"^##\s+关联\s*$", stripped):
+        if re.match(r"^##\s+关联\s*$", stripped) or re.match(r"^##\s+来源\s*$", stripped):
             mode = "links"
             continue
         m_sec = re.match(r"^###\s+(.+?)\s*$", stripped)
@@ -651,15 +682,117 @@ def _render_managed_sections(
     preamble: str,
     sections: list[tuple[str, str]],
     link_lines: list[str],
+    source_lines: list[str] | None = None,
 ) -> str:
     parts: list[str] = []
     if preamble.strip():
         parts.append(preamble.strip())
     for heading, body in sections:
         parts.append(f"### {heading}\n\n{body.strip()}" if body.strip() else f"### {heading}")
-    if link_lines:
-        parts.append("## 关联\n" + "\n".join(link_lines))
+    # 解析时「来源」行会随「关联」一起回来，这里按前缀把它们分回各自的小节
+    derived_source = [ln for ln in link_lines if "来源：" in ln]
+    derived_links = [ln for ln in link_lines if "来源：" not in ln]
+    all_sources = list(source_lines or [])
+    seen_sources = {m.group(1).strip() for ln in all_sources for m in _WIKILINK_RE.finditer(ln)}
+    for ln in derived_source:
+        key = next((m.group(1).strip() for m in _WIKILINK_RE.finditer(ln)), ln)
+        if key in seen_sources:
+            continue
+        all_sources.append(ln)
+        seen_sources.add(key)
+    if derived_links:
+        parts.append("## 关联\n" + "\n".join(derived_links))
+    if all_sources:
+        parts.append("## 来源\n" + "\n".join(all_sources))
     return "\n\n".join(parts).strip()
+
+
+_SESSION_ID_RE = re.compile(r"local-([0-9a-f]{16,})", re.IGNORECASE)
+SESSION_DIR = "40_Sessions"
+
+
+def _extract_session_ids(source_refs: Any) -> list[str]:
+    """从 source_refs 里抽出去重的会话标识（`hermes:local-<hash>:turn:19` → `local-<hash>`）。"""
+    found: list[str] = []
+    refs = source_refs if isinstance(source_refs, list) else []
+    for ref in refs:
+        m = _SESSION_ID_RE.search(str(ref or ""))
+        if not m:
+            continue
+        sid = f"local-{m.group(1).lower()}"
+        if sid not in found:
+            found.append(sid)
+    return found
+
+
+def _session_stub_rel(session_id: str) -> str:
+    """会话索引笔记的相对路径：`40_Sessions/S-<前 8 位>.md`。"""
+    short = session_id.split("-", 1)[-1][:8]
+    return f"{SESSION_DIR}/S-{short}.md"
+
+
+def _sync_session_links(
+    config: AppConfig,
+    *,
+    note_stem: str,
+    source_refs: Any,
+    today_str: str,
+) -> list[tuple[str, str]]:
+    """确保每个来源会话都有一篇索引笔记，并把本篇反向链进去；返回 (stub_stem, session_id) 列表。
+
+    会话索引放在 `40_Sessions/`（不进索引、不参与检索），作用是给非日记笔记一条可点的
+    「这条结论是哪次对话里来的」出处链接。
+    """
+    pairs: list[tuple[str, str]] = []
+    for sid in _extract_session_ids(source_refs):
+        rel = _session_stub_rel(sid)
+        try:
+            target = _assert_safe_profile_subpath(config, rel)
+        except Exception:
+            continue
+        stub_stem = target.stem
+        existing = target.read_text(encoding="utf-8") if target.exists() else None
+        if existing is None:
+            header = (
+                "---\n"
+                "type: session\n"
+                f"title: 会话 {stub_stem[2:]}\n"
+                f"session_id: {sid}\n"
+                f"created: '{today_str}'\n"
+                f"updated: '{today_str}'\n"
+                "status: active\n"
+                "source: hermes\n"
+                "---\n\n"
+                f"# 会话 {stub_stem[2:]}\n\n"
+            )
+            body = f"<!-- agentbrain:managed:start -->\n- 相关笔记：[[{note_stem}]]\n<!-- agentbrain:managed:end -->\n"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(target, header + body)
+        else:
+            managed = _extract_managed_block(existing) or ""
+            line = f"- 相关笔记：[[{note_stem}]]"
+            if note_stem and f"[[{note_stem}]]" not in managed:
+                new_managed = (managed.rstrip() + "\n" + line).strip() if managed.strip() else line
+                merged = _merge_managed_block(
+                    existing,
+                    default_header=f"# 会话 {stub_stem[2:]}\n\n",
+                    managed_body=new_managed,
+                )
+                atomic_write_text(target, merged)
+        pairs.append((stub_stem, sid))
+    return pairs
+
+
+def _format_source_lines(pairs: list[tuple[str, str]] | None, existing: list[str] | None = None) -> list[str]:
+    """合并「来源」小节的行：保留已有，补充缺失，链接文本用短会话号。"""
+    out = list(existing or [])
+    seen = {m.group(1).strip() for line in out for m in _WIKILINK_RE.finditer(line)}
+    for stub_stem, sid in pairs or []:
+        if stub_stem in seen:
+            continue
+        out.append(f"- 来源：[[{stub_stem}]] （{sid[:13]}…）")
+        seen.add(stub_stem)
+    return out
 
 
 def _format_longterm_note_content(
@@ -678,6 +811,7 @@ def _format_longterm_note_content(
     today_str: str,
     candidate_links: list[str] | None = None,
     exclude_link_names: set[str] | None = None,
+    session_pairs: list[tuple[str, str]] | None = None,
     as_section: bool = False,
 ) -> str:
     """生成或更新长期笔记：新建写正文+关联，已有文件在受管块内追加/替换 ### 小节并合并 frontmatter。"""
@@ -706,10 +840,11 @@ def _format_longterm_note_content(
         if source_refs:
             fm["source_refs"] = _merge_str_list_ordered([], source_refs, limit=MAX_SOURCE_REFS)
         link_lines = _merge_link_lines([], links_in, exclude_names=excl)
+        source_lines = _format_source_lines(session_pairs)
         if as_section:
-            managed_body = _render_managed_sections("", [(title, content)], link_lines)
+            managed_body = _render_managed_sections("", [(title, content)], link_lines, source_lines)
         else:
-            managed_body = _render_managed_sections(content, [], link_lines)
+            managed_body = _render_managed_sections(content, [], link_lines, source_lines)
         header = f"{_dump_frontmatter(fm)}\n# {title}\n\n"
         return _merge_managed_block(None, default_header=header, managed_body=managed_body)
 
@@ -744,7 +879,8 @@ def _format_longterm_note_content(
     preamble, sections, existing_links = _parse_managed_sections(existing_managed)
     sections = _upsert_managed_section(sections, title, content)
     link_lines = _merge_link_lines(existing_links, links_in, exclude_names=excl)
-    managed_body = _render_managed_sections(preamble, sections, link_lines)
+    source_lines = _format_source_lines(session_pairs)
+    managed_body = _render_managed_sections(preamble, sections, link_lines, source_lines)
 
     merged_body = _merge_managed_block(
         body.lstrip("\r\n"),
@@ -781,17 +917,34 @@ def _regenerate_project_overview(config: AppConfig) -> Path | None:
             continue
         text = md_file.read_text(encoding="utf-8", errors="replace")
         managed = _extract_managed_block(text)
-        if managed:
-            entries.append((md_file.stem, managed))
+        if not managed:
+            continue
+        # 只取一句话概要：跳过 evidence_level 行与标题行，取第一段实质内容的首句。
+        summary = ""
+        for raw_line in managed.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("evidence_level:"):
+                continue
+            if line.startswith("##") or line.startswith("- "):
+                line = line.lstrip("- ").strip()
+            summary = line
+            break
+        for sep in ("。", "；", "！", "？"):
+            idx = summary.find(sep)
+            if 0 < idx:
+                summary = summary[: idx + 1]
+                break
+        summary = summary[:120].strip()
+        entries.append((md_file.stem, summary))
 
     if not entries:
         return None
 
     managed_lines: list[str] = []
-    for name, managed in entries:
+    for name, summary in entries:
         managed_lines.append(f"## [[{name}]]")
         managed_lines.append("")
-        managed_lines.append(managed)
+        managed_lines.append(summary or "（暂无摘要）")
         managed_lines.append("")
     managed_body = "\n".join(managed_lines).strip()
 
@@ -1449,6 +1602,12 @@ def validate_and_apply_batch(
                     target = op["_resolved_target"]
 
                 existing = target.read_text(encoding="utf-8") if target.exists() else None
+                session_pairs = _sync_session_links(
+                    config,
+                    note_stem=target.stem,
+                    source_refs=op["source_refs"],
+                    today_str=today_str,
+                )
                 extra_excludes: set[str] = set()
                 if scope == "project":
                     extra_excludes.add(str(op.get("_project_raw") or ""))
@@ -1508,6 +1667,7 @@ def validate_and_apply_batch(
                             today_str=today_str,
                             candidate_links=candidate_links,
                             exclude_link_names=exclude_names,
+                            session_pairs=session_pairs,
                             as_section=True,
                         )
                     touched_project = True
@@ -1527,6 +1687,7 @@ def validate_and_apply_batch(
                         today_str=today_str,
                         candidate_links=candidate_links,
                         exclude_link_names=exclude_names,
+                        session_pairs=session_pairs,
                     )
 
                 if existing is not None and existing == rendered:

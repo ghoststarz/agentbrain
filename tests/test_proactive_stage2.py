@@ -572,7 +572,9 @@ def test_restricted_projection_security_manual_blocks_conflict_and_diary_idempot
     assert "Footer manual." in updated_proj
     assert "milestone: stage2" in updated_proj
     overview = (cfg.profile_dir / "20_LongTerm" / "Projects" / "_Overview.md").read_text(encoding="utf-8")
-    assert "milestone: stage2" in overview and "Manual notes stay here." not in overview
+    # 总览是薄索引（链接 + 一句话摘要），不再整段复制受管块
+    # 已有旧式项目页（Alpha.md）会被沿用，总览里是「链接 + 一句话摘要」的薄索引
+    assert "[[Alpha]]" in overview and "Manual notes stay here." not in overview
 
     diary_10 = cfg.profile_dir / "30_Diary" / "Public" / "2026-11-10.md"
     assert diary_10.exists() and diary_10.read_text(encoding="utf-8").count("Alpha milestone reached") == 1

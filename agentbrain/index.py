@@ -175,7 +175,7 @@ def init_db(config: AppConfig) -> Path:
 #           一旦被索引就会通过 search / prefetch 漏进模型上下文。
 # 50_Inbox/new：已下线功能的遗留安全护栏，防止旧目录或外部误放的未审卡片参与检索与注入。
 # 90_Archive：已退役的内容。保留是为了"不硬删"，但它的语义就是不该再被检索到。
-NEVER_INDEX_DIRS = ("30_Diary", "50_Inbox/new", "90_Archive")
+NEVER_INDEX_DIRS = ("30_Diary", "40_Sessions", "50_Inbox/new", "90_Archive")
 
 
 def _iter_profile_markdowns(profile_dir: Path) -> list[Path]:

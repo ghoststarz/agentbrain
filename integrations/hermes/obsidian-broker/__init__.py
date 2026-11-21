@@ -290,6 +290,16 @@ def _strip_thinking_and_memory(text: str) -> str:
 _MIRROR_TITLE_MAX = 24
 
 
+def _looks_like_system_notice(text: str) -> bool:
+    """判断这条消息是宿主注入的系统通知而不是用户提问（与写入侧同一套前缀）。"""
+    stripped = (text or "").lstrip()
+    if not stripped:
+        return True
+    if stripped.startswith(_SYSTEM_NOTICE_PREFIXES):
+        return True
+    return "heartbeat #" in stripped.lower()[:200]
+
+
 def _derive_mirror_title(text: str) -> str:
     """从记忆条目正文派生短标题（避免把整句话当文件名）。"""
     first = ""
@@ -512,6 +522,10 @@ class ObsidianBrokerMemoryProvider(MemoryProvider):
         self._last_recall = None
         try:
             if self._closed or is_trivial_prompt(query):
+                return ""
+            if _looks_like_system_notice(query):
+                # 后台任务完成通知、复盘回执这类消息不是他在提问：拿它去检索只会
+                # 命中一堆无关笔记白吃注入预算（实测审计里出现过这种 query）。
                 return ""
 
             prev_revision = self._last_revision
