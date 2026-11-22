@@ -599,7 +599,8 @@ def test_budget_segmentation_lease_concurrency_and_http_endpoints(tmp_path: Path
                 enabled=True,
                 model_endpoint=srv.endpoint,
                 model_name="fake-gpt",
-                model_max_context_chars=2400,
+                # 系统提示词开销约 2.2k 字：2400 的总预算塞不下任何证据（不是本用例要测的）
+                model_max_context_chars=4000,
                 max_payload_chars=1000,
             ),
         )

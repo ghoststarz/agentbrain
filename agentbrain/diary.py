@@ -44,18 +44,34 @@ def _check_gate(config: AppConfig, ledger: str, *, can_casual: bool = False) -> 
         raise DiaryGateError("private diary gate is enabled")
 
 
+VALID_DIARY_KINDS = frozenset({"daily", "wander"})
+_DIARY_ENTRY_LINE_RE = re.compile(r"^-\s*\[(\d{2}:\d{2}:\d{2})\]\s*(?:\([^)]*\))?\s*(.*)$")
+
+
+def normalize_diary_kind(raw: str | None) -> str:
+    """规范化日记条目类型：仅允许 daily / wander，缺省 daily。"""
+    clean = str(raw or "daily").strip().lower()
+    if not clean:
+        return "daily"
+    if clean not in VALID_DIARY_KINDS:
+        raise ValueError(f"不支持的 diary kind: {raw!r}（仅支持 daily / wander）")
+    return clean
+
+
 def append_diary(
     config: AppConfig,
     *,
     ledger: str,
     content: str,
     author: str = "",
+    kind: str = "daily",
     can_casual: bool = False,
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
     """向指定账本（public/private）的当日文件原子追加一条记录。"""
     clean_ledger = str(ledger or "").strip().lower()
     _check_gate(config, clean_ledger, can_casual=can_casual)
+    clean_kind = normalize_diary_kind(kind)
 
     clean_content = str(content or "").strip()
     if not clean_content:
@@ -71,7 +87,8 @@ def append_diary(
 
     clean_author = normalize_diary_author(author)
     tag = f" ({clean_author})" if clean_author else ""
-    line = f"- [{time_str}]{tag} {clean_content}\n"
+    kind_tag = " [wander]" if clean_kind == "wander" else ""
+    line = f"- [{time_str}]{tag}{kind_tag} {clean_content}\n"
 
     if target_file.exists():
         existing = target_file.read_text(encoding="utf-8")
@@ -86,6 +103,7 @@ def append_diary(
     return {
         "ok": True,
         "ledger": clean_ledger,
+        "kind": clean_kind,
         "date": date_str,
         "path": str(target_file),
     }
@@ -165,3 +183,76 @@ def read_diary(
         "gate": config.memory.diary_gate,
         "entries": entries,
     }
+
+
+def collect_recent_diary_context(
+    config: AppConfig,
+    *,
+    exclude_date: str | dt.date | None = None,
+    days: int = 3,
+    max_chars: int = 4000,
+) -> str:
+    """收集最近 N 天（不含 exclude_date 当天）的公/私账条目，按日期升序压成单行列表。
+
+    单行格式：`YYYY-MM-DD 公|私 [hh:mm:ss] 正文`。
+    总字符数受 max_chars 限制；超出时从最旧的条目开始丢弃。
+    """
+    eff_days = int(days)
+    eff_max = int(max_chars)
+    if eff_days <= 0 or eff_max <= 0:
+        return ""
+
+    if isinstance(exclude_date, dt.date):
+        ref_date = exclude_date
+    elif isinstance(exclude_date, str) and exclude_date.strip():
+        try:
+            ref_date = dt.date.fromisoformat(exclude_date.strip()[:10])
+        except ValueError:
+            ref_date = dt.date.today()
+    else:
+        ref_date = dt.date.today()
+
+    min_date = ref_date - dt.timedelta(days=eff_days)
+    # (date_str, time_str, ledger_order, line_idx, formatted_line)
+    records: list[tuple[str, str, int, int, str]] = []
+    for ledger, label, order in (("public", "公", 0), ("private", "私", 1)):
+        target_dir = _ledger_dir(config, ledger)
+        if not target_dir.exists() or target_dir.is_symlink():
+            continue
+        for md in sorted(target_dir.glob("*.md")):
+            if md.is_symlink():
+                continue
+            try:
+                file_date = dt.date.fromisoformat(md.stem)
+            except ValueError:
+                continue
+            if not (min_date <= file_date < ref_date):
+                continue
+            try:
+                raw = md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for idx, raw_line in enumerate(raw.splitlines()):
+                m = _DIARY_ENTRY_LINE_RE.match(raw_line.strip())
+                if not m:
+                    continue
+                time_str = m.group(1)
+                body = " ".join(m.group(2).split()).strip()
+                if not body:
+                    continue
+                formatted = f"{md.stem} {label} [{time_str}] {body}"
+                records.append((md.stem, time_str, order, idx, formatted))
+
+    if not records:
+        return ""
+
+    records.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
+    lines = [r[4] for r in records]
+
+    # 超出预算时从最旧的开始丢弃，尽量保留最新条目
+    while len(lines) > 1 and sum(len(ln) for ln in lines) + (len(lines) - 1) > eff_max:
+        lines.pop(0)
+    joined = "\n".join(lines)
+    if len(joined) > eff_max:
+        joined = joined[:eff_max]
+    return joined

@@ -16,7 +16,7 @@ import yaml
 from agentbrain.acl import display_client_id
 from agentbrain.atomic import atomic_write_text
 from agentbrain.config import AppConfig
-from agentbrain.diary import DiaryGateError, append_diary
+from agentbrain.diary import DiaryGateError, append_diary, normalize_diary_kind
 from agentbrain.handoff import handoff_path, read_handoff, upsert_handoff
 from agentbrain.index import reindex
 from agentbrain.proactive import ClaimedJob, LeaseMismatchError, ProactiveStore, StoredEvent
@@ -872,9 +872,13 @@ def _render_managed_sections(
     derived_source = [ln for ln in link_lines if "来源：" in ln]
     derived_links = [ln for ln in link_lines if "来源：" not in ln]
     all_sources = list(source_lines or [])
-    seen_sources = {m.group(1).strip() for ln in all_sources for m in _WIKILINK_RE.finditer(ln)}
+    seen_sources: set[str] = set()
+    for ln in all_sources:
+        m_sid = _SESSION_ID_RE.search(ln)
+        seen_sources.add(m_sid.group(0).lower() if m_sid else ln.strip())
     for ln in derived_source:
-        key = next((m.group(1).strip() for m in _WIKILINK_RE.finditer(ln)), ln)
+        m_sid = _SESSION_ID_RE.search(ln)
+        key = m_sid.group(0).lower() if m_sid else ln.strip()
         if key in seen_sources:
             continue
         all_sources.append(ln)
@@ -887,90 +891,55 @@ def _render_managed_sections(
 
 
 _SESSION_ID_RE = re.compile(r"local-([0-9a-f]{16,})", re.IGNORECASE)
-SESSION_DIR = "40_Sessions"
 
 
-def _extract_session_ids(source_refs: Any) -> list[str]:
-    """从 source_refs 里抽出去重的会话标识（`hermes:local-<hash>:turn:19` → `local-<hash>`）。"""
-    found: list[str] = []
+def _extract_session_sources(source_refs: Any) -> list[tuple[str, str]]:
+    """从 source_refs 中提取去重的 (client, 完整 session_id) 列表。
+
+    例如 `hermes:local-<64hex>:turn:19` -> `("hermes", "local-<64hex>")`。
+    """
+    found: list[tuple[str, str]] = []
+    seen_sids: set[str] = set()
     refs = source_refs if isinstance(source_refs, list) else []
     for ref in refs:
-        m = _SESSION_ID_RE.search(str(ref or ""))
+        raw = str(ref or "").strip()
+        m = _SESSION_ID_RE.search(raw)
         if not m:
             continue
         sid = f"local-{m.group(1).lower()}"
-        if sid not in found:
-            found.append(sid)
+        if sid in seen_sids:
+            continue
+        seen_sids.add(sid)
+        client = "hermes"
+        if ":" in raw:
+            prefix = raw.split(":", 1)[0].strip()
+            if prefix and not prefix.lower().startswith("local-"):
+                client = display_client_id(prefix) or "hermes"
+        found.append((client, sid))
     return found
 
 
-def _session_stub_rel(session_id: str) -> str:
-    """会话索引笔记的相对路径：`40_Sessions/S-<前 8 位>.md`。"""
-    short = session_id.split("-", 1)[-1][:8]
-    return f"{SESSION_DIR}/S-{short}.md"
-
-
-def _sync_session_links(
-    config: AppConfig,
-    *,
-    note_stem: str,
-    source_refs: Any,
-    today_str: str,
-) -> list[tuple[str, str]]:
-    """确保每个来源会话都有一篇索引笔记，并把本篇反向链进去；返回 (stub_stem, session_id) 列表。
-
-    会话索引放在 `40_Sessions/`（不进索引、不参与检索），作用是给非日记笔记一条可点的
-    「这条结论是哪次对话里来的」出处链接。
-    """
-    pairs: list[tuple[str, str]] = []
-    for sid in _extract_session_ids(source_refs):
-        rel = _session_stub_rel(sid)
-        try:
-            target = _assert_safe_profile_subpath(config, rel)
-        except Exception:
-            continue
-        stub_stem = target.stem
-        existing = target.read_text(encoding="utf-8") if target.exists() else None
-        if existing is None:
-            header = (
-                "---\n"
-                "type: session\n"
-                f"title: 会话 {stub_stem[2:]}\n"
-                f"session_id: {sid}\n"
-                f"created: '{today_str}'\n"
-                f"updated: '{today_str}'\n"
-                "status: active\n"
-                "source: hermes\n"
-                "---\n\n"
-                f"# 会话 {stub_stem[2:]}\n\n"
-            )
-            body = f"<!-- agentbrain:managed:start -->\n- 相关笔记：[[{note_stem}]]\n<!-- agentbrain:managed:end -->\n"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(target, header + body)
-        else:
-            managed = _extract_managed_block(existing) or ""
-            line = f"- 相关笔记：[[{note_stem}]]"
-            if note_stem and f"[[{note_stem}]]" not in managed:
-                new_managed = (managed.rstrip() + "\n" + line).strip() if managed.strip() else line
-                merged = _merge_managed_block(
-                    existing,
-                    default_header=f"# 会话 {stub_stem[2:]}\n\n",
-                    managed_body=new_managed,
-                )
-                atomic_write_text(target, merged)
-        pairs.append((stub_stem, sid))
-    return pairs
-
-
-def _format_source_lines(pairs: list[tuple[str, str]] | None, existing: list[str] | None = None) -> list[str]:
-    """合并「来源」小节的行：保留已有，补充缺失，链接文本用短会话号。"""
+def _format_source_lines(
+    session_sources: list[tuple[str, str]] | None,
+    existing: list[str] | None = None,
+) -> list[str]:
+    """合并「来源」小节的纯文本行（不建 wikilink），按完整 session_id 去重。"""
     out = list(existing or [])
-    seen = {m.group(1).strip() for line in out for m in _WIKILINK_RE.finditer(line)}
-    for stub_stem, sid in pairs or []:
-        if stub_stem in seen:
+    seen_sids: set[str] = set()
+    seen_lines: set[str] = set()
+    for line in out:
+        seen_lines.add(line.strip())
+        m = _SESSION_ID_RE.search(line)
+        if m:
+            seen_sids.add(m.group(0).lower())
+    for client, sid in session_sources or []:
+        norm_sid = sid.lower()
+        line = f"- 来源：{client} 会话 {norm_sid}"
+        if norm_sid in seen_sids or line in seen_lines:
             continue
-        out.append(f"- 来源：[[{stub_stem}]] （{sid[:13]}…）")
-        seen.add(stub_stem)
+        out.append(line)
+        seen_sids.add(norm_sid)
+        seen_lines.add(line)
     return out
 
 
@@ -990,7 +959,7 @@ def _format_longterm_note_content(
     today_str: str,
     candidate_links: list[str] | None = None,
     exclude_link_names: set[str] | None = None,
-    session_pairs: list[tuple[str, str]] | None = None,
+    session_sources: list[tuple[str, str]] | None = None,
     as_section: bool = False,
     section_key: str | None = None,
     summary: str | None = None,
@@ -1024,7 +993,7 @@ def _format_longterm_note_content(
         if source_refs:
             fm["source_refs"] = _merge_str_list_ordered([], source_refs, limit=MAX_SOURCE_REFS)
         link_lines = _merge_link_lines([], links_in, exclude_names=excl)
-        source_lines = _format_source_lines(session_pairs)
+        source_lines = _format_source_lines(session_sources)
         if as_section or clean_section_key:
             managed_body = _render_managed_sections(
                 "",
@@ -1078,7 +1047,7 @@ def _format_longterm_note_content(
         today_str=today_str,
     )
     link_lines = _merge_link_lines(existing_links, links_in, exclude_names=excl)
-    source_lines = _format_source_lines(session_pairs)
+    source_lines = _format_source_lines(session_sources)
     managed_body = _render_managed_sections(preamble, sections, link_lines, source_lines)
 
     merged_body = _merge_managed_block(
@@ -1170,13 +1139,25 @@ def _resolve_diary_datetime(
     job: ClaimedJob,
     matched_events: list[StoredEvent],
     clock: Clock,
+    *,
+    config: AppConfig | None = None,
 ) -> dt.datetime:
-    """日记日期严格限定在源事件本地日期或夜间窗口日期范围内，绝不接受模型任意日期。"""
+    """日记日期严格限定在源事件本地日期或夜间窗口日期范围内，绝不接受模型任意日期。
+
+    时间戳别写死 22:00：夜间任务实际在 22:30 落盘，写死会让日记时间和事实打架。
+    当天就记真实落盘时间；补写往日才回落到夜间调度时刻（取配置里的 hour/minute）。
+    """
+    nightly_h, nightly_m = 22, 30
+    if config is not None:
+        proactive = config.memory.proactive
+        nightly_h = int(getattr(proactive, "nightly_hour", nightly_h) or nightly_h)
+        nightly_m = int(getattr(proactive, "nightly_minute", nightly_m) or 0)
+    now_local = clock.to_local(clock.now_utc()).replace(tzinfo=None)
     allowed_dates: set[str] = set()
     for ev in matched_events:
         utc_dt = ensure_utc(dt.datetime.fromisoformat(ev.occurred_at_utc))
         allowed_dates.add(clock.to_local(utc_dt).strftime("%Y-%m-%d"))
-    if job.job_type == "nightly" and job.window_id:
+    if job.job_type in ("nightly", "nightly_diary") and job.window_id:
         allowed_dates.add(job.window_id)
 
     raw_date = str(op.get("event_date") or "").strip()
@@ -1189,7 +1170,11 @@ def _resolve_diary_datetime(
             raise BatchValidationError(
                 f"diary_append event_date {raw_date!r} 超出源事件/窗口日期范围 {sorted(allowed_dates)}"
             )
-        return dt.datetime(parsed_d.year, parsed_d.month, parsed_d.day, 22, 0, 0)
+        return (
+            now_local
+            if parsed_d == now_local.date()
+            else dt.datetime(parsed_d.year, parsed_d.month, parsed_d.day, nightly_h, nightly_m, 0)
+        )
 
     if matched_events:
         utc_dt = ensure_utc(dt.datetime.fromisoformat(matched_events[0].occurred_at_utc))
@@ -1197,18 +1182,36 @@ def _resolve_diary_datetime(
 
     if job.window_id:
         win_date = dt.date.fromisoformat(job.window_id)
-        return dt.datetime(win_date.year, win_date.month, win_date.day, 22, 55, 0)
+        return (
+            now_local
+            if win_date == now_local.date()
+            else dt.datetime(win_date.year, win_date.month, win_date.day, nightly_h, nightly_m, 0)
+        )
 
     return clock.to_local(clock.now_utc()).replace(tzinfo=None)
 
 
-def _diary_contains_exact_entry(config: AppConfig, ledger: str, date_str: str, content: str) -> bool:
+def _diary_entry_body(content: str, *, kind: str = "daily") -> str:
+    clean = " ".join(str(content or "").split())
+    if kind == "wander" and clean:
+        return f"[wander] {clean}"
+    return clean
+
+
+def _diary_contains_exact_entry(
+    config: AppConfig,
+    ledger: str,
+    date_str: str,
+    content: str,
+    *,
+    kind: str = "daily",
+) -> bool:
     """精确行正文比对（绝不使用子串匹配），用于崩溃恢复幂等。"""
     sub = "Public" if ledger == "public" else "Private"
     target = config.profile_dir / "30_Diary" / sub / f"{date_str}.md"
     if not target.exists():
         return False
-    norm_new = " ".join(content.split())
+    norm_new = _diary_entry_body(content, kind=kind)
     if not norm_new:
         return False
     for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -1226,20 +1229,49 @@ def _replace_diary_auto_entry(
     new_content: str,
     *,
     now_dt: dt.datetime,
+    old_kind: str = "daily",
+    new_kind: str = "daily",
 ) -> bool:
     """在日记文件中就地更新同一证据来源的自动条目（精确匹配旧正文，绝不误改其他条目）。"""
     if not target.exists():
         return False
-    norm_old = " ".join(old_content.split())
+    norm_old = _diary_entry_body(old_content, kind=old_kind)
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
     for idx, line in enumerate(lines):
         m = _DIARY_LINE_RE.match(line.strip())
         if m and " ".join(m.group(1).split()) == norm_old:
             time_str = now_dt.strftime("%H:%M:%S")
-            lines[idx] = f"- [{time_str}] (proactive) {new_content.strip()}\n"
+            kind_tag = " [wander]" if new_kind == "wander" else ""
+            lines[idx] = f"- [{time_str}] (proactive){kind_tag} {new_content.strip()}\n"
             atomic_write_text(target, "".join(lines))
             return True
     return False
+
+
+def _existing_diary_timestamps(target: Path) -> set[str]:
+    """读取目标日记文件中已出现的 HH:MM:SS 时间戳集合，用于避免多条写入时间戳撞车。"""
+    if not target.exists():
+        return set()
+    used: set[str] = set()
+    ts_re = re.compile(r"^-\s*\[(\d{2}:\d{2}:\d{2})\]")
+    try:
+        for line in target.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = ts_re.match(line.strip())
+            if m:
+                used.add(m.group(1))
+    except OSError:
+        pass
+    return used
+
+
+def _allocate_unique_diary_dt(base_dt: dt.datetime, used_times: set[str]) -> dt.datetime:
+    """确保同日同一账本内多条日记的时间戳不重复（撞车则顺延 1 秒，不跨天）。"""
+    cur = base_dt
+    day_end = base_dt.replace(hour=23, minute=59, second=59)
+    while cur.strftime("%H:%M:%S") in used_times and cur < day_end:
+        cur = cur + dt.timedelta(seconds=1)
+    used_times.add(cur.strftime("%H:%M:%S"))
+    return cur
 
 
 def _derive_op_id(job: ClaimedJob, idx: int, op_type: str, dedupe_key: str) -> str:
@@ -1251,10 +1283,17 @@ def _derive_dedupe_key(op: dict[str, Any]) -> str:
     op_type = str(op["op_type"])
     if op_type == "diary_append":
         ledger = str(op.get("ledger") or "").strip().lower()
+        kind = str(op.get("kind") or "daily").strip().lower()
         date_hint = str(op.get("_resolved_date") or "")
         canonical_refs = op.get("_canonical_source_refs") or []
         refs_digest = sha256_text("|".join(canonical_refs))[:24]
-        return f"diary:{ledger}:{date_hint}:refs:{refs_digest}"
+        base_key = f"diary:{ledger}:{date_hint}:refs:{refs_digest}"
+        if kind != "daily":
+            base_key = f"{base_key}:kind:{kind}"
+        slot = int(op.get("_diary_slot") or 0)
+        if slot > 0:
+            return f"{base_key}:slot:{slot}"
+        return base_key
     if op_type == "longterm_upsert":
         fact_key = str(op.get("fact_key") or "").strip()
         slot = fact_key or str(op.get("_dedupe_slot") or op.get("_resolved_rel") or "")
@@ -1389,6 +1428,7 @@ def validate_and_apply_batch(
     today_str = eff_clock.to_local(eff_clock.now_utc()).strftime("%Y-%m-%d")
     validated_ops: list[dict[str, Any]] = []
     pre_lock_checks: list[tuple[Path, str, str | None]] = []
+    diary_slot_counts: dict[tuple[str, str, str, str], int] = {}
 
     # 第一阶段：整批严格校验（任意一条不合规即中止，零写入）
     for idx, raw_op in enumerate(ops):
@@ -1401,7 +1441,19 @@ def validate_and_apply_batch(
             raise BatchValidationError(f"operation[{idx}] 不支持的 op_type: {op_type!r}")
 
         op = dict(raw_op)
-        if job.job_type == "nightly" and not events and op_type == "diary_append":
+        diary_kind = "daily"
+        if op_type == "diary_append":
+            try:
+                diary_kind = normalize_diary_kind(op.get("kind"))
+            except ValueError as exc:
+                raise BatchValidationError(f"operation[{idx}] {exc}") from exc
+            op["kind"] = diary_kind
+
+        if (
+            job.job_type in ("nightly", "nightly_diary")
+            and op_type == "diary_append"
+            and (not events or diary_kind == "wander")
+        ):
             raw_refs = _normalize_str_list(op.get("source_refs"))
             if raw_refs:
                 source_refs, canonical_refs, matched_events = _resolve_source_refs(
@@ -1449,6 +1501,15 @@ def validate_and_apply_batch(
             merge_into = str(op.get("merge_into") or "").strip() or None
             op["_merge_into"] = merge_into
             expected_hash = str(op.get("expected_hash") or "").strip()
+
+            if scope == "global" and note_type == "project":
+                # 模型有时把项目页标题直接写成 `PROJ-…`（旧命名习惯）。不纠正的话
+                # 会绕开「按项目名复用」的逻辑，在 Projects 下另建一个同义文件。
+                derived = re.sub(r"^PROJ-(\d+-)?", "", str(op.get("title") or ""), flags=re.IGNORECASE).strip()
+                if derived:
+                    op["project"] = derived
+                    scope = "project"
+                    op["scope"] = "project"
 
             if scope == "project":
                 project_raw = str(op.get("project") or "").strip()
@@ -1617,7 +1678,7 @@ def validate_and_apply_batch(
                 )
             if ledger == "private" and config.memory.diary_gate:
                 raise DiaryGateError("private diary gate is enabled")
-            target_dt = _resolve_diary_datetime(op, job, matched_events, eff_clock)
+            target_dt = _resolve_diary_datetime(op, job, matched_events, eff_clock, config=config)
             date_str = target_dt.strftime("%Y-%m-%d")
             rel = f"30_Diary/{'Public' if ledger == 'public' else 'Private'}/{date_str}.md"
             _assert_no_symlink_escape(config, rel)
@@ -1625,6 +1686,10 @@ def validate_and_apply_batch(
             op["_resolved_dt"] = target_dt
             op["_resolved_date"] = date_str
             op["_resolved_rel"] = rel
+            refs_digest = sha256_text("|".join(canonical_refs))[:24]
+            slot_key = (ledger, op["kind"], date_str, refs_digest)
+            op["_diary_slot"] = diary_slot_counts.get(slot_key, 0)
+            diary_slot_counts[slot_key] = op["_diary_slot"] + 1
 
         dedupe_key = _derive_dedupe_key(op)
         op_id = str(op.get("op_id") or "").strip() or _derive_op_id(job, idx, op_type, dedupe_key)
@@ -1680,6 +1745,7 @@ def validate_and_apply_batch(
                         f"写锁复检冲突拒绝覆盖 {rel}: expected={req_hash[:12]} actual={actual_hash[:12]}"
                     )
 
+        diary_used_times: dict[str, set[str]] = {}
         for op in validated_ops:
             op_id = op["_op_id"]
             op_type = op["op_type"]
@@ -1693,11 +1759,16 @@ def validate_and_apply_batch(
                 continue
 
             if op_type == "diary_append":
+                op_kind = str(op.get("kind") or "daily")
+                diary_target = _assert_no_symlink_escape(config, rel)
+                if rel not in diary_used_times:
+                    diary_used_times[rel] = _existing_diary_timestamps(diary_target)
                 journal = store.get_adapter_cursor("diary_journal", dedupe_key)
                 norm_new = " ".join(op["content"].split())
                 if journal is not None:
                     prev_content = str(journal.get("content") or "")
-                    if " ".join(prev_content.split()) == norm_new:
+                    prev_kind = str(journal.get("kind") or "daily")
+                    if " ".join(prev_content.split()) == norm_new and prev_kind == op_kind:
                         store.record_applied_op(
                             op_id=op_id,
                             job_id=job.job_id,
@@ -1711,12 +1782,14 @@ def validate_and_apply_batch(
                         skipped_dedupe += 1
                         op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_dedupe"})
                         continue
-                    diary_target = _assert_no_symlink_escape(config, rel)
+                    eff_dt = _allocate_unique_diary_dt(op["_resolved_dt"], diary_used_times[rel])
                     if _replace_diary_auto_entry(
                         diary_target,
                         prev_content,
                         op["content"],
-                        now_dt=op["_resolved_dt"],
+                        now_dt=eff_dt,
+                        old_kind=prev_kind,
+                        new_kind=op_kind,
                     ):
                         store.set_adapter_cursor(
                             "diary_journal",
@@ -1725,6 +1798,7 @@ def validate_and_apply_batch(
                                 "target_path": rel,
                                 "target_date": op["_resolved_date"],
                                 "content": op["content"],
+                                "kind": op_kind,
                                 "op_id": op_id,
                             },
                         )
@@ -1744,7 +1818,13 @@ def validate_and_apply_batch(
                         )
                         continue
 
-                if _diary_contains_exact_entry(config, op["ledger"], op["_resolved_date"], op["content"]):
+                if _diary_contains_exact_entry(
+                    config,
+                    op["ledger"],
+                    op["_resolved_date"],
+                    op["content"],
+                    kind=op_kind,
+                ):
                     store.set_adapter_cursor(
                         "diary_journal",
                         dedupe_key,
@@ -1752,6 +1832,7 @@ def validate_and_apply_batch(
                             "target_path": rel,
                             "target_date": op["_resolved_date"],
                             "content": op["content"],
+                            "kind": op_kind,
                             "op_id": op_id,
                         },
                     )
@@ -1769,13 +1850,15 @@ def validate_and_apply_batch(
                     op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_crash_idempotent"})
                     continue
 
+                eff_dt = _allocate_unique_diary_dt(op["_resolved_dt"], diary_used_times[rel])
                 append_diary(
                     config,
                     ledger=op["ledger"],
                     content=op["content"],
                     author=("antigravity" if str(job.client or "").startswith(("agy", "antigravity")) else "hermes"),
+                    kind=op_kind,
                     can_casual=False,
-                    now=op["_resolved_dt"],
+                    now=eff_dt,
                 )
                 store.set_adapter_cursor(
                     "diary_journal",
@@ -1784,6 +1867,7 @@ def validate_and_apply_batch(
                         "target_path": rel,
                         "target_date": op["_resolved_date"],
                         "content": op["content"],
+                        "kind": op_kind,
                         "op_id": op_id,
                     },
                 )
@@ -1815,12 +1899,19 @@ def validate_and_apply_batch(
                     target = op["_resolved_target"]
 
                 existing = target.read_text(encoding="utf-8") if target.exists() else None
-                session_pairs = _sync_session_links(
-                    config,
-                    note_stem=target.stem,
-                    source_refs=op["source_refs"],
-                    today_str=today_str,
-                )
+                session_sources = _extract_session_sources(op["source_refs"])
+                if not session_sources:
+                    # source_refs 可能是「短事件 id」（如 turn:12），抽不出会话标识；
+                    # 这时从命中的事件本身取 session_id，别让「来源」整节凭空消失。
+                    seen_sids: set[str] = set()
+                    for _ev in op.get("_matched_events") or []:
+                        _sid = str(getattr(_ev, "session_id", "") or "").strip()
+                        if not _sid or _sid in seen_sids:
+                            continue
+                        seen_sids.add(_sid)
+                        session_sources.append(
+                            (display_client_id(str(getattr(_ev, "client", ""))) or "hermes", _sid)
+                        )
                 extra_excludes: set[str] = set()
                 if scope == "project":
                     extra_excludes.add(str(op.get("_project_raw") or ""))
@@ -1862,10 +1953,12 @@ def validate_and_apply_batch(
                         if proj_refs:
                             fm_proj["source_refs"] = proj_refs
                         link_lines = _merge_link_lines([], candidate_links, exclude_names=exclude_names)
+                        source_lines = _format_source_lines(session_sources)
                         managed_body = _render_managed_sections(
                             "",
                             [_ManagedSection(heading=title, body=content, section_key=op.get("section_key"))],
                             link_lines,
+                            source_lines,
                         )
                         header = f"{_dump_frontmatter(fm_proj)}\n# {proj_title}\n\n"
                         rendered = _merge_managed_block(None, default_header=header, managed_body=managed_body)
@@ -1885,7 +1978,7 @@ def validate_and_apply_batch(
                             today_str=today_str,
                             candidate_links=candidate_links,
                             exclude_link_names=exclude_names,
-                            session_pairs=session_pairs,
+                            session_sources=session_sources,
                             as_section=True,
                             section_key=op.get("section_key"),
                             summary=op.get("summary"),
@@ -1907,7 +2000,7 @@ def validate_and_apply_batch(
                         today_str=today_str,
                         candidate_links=candidate_links,
                         exclude_link_names=exclude_names,
-                        session_pairs=session_pairs,
+                        session_sources=session_sources,
                         section_key=op.get("section_key"),
                         summary=op.get("summary"),
                     )

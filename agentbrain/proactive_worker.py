@@ -19,6 +19,7 @@ from agentbrain.config import (
     resolve_effective_model_backend,
     validate_proactive_worker_config,
 )
+from agentbrain.diary import collect_recent_diary_context
 from agentbrain.index import touch_notes_access
 from agentbrain.proactive import ClaimedJob, LeaseMismatchError, ProactiveStore, StoredEvent
 from agentbrain.proactive_apply import (
@@ -80,6 +81,16 @@ def _system_prompt(
             addendum = addendum.replace("<窗口日期>", str(window_id))
         # 前置而不是追加：弱模型对末尾的补充要求容易忽略，实测前置才稳定遵守。
         return f"{addendum}\n\n{persona_block}\n\n{base}"
+    if job_type == "nightly_work":
+        addendum = load_prompt("review_nightly_work")
+        if window_id:
+            addendum = addendum.replace("<窗口日期>", str(window_id))
+        return f"{addendum}\n\n{persona_block}\n\n{base}"
+    if job_type == "nightly_diary":
+        addendum = load_prompt("review_nightly_diary")
+        if window_id:
+            addendum = addendum.replace("<窗口日期>", str(window_id))
+        return f"{addendum}\n\n{persona_block}\n\n{base}"
     return f"{persona_block}\n\n{base}"
 
 
@@ -108,18 +119,18 @@ def _nightly_system_prompt_overhead_chars(
 
 
 def _format_missing_diary_code(missing: list[str]) -> str:
-    missing_set = set(missing)
-    if "public" in missing_set and "private" in missing_set:
+    ordered = [m for m in ("public", "private", "wander") if m in set(missing)]
+    if not ordered:
         return "nightly_missing_diary:both"
-    if "public" in missing_set:
-        return "nightly_missing_diary:public"
-    if "private" in missing_set:
-        return "nightly_missing_diary:private"
-    return "nightly_missing_diary:both"
+    if ordered == ["public", "private"]:
+        return "nightly_missing_diary:both"
+    if len(ordered) == 1:
+        return f"nightly_missing_diary:{ordered[0]}"
+    return "nightly_missing_diary:" + "+".join(ordered)
 
 
 class NightlyMissingDiaryError(RuntimeError):
-    """夜间复盘缺少必需的公账或私账日记条目。"""
+    """夜间复盘缺少必需的公账、私账或漫游（wander）日记条目。"""
 
     def __init__(self, missing: list[str]) -> None:
         self.missing = list(missing)
@@ -127,20 +138,20 @@ class NightlyMissingDiaryError(RuntimeError):
         super().__init__(self.code)
 
 
-def _extract_nightly_diary_ops(
+def _extract_nightly_diary_ops_list(
     raw_output: Any,
     *,
     window_id: str | None,
-) -> dict[str, dict[str, Any]]:
-    """从模型输出中提取符合夜间窗口日期的公/私账 diary_append 操作（按 ledger 索引）。"""
+) -> list[dict[str, Any]]:
+    """从模型输出中提取所有符合夜间窗口日期的公/私账 diary_append 操作列表。"""
     if not isinstance(raw_output, dict):
-        return {}
+        return []
     if str(raw_output.get("outcome") or "").strip() != "operations":
-        return {}
+        return []
     ops = raw_output.get("operations")
     if not isinstance(ops, list):
-        return {}
-    found: dict[str, dict[str, Any]] = {}
+        return []
+    found: list[dict[str, Any]] = []
     target_date = str(window_id or "").strip()
     for op in ops:
         if not isinstance(op, dict):
@@ -154,9 +165,36 @@ def _extract_nightly_diary_ops(
             continue
         if target_date and str(op.get("event_date") or "").strip() != target_date:
             continue
+        found.append(op)
+    return found
+
+
+def _extract_nightly_diary_ops(
+    raw_output: Any,
+    *,
+    window_id: str | None,
+) -> dict[str, dict[str, Any]]:
+    """兼容旧接口：按 ledger 返回首条符合夜间窗口日期的 diary_append。"""
+    found: dict[str, dict[str, Any]] = {}
+    for op in _extract_nightly_diary_ops_list(raw_output, window_id=window_id):
+        ledger = str(op.get("ledger") or "").strip().lower()
         if ledger not in found:
             found[ledger] = op
     return found
+
+
+def _count_nightly_diary_ops(ops: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"public": 0, "private": 0, "wander": 0}
+    for op in ops:
+        ledger = str(op.get("ledger") or "").strip().lower()
+        kind = str(op.get("kind") or "daily").strip().lower() or "daily"
+        if ledger == "public":
+            counts["public"] += 1
+        elif ledger == "private":
+            counts["private"] += 1
+            if kind == "wander":
+                counts["wander"] += 1
+    return counts
 
 
 def _missing_nightly_diary_ledgers(
@@ -164,15 +202,30 @@ def _missing_nightly_diary_ledgers(
     *,
     window_id: str | None,
     satisfied: set[str] | None = None,
+    satisfied_counts: dict[str, int] | None = None,
 ) -> list[str]:
-    found = set(_extract_nightly_diary_ops(raw_output, window_id=window_id).keys())
-    if satisfied:
-        found |= satisfied
-    return [ledger for ledger in ("public", "private") if ledger not in found]
+    counts = _count_nightly_diary_ops(_extract_nightly_diary_ops_list(raw_output, window_id=window_id))
+    if satisfied_counts:
+        for k in ("public", "private", "wander"):
+            counts[k] += int(satisfied_counts.get(k, 0))
+    elif satisfied:
+        if "public" in satisfied:
+            counts["public"] += 1
+        if "private" in satisfied:
+            counts["private"] += 2
+            counts["wander"] += 1
+    missing: list[str] = []
+    if counts["public"] < 1:
+        missing.append("public")
+    if counts["private"] < 2:
+        missing.append("private")
+    if counts["wander"] < 1:
+        missing.append("wander")
+    return missing
 
 
 def _strip_diary_ops(raw_output: Any) -> tuple[Any, int]:
-    """防御性剔除日记操作：多分段夜间复盘里，只有最后一个分段允许写日记。"""
+    """防御性剔除日记操作：多分段夜间前序分段与 nightly_work 不允许写日记。"""
     if not isinstance(raw_output, dict):
         return raw_output, 0
     ops = raw_output.get("operations")
@@ -194,17 +247,42 @@ def _strip_diary_ops(raw_output: Any) -> tuple[Any, int]:
     return cleaned, removed
 
 
+def _strip_non_diary_ops(raw_output: Any) -> tuple[Any, int]:
+    """防御性剔除非日记操作：nightly_diary 通道只允许输出 diary_append。"""
+    if not isinstance(raw_output, dict):
+        return raw_output, 0
+    ops = raw_output.get("operations")
+    if not isinstance(ops, list):
+        return raw_output, 0
+    kept: list[Any] = []
+    removed = 0
+    for op in ops:
+        if isinstance(op, dict) and str(op.get("op_type") or "").strip() == "diary_append":
+            kept.append(op)
+        else:
+            removed += 1
+    if removed == 0:
+        return raw_output, 0
+    cleaned = dict(raw_output)
+    cleaned["operations"] = kept
+    if not kept:
+        cleaned["outcome"] = "no_change"
+    return cleaned, removed
+
+
 def _nightly_missing_retry_hint(missing: list[str], window_id: str | None) -> str:
-    if set(missing) == {"public", "private"}:
-        missing_desc = "缺少 public 和 private 日记"
-    elif "public" in missing:
-        missing_desc = "缺少 public 日记"
-    else:
-        missing_desc = "缺少 private 日记"
+    parts: list[str] = []
+    if "public" in missing:
+        parts.append("公账（ledger=public）至少 1 条")
+    if "private" in missing:
+        parts.append("私账（ledger=private）至少 2 条")
+    if "wander" in missing:
+        parts.append('私账中至少 1 条 kind="wander" 的漫游/小思考')
+    missing_desc = "；".join(parts) if parts else "未满足夜间日记条数要求"
     date_part = f"（event_date 必须为 {window_id}）" if window_id else ""
     return (
-        f"\n\nIMPORTANT: 本次为夜间复盘，{missing_desc}{date_part}。"
-        "请补齐并输出合法 JSON（必须包含 diary_append，且不要返回 no_change 或空操作），"
+        f"\n\nIMPORTANT: 本次为夜间复盘，未满足日记要求：{missing_desc}{date_part}。"
+        "请补齐并输出合法 JSON（必须包含满足要求的 diary_append，且不要返回 no_change 或空操作），"
         "不要包含多余解释。"
     )
 
@@ -215,7 +293,7 @@ def _merge_nightly_diary_retry(
     *,
     window_id: str | None,
 ) -> dict[str, Any]:
-    """若重试仅补齐了缺失的一侧日记，则保留首次输出中已合乎窗口日期的另一侧日记。"""
+    """若重试仅补齐了缺失的部分日记，则保留首次输出中已合乎窗口日期的其余日记条目。"""
     if not isinstance(retry_out, dict):
         return retry_out
     if str(retry_out.get("outcome") or "").strip() != "operations":
@@ -223,14 +301,20 @@ def _merge_nightly_diary_retry(
     retry_ops = retry_out.get("operations")
     if not isinstance(retry_ops, list) or not retry_ops:
         return retry_out
-    retry_diaries = _extract_nightly_diary_ops(retry_out, window_id=window_id)
-    first_diaries = _extract_nightly_diary_ops(first_out, window_id=window_id)
-    prefix = [
-        op
-        for ledger in ("public", "private")
-        if ledger not in retry_diaries and ledger in first_diaries
-        for op in (first_diaries[ledger],)
-    ]
+    # 若重试输出本身已完整满足公/私/wander 要求，直接采纳重试输出
+    if not _missing_nightly_diary_ledgers(retry_out, window_id=window_id):
+        return retry_out
+
+    def _sig(op: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(op.get("ledger") or "").strip().lower(),
+            str(op.get("kind") or "daily").strip().lower() or "daily",
+            " ".join(str(op.get("content") or "").split()),
+        )
+
+    retry_sigs = {_sig(op) for op in _extract_nightly_diary_ops_list(retry_out, window_id=window_id)}
+    first_diaries = _extract_nightly_diary_ops_list(first_out, window_id=window_id)
+    prefix = [op for op in first_diaries if _sig(op) not in retry_sigs]
     if not prefix or len(prefix) + len(retry_ops) > MAX_BATCH_OPS:
         return retry_out
     merged = dict(retry_out)
@@ -333,10 +417,17 @@ def _collect_existing_context(
     return "\n\n".join(snippets), snapshot_hashes
 
 
-def _format_event_block(ev: StoredEvent, *, notice_only: bool = False) -> str:
+def _format_event_block(
+    ev: StoredEvent,
+    *,
+    notice_only: bool = False,
+    max_content_chars: int | None = None,
+) -> str:
     safe_content = redact_secrets(ev.content)
     if notice_only:
         safe_content = safe_content[:400]
+    if max_content_chars is not None and max_content_chars > 0:
+        safe_content = safe_content[:max_content_chars]
     meta_part = ""
     if ev.meta:
         safe_meta = {k: v for k, v in ev.meta.items() if k not in ("raw", "thinking")}
@@ -350,6 +441,54 @@ def _format_event_block(ev: StoredEvent, *, notice_only: bool = False) -> str:
     if notice_only:
         return f"{header}\n[系统通知，仅参考]\n{safe_content}"
     return f"{header}\n{safe_content}"
+
+
+def _build_recent_diary_block(config: AppConfig, *, window_id: str | None) -> str:
+    """为夜间任务构建 `<recent_diary>` 上下文块（不含本窗口当天，受 days 与 max_chars 约束）。"""
+    cfg = config.memory.proactive
+    raw = collect_recent_diary_context(
+        config,
+        exclude_date=window_id,
+        days=cfg.nightly_recent_diary_days,
+        max_chars=cfg.nightly_recent_diary_max_chars,
+    )
+    if not raw:
+        return ""
+    safe = redact_secrets(raw)
+    if len(safe) > cfg.nightly_recent_diary_max_chars:
+        safe = safe[-cfg.nightly_recent_diary_max_chars :]
+    return f"<recent_diary>\n{safe}\n</recent_diary>"
+
+
+def estimate_nightly_context_chars(
+    config: AppConfig,
+    *,
+    window_id: str | None,
+    events: list[StoredEvent],
+) -> int:
+    """估算单任务夜间复盘总上下文长度（system + 证据 + existing_memory + recent_diary）。"""
+    countable_events = sorted(
+        (ev for ev in events if ev.countable),
+        key=lambda e: (e.occurred_at_us, e.row_id),
+    )
+    uncountable_events = sorted(
+        (ev for ev in events if not ev.countable),
+        key=lambda e: (e.occurred_at_us, e.row_id),
+    )[-2:]
+    ordered_events = countable_events + uncountable_events
+
+    max_ctx = config.memory.proactive.model_max_context_chars
+    context_budget = min(max_ctx // 3, 6000)
+    existing_ctx, _ = _collect_existing_context(config, ordered_events, context_budget)
+    recent_diary_block = _build_recent_diary_block(config, window_id=window_id)
+    sys_prompt_len = len(
+        _system_prompt("nightly", window_id=window_id, soul_path=config.broker.soul_path)
+    )
+    evidence_len = sum(
+        len(_format_event_block(ev, notice_only=not ev.countable)) + 2
+        for ev in ordered_events
+    )
+    return sys_prompt_len + len(existing_ctx) + len(recent_diary_block) + evidence_len
 
 
 def _split_oversized_block(event_id: str, block: str, event_budget: int) -> list[str]:
@@ -384,6 +523,8 @@ def segment_job_prompts_with_snapshots(
     config: AppConfig,
     job: ClaimedJob,
     events: list[StoredEvent],
+    *,
+    store: ProactiveStore | None = None,
 ) -> tuple[list[tuple[list[StoredEvent], str]], dict[str, str]]:
     """按上下文预算确定性分段并返回服务端读取快照哈希；可计数事件优先，不可计数仅保留最近 2 条且截断到 400 字。"""
     countable_events = sorted(
@@ -403,6 +544,10 @@ def segment_job_prompts_with_snapshots(
     )
     context_budget = min(max_ctx // 3, 6000)
     existing_ctx, snapshot_hashes = _collect_existing_context(config, ordered_events, context_budget)
+    recent_diary_block = ""
+    if job.job_type in ("nightly", "nightly_diary"):
+        recent_diary_block = _build_recent_diary_block(config, window_id=job.window_id)
+
     sys_prompt_len = len(
         _system_prompt(job.job_type, window_id=job.window_id, soul_path=config.broker.soul_path)
     )
@@ -415,26 +560,65 @@ def segment_job_prompts_with_snapshots(
                 soul_path=config.broker.soul_path,
             ),
         )
-    static_overhead = sys_prompt_len + len(header) + len(existing_ctx) + 256
+    recent_diary_section = f"\n\n{recent_diary_block}" if recent_diary_block else ""
+    digest_section = ""
+    if job.job_type == "nightly_diary" and store is not None and job.window_id and job.revision is not None:
+        work_digests_cursor = store.get_adapter_cursor(
+            "nightly_work_digests",
+            f"{job.window_id}:rev:{job.revision}",
+        )
+        if work_digests_cursor and isinstance(work_digests_cursor.get("digests"), list):
+            digests = [str(d).strip() for d in work_digests_cursor["digests"] if str(d).strip()]
+            if digests:
+                digest_section = (
+                    "\n\n<segment_digests>\n"
+                    + "\n".join(digests)
+                    + "\n</segment_digests>"
+                )
+
+    static_overhead = (
+        sys_prompt_len
+        + len(header)
+        + len(existing_ctx)
+        + len(recent_diary_section)
+        + len(digest_section)
+        + 256
+    )
     event_budget = max_ctx - static_overhead
     if event_budget < 256:
         raise ContextBudgetExceededError(
             f"上下文预算不足以容纳任何事件（max_ctx={max_ctx}, overhead={static_overhead}）"
         )
 
+    def _assemble_prompt(ev_text: str, *, extra_tail: str = "") -> str:
+        return (
+            f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>"
+            f"{recent_diary_section}{digest_section}\n\n"
+            f"<untrusted_evidence>\n{ev_text}\n</untrusted_evidence>{extra_tail}"
+        )
+
     if not ordered_events:
-        if job.job_type == "nightly":
-            prompt = (
-                f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
-                "<untrusted_evidence>\n</untrusted_evidence>\n\n"
-                "说明：本窗口没有任何新对话，请只基于你自己的近况、想法与已有记忆写今天的公账与私账日记，严禁编造用户当天做过什么。"
+        if job.job_type in ("nightly", "nightly_diary"):
+            prompt = _assemble_prompt(
+                "",
+                extra_tail=(
+                    "\n\n说明：本窗口没有任何新对话，请只基于你自己的近况、想法与已有记忆写今天的公账与私账日记，"
+                    "严禁编造用户当天做过什么。"
+                ),
             )
         else:
-            prompt = (
-                f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
-                "<untrusted_evidence>\n</untrusted_evidence>"
-            )
+            prompt = _assemble_prompt("")
         return [([], prompt)], snapshot_hashes
+
+    # nightly_diary 通道：若当天原始证据超出预算，改喂「各分段 digest 汇总 + 每个事件的前 200 字」
+    use_compact_diary_events = False
+    if job.job_type == "nightly_diary":
+        raw_total = sum(
+            len(_format_event_block(ev, notice_only=not ev.countable)) + 2
+            for ev in ordered_events
+        )
+        if raw_total > event_budget:
+            use_compact_diary_events = True
 
     segments: list[tuple[list[StoredEvent], str]] = []
     cur_events: list[StoredEvent] = []
@@ -442,17 +626,17 @@ def segment_job_prompts_with_snapshots(
     cur_len = 0
 
     for ev in ordered_events:
-        raw_block = _format_event_block(ev, notice_only=not ev.countable)
+        raw_block = _format_event_block(
+            ev,
+            notice_only=not ev.countable,
+            max_content_chars=200 if use_compact_diary_events else None,
+        )
         parts = _split_oversized_block(ev.event_id, raw_block, event_budget)
         for part in parts:
             add_len = len(part) + (2 if cur_blocks else 0)
             if cur_blocks and (cur_len + add_len > event_budget):
                 ev_text = "\n\n".join(cur_blocks)
-                prompt = (
-                    f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
-                    f"<untrusted_evidence>\n{ev_text}\n</untrusted_evidence>"
-                )
-                segments.append((cur_events, prompt))
+                segments.append((cur_events, _assemble_prompt(ev_text)))
                 cur_events = [ev]
                 cur_blocks = [part]
                 cur_len = len(part)
@@ -464,11 +648,7 @@ def segment_job_prompts_with_snapshots(
 
     if cur_blocks:
         ev_text = "\n\n".join(cur_blocks)
-        prompt = (
-            f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>\n\n"
-            f"<untrusted_evidence>\n{ev_text}\n</untrusted_evidence>"
-        )
-        segments.append((cur_events, prompt))
+        segments.append((cur_events, _assemble_prompt(ev_text)))
 
     return segments, snapshot_hashes
 
@@ -630,7 +810,7 @@ def process_claimed_job(
     total_applied = 0
     total_skipped = 0
     has_applied = False
-    satisfied_ledgers: set[str] = set()
+    satisfied_counts: dict[str, int] = {"public": 0, "private": 0, "wander": 0}
 
     if (
         not dry_run
@@ -664,13 +844,18 @@ def process_claimed_job(
         total_applied = max(0, int(cursor.get("total_applied") or 0))
         total_skipped = max(0, int(cursor.get("total_skipped") or 0))
         has_applied = bool(cursor.get("has_applied", total_applied > 0))
-        raw_ledgers = cursor.get("nightly_diary_ledgers")
-        if isinstance(raw_ledgers, list):
-            satisfied_ledgers = {
-                str(x).strip().lower()
-                for x in raw_ledgers
-                if str(x).strip().lower() in ("public", "private")
-            }
+        raw_counts = cursor.get("nightly_diary_counts")
+        if isinstance(raw_counts, dict):
+            for k in ("public", "private", "wander"):
+                satisfied_counts[k] = max(0, int(raw_counts.get(k) or 0))
+        else:
+            raw_ledgers = cursor.get("nightly_diary_ledgers")
+            if isinstance(raw_ledgers, list):
+                if "public" in raw_ledgers:
+                    satisfied_counts["public"] = max(satisfied_counts["public"], 1)
+                if "private" in raw_ledgers:
+                    satisfied_counts["private"] = max(satisfied_counts["private"], 2)
+                    satisfied_counts["wander"] = max(satisfied_counts["wander"], 1)
         raw_digests = cursor.get("earlier_digests")
         earlier_digests_state: list[str] = (
             [str(x) for x in raw_digests] if isinstance(raw_digests, list) else []
@@ -680,7 +865,12 @@ def process_claimed_job(
             [str(x) for x in raw_written] if isinstance(raw_written, list) else []
         )
     else:
-        segments, snapshot_hashes = segment_job_prompts_with_snapshots(config, job, events)
+        segments, snapshot_hashes = segment_job_prompts_with_snapshots(
+            config,
+            job,
+            events,
+            store=store,
+        )
         initial_snapshot_hashes = dict(snapshot_hashes)
         trusted_post_write_hashes = {}
         earlier_digests_state = []
@@ -695,7 +885,7 @@ def process_claimed_job(
                     "total_applied": 0,
                     "total_skipped": 0,
                     "has_applied": False,
-                    "nightly_diary_ledgers": [],
+                    "nightly_diary_counts": dict(satisfied_counts),
                     "earlier_digests": [],
                     "written_notes": [],
                     "snapshot_hashes": snapshot_hashes,
@@ -807,7 +997,9 @@ def process_claimed_job(
                     raise err
                 raise LeaseMismatchError(f"任务 {job.job_id} 后台心跳续约失败: {err}") from err
 
-    multi_nightly = job.job_type == "nightly" and len(segments) > 1
+    is_diary_nightly = job.job_type in ("nightly", "nightly_diary")
+    is_work_nightly = job.job_type == "nightly_work"
+    multi_nightly = job.job_type in ("nightly", "nightly_work") and len(segments) > 1
     earlier_digests: list[str] = list(earlier_digests_state)
     written_notes: list[str] = list(written_notes_state)
 
@@ -826,7 +1018,7 @@ def process_claimed_job(
                 + "（这些笔记本次复盘已经写过。同一条事实不要再新建文件：确有补充就沿用同一主题，"
                 "宁可少写，也不要为了凑数再开一条。）"
             )
-        if multi_nightly and is_last_seg and earlier_digests:
+        if job.job_type == "nightly" and multi_nightly and is_last_seg and earlier_digests:
             seg_prompt = (
                 seg_prompt
                 + "\n\n<earlier_segment_digests>\n"
@@ -834,13 +1026,14 @@ def process_claimed_job(
                 + "\n</earlier_segment_digests>\n"
                 + "（以上是前面几个分段已经整理过的当天轨迹摘要，写整天的公账/私账时一并考虑。）"
             )
+        seg_allow_diary = (not is_work_nightly) and not (job.job_type == "nightly" and multi_nightly and not is_last_seg)
         model_out = _call_model_with_heartbeat(
             seg_prompt,
-            allow_diary=not (multi_nightly and not is_last_seg),
+            allow_diary=seg_allow_diary,
         )
         _refresh_leases()
-        if multi_nightly and not is_last_seg:
-            # 分段轮次不该写日记：即使模型不听话写了，这里也剔掉，避免一天写成七八条流水账。
+        if is_work_nightly or (job.job_type == "nightly" and multi_nightly and not is_last_seg):
+            # nightly_work 与多分段前序分段不允许写日记：代码层强制剔除
             model_out, stripped = _strip_diary_ops(model_out)
             total_skipped += stripped
             digest = ""
@@ -848,16 +1041,23 @@ def process_claimed_job(
                 digest = str(model_out.get("digest") or "").strip().replace("\n", " ")[:200]
             if digest:
                 earlier_digests.append(f"- 分段 {seg_idx + 1}：{digest}")
-        if job.job_type == "nightly" and is_last_seg:
+        elif job.job_type == "nightly_diary":
+            # nightly_diary 通道只做 diary_append：代码层滤掉其它 op
+            model_out, stripped_non_diary = _strip_non_diary_ops(model_out)
+            total_skipped += stripped_non_diary
+        if is_diary_nightly and is_last_seg:
             missing = _missing_nightly_diary_ledgers(
                 model_out,
                 window_id=job.window_id,
-                satisfied=satisfied_ledgers,
+                satisfied_counts=satisfied_counts,
             )
             if missing:
-                retry_prompt = prompt + _nightly_missing_retry_hint(missing, job.window_id)
+                retry_prompt = seg_prompt + _nightly_missing_retry_hint(missing, job.window_id)
                 retry_out = _call_model_with_heartbeat(retry_prompt, allow_compact_retry=False)
                 _refresh_leases()
+                if job.job_type == "nightly_diary":
+                    retry_out, stripped_retry = _strip_non_diary_ops(retry_out)
+                    total_skipped += stripped_retry
                 model_out = _merge_nightly_diary_retry(
                     model_out,
                     retry_out,
@@ -866,7 +1066,7 @@ def process_claimed_job(
                 missing_after = _missing_nightly_diary_ledgers(
                     model_out,
                     window_id=job.window_id,
-                    satisfied=satisfied_ledgers,
+                    satisfied_counts=satisfied_counts,
                 )
                 if missing_after:
                     raise NightlyMissingDiaryError(missing_after)
@@ -895,18 +1095,23 @@ def process_claimed_job(
             repaired = _call_model_with_heartbeat(
                 seg_prompt + "\n\n" + repair_hint,
                 allow_compact_retry=False,
-                allow_diary=not (multi_nightly and not is_last_seg),
+                allow_diary=seg_allow_diary,
             )
             _refresh_leases()
-            if multi_nightly and not is_last_seg:
+            if is_work_nightly or (job.job_type == "nightly" and multi_nightly and not is_last_seg):
                 repaired, stripped2 = _strip_diary_ops(repaired)
+                total_skipped += stripped2
+            elif job.job_type == "nightly_diary":
+                repaired, stripped2 = _strip_non_diary_ops(repaired)
                 total_skipped += stripped2
             model_out = repaired
             summary = _apply_batch(model_out)
-        if job.job_type == "nightly":
-            satisfied_ledgers |= set(
-                _extract_nightly_diary_ops(model_out, window_id=job.window_id).keys()
+        if is_diary_nightly:
+            seg_counts = _count_nightly_diary_ops(
+                _extract_nightly_diary_ops_list(model_out, window_id=job.window_id)
             )
+            for k in ("public", "private", "wander"):
+                satisfied_counts[k] += seg_counts[k]
         if summary.post_write_hashes:
             snapshot_hashes.update(summary.post_write_hashes)
             trusted_post_write_hashes.update(summary.post_write_hashes)
@@ -928,7 +1133,7 @@ def process_claimed_job(
                     "total_applied": total_applied,
                     "total_skipped": total_skipped,
                     "has_applied": has_applied,
-                    "nightly_diary_ledgers": sorted(satisfied_ledgers),
+                    "nightly_diary_counts": dict(satisfied_counts),
                     "earlier_digests": list(earlier_digests),
                     "written_notes": list(written_notes),
                     "snapshot_hashes": snapshot_hashes,
@@ -942,16 +1147,43 @@ def process_claimed_job(
                 },
             )
 
-    if job.job_type == "nightly":
-        missing_final = [l for l in ("public", "private") if l not in satisfied_ledgers]
+    if is_work_nightly and earlier_digests and not dry_run and job.window_id and job.revision is not None:
+        store.set_adapter_cursor(
+            "nightly_work_digests",
+            f"{job.window_id}:rev:{job.revision}",
+            {"digests": list(earlier_digests)},
+        )
+
+    if is_diary_nightly:
+        missing_final: list[str] = []
+        if satisfied_counts["public"] < 1:
+            missing_final.append("public")
+        if satisfied_counts["private"] < 2:
+            missing_final.append("private")
+        if satisfied_counts["wander"] < 1:
+            missing_final.append("wander")
         if missing_final:
             raise NightlyMissingDiaryError(missing_final)
         if not dry_run and job.window_id:
             missing_disk: list[str] = []
-            if not (config.profile_dir / "30_Diary" / "Public" / f"{job.window_id}.md").exists():
+            pub_path = config.profile_dir / "30_Diary" / "Public" / f"{job.window_id}.md"
+            pri_path = config.profile_dir / "30_Diary" / "Private" / f"{job.window_id}.md"
+            pub_lines = (
+                [ln for ln in pub_path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip().startswith("- [")]
+                if pub_path.exists()
+                else []
+            )
+            pri_lines = (
+                [ln for ln in pri_path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip().startswith("- [")]
+                if pri_path.exists()
+                else []
+            )
+            if len(pub_lines) < 1:
                 missing_disk.append("public")
-            if not (config.profile_dir / "30_Diary" / "Private" / f"{job.window_id}.md").exists():
+            if len(pri_lines) < 2:
                 missing_disk.append("private")
+            if not any("[wander]" in ln for ln in pri_lines):
+                missing_disk.append("wander")
             if missing_disk:
                 raise NightlyMissingDiaryError(missing_disk)
 
@@ -1013,7 +1245,7 @@ def run_worker_once(
                 summary=summary_payload,
             )
             # 先写复盘结果，再依次跑夜间小节体检与归档；异常绝不把已成功的复盘改成失败。
-            if job.job_type == "nightly" and config.memory.proactive.section_audit_enabled:
+            if job.job_type in ("nightly", "nightly_work") and config.memory.proactive.section_audit_enabled:
                 try:
                     run_section_audit(
                         config,
@@ -1030,7 +1262,7 @@ def run_worker_once(
                         )
                     except Exception:
                         pass
-            if job.job_type == "nightly" and config.memory.proactive.archive_enabled:
+            if job.job_type in ("nightly", "nightly_work") and config.memory.proactive.archive_enabled:
                 try:
                     eff_clock = clock or SystemClock()
                     now_utc = ensure_utc(eff_clock.now_utc())

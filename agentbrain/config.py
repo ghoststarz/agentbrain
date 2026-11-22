@@ -129,6 +129,10 @@ class ProactiveConfig:
     section_audit_enabled: bool = False
     section_audit_min_similarity: float = 0.45
     section_audit_max_files: int = 3
+    nightly_recent_diary_days: int = 3
+    nightly_recent_diary_max_chars: int = 4000
+    nightly_split_enabled: bool = True
+    nightly_split_threshold_chars: int = 0
 
 
 _VALID_MODEL_BACKENDS = frozenset({"", "auto", "hermes", "openai_compatible"})
@@ -382,6 +386,10 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
         section_audit_enabled=section_audit_enabled,
         section_audit_min_similarity=section_audit_min_similarity,
         section_audit_max_files=section_audit_max_files,
+        nightly_recent_diary_days=max(0, int(proactive_raw.get("nightly_recent_diary_days", 3))),
+        nightly_recent_diary_max_chars=max(0, int(proactive_raw.get("nightly_recent_diary_max_chars", 4000))),
+        nightly_split_enabled=_require_bool(proactive_raw, "nightly_split_enabled", True),
+        nightly_split_threshold_chars=max(0, int(proactive_raw.get("nightly_split_threshold_chars", 0))),
     )
     if enabled:
         validate_proactive_worker_config(proactive)

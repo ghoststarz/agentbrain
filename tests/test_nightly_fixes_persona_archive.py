@@ -104,7 +104,8 @@ def test_req1_oversized_event_splits_deterministically_without_raising(tmp_path:
         tmp_path,
         proactive=ProactiveConfig(
             enabled=True,
-            model_max_context_chars=2400,
+            # 系统提示词开销约 2.2k 字，2400 的预算连一个分段都装不下；本用例要的是「超长事件确定性切分」
+            model_max_context_chars=4000,
             max_payload_chars=16000,
         ),
     )
@@ -562,9 +563,18 @@ def test_req6_nightly_archive_failure_does_not_fail_review(
                     {
                         "op_type": "diary_append",
                         "ledger": "private",
+                        "kind": "daily",
                         "event_date": "2026-11-19",
                         "content": "把归档放在 ack 之后心里踏实多了，至少不会因为磁盘小毛病丢掉一整天的记忆整理。",
                         "source_refs": ["nf-1"],
+                    },
+                    {
+                        "op_type": "diary_append",
+                        "ledger": "private",
+                        "kind": "wander",
+                        "event_date": "2026-11-19",
+                        "content": "忽然想到老笔记归档之后如果哪天想翻出来看，留一条轻一点的索引好像也挺省心。",
+                        "source_refs": [],
                     },
                 ],
             },
@@ -718,7 +728,11 @@ def test_req1_multisegment_nightly_writes_exactly_one_diary_per_ledger(tmp_path:
     clock = ManualClock(dt.datetime(2026, 11, 18, 2, 0, tzinfo=dt.timezone.utc), tz=tz)
     cfg = _make_cfg(
         tmp_path / "multi_nightly",
-        proactive=ProactiveConfig(enabled=True, model_max_context_chars=8000),
+        proactive=ProactiveConfig(
+            enabled=True,
+            model_max_context_chars=8000,
+            nightly_split_enabled=False,
+        ),
     )
     store = ProactiveStore.from_app_config(cfg, clock=clock)
     for i in range(1, 6):
@@ -790,9 +804,18 @@ def test_req1_multisegment_nightly_writes_exactly_one_diary_per_ledger(tmp_path:
                     {
                         "op_type": "diary_append",
                         "ledger": "private",
+                        "kind": "daily",
                         "event_date": "2026-11-19",
                         "content": "写整天的账比写零碎的分段踏实，至少不用重复讲三遍同一件事。",
                         "source_refs": [ref],
+                    },
+                    {
+                        "op_type": "diary_append",
+                        "ledger": "private",
+                        "kind": "wander",
+                        "event_date": "2026-11-19",
+                        "content": "晚上安静下来时总觉得，把零散念头单独记一笔比硬塞进复盘里舒服多了。",
+                        "source_refs": [],
                     },
                 ],
             },
@@ -812,7 +835,8 @@ def test_req1_multisegment_nightly_writes_exactly_one_diary_per_ledger(tmp_path:
     public_text = (cfg.profile_dir / "30_Diary" / "Public" / "2026-11-19.md").read_text(encoding="utf-8")
     private_text = (cfg.profile_dir / "30_Diary" / "Private" / "2026-11-19.md").read_text(encoding="utf-8")
     assert public_text.count("- [") == 1, public_text
-    assert private_text.count("- [") == 1, private_text
+    assert private_text.count("- [") == 2, private_text
+    assert "[wander]" in private_text
     assert "分段轮次里不该出现" not in public_text
 
 

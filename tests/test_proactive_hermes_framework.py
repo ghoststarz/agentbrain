@@ -232,7 +232,8 @@ def test_hermes_timeout_triggers_retry_wait_and_budget_enforced(
             hermes_agent_dir=str(agent_dir),
             hermes_python=sys.executable,
             model_timeout_seconds=5.0,
-            model_max_context_chars=2400,
+            # 系统提示词开销约 2.2k 字：预算低于它时任何事件都塞不下（不是本用例要测的场景）
+            model_max_context_chars=4000,
         ),
     )
     store = ProactiveStore.from_app_config(cfg, clock=ManualClock(dt.datetime(2026, 11, 17, 6, 30, 0, tzinfo=dt.timezone.utc)))

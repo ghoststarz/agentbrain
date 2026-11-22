@@ -87,6 +87,7 @@ JOB_STATUS_RETRY_WAIT = "retry_wait"
 JOB_STATUS_SUCCEEDED = "succeeded"
 JOB_STATUS_DEAD = "dead"
 ACTIVE_JOB_STATUSES = (JOB_STATUS_PENDING, JOB_STATUS_RUNNING, JOB_STATUS_RETRY_WAIT)
+NIGHTLY_JOB_TYPES = ("nightly", "nightly_work", "nightly_diary")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS scheduler_meta (
@@ -400,10 +401,12 @@ class ProactiveStore:
         *,
         config: ProactiveConfig | None = None,
         clock: Clock | None = None,
+        app_config: AppConfig | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.config = config or ProactiveConfig()
         self.clock: Clock = clock or SystemClock()
+        self._app_config: AppConfig | None = app_config
         self.init_db()
 
     @classmethod
@@ -419,6 +422,7 @@ class ProactiveStore:
             app_config.proactive_db_path,
             config=app_config.memory.proactive,
             clock=clock,
+            app_config=app_config,
         )
 
     @contextlib.contextmanager
@@ -846,17 +850,18 @@ class ProactiveStore:
                                 now_utc.isoformat(),
                             ),
                         )
-                        if self._enqueue_nightly_job(
+                        jobs_created += self._enqueue_nightly_jobs_for_window(
                             conn,
                             window_id=spec.window_id,
                             revision=1,
+                            window_start_us=spec.start_us,
+                            window_end_us=spec.end_us,
                             since_event_id=0,
                             until_event_id=max_id,
                             event_count=cnt,
                             now_utc=now_utc,
                             now_us=now_us,
-                        ):
-                            jobs_created += 1
+                        )
                 cur_date += dt.timedelta(days=1)
 
             # 2. 检查所有已记录窗口是否有迟到导入的新证据（id > watermark_event_id）
@@ -899,26 +904,27 @@ class ProactiveStore:
                     (new_status, new_rev, new_max_id, now_utc.isoformat(), win_id),
                 )
                 windows_reopened += 1
-                if self._enqueue_nightly_job(
+                jobs_created += self._enqueue_nightly_jobs_for_window(
                     conn,
                     window_id=win_id,
                     revision=new_rev,
+                    window_start_us=int(win["window_start_us"]),
+                    window_end_us=int(win["window_end_us"]),
                     since_event_id=watermark,
                     until_event_id=new_max_id,
                     event_count=late_cnt,
                     now_utc=now_utc,
                     now_us=now_us,
-                ):
-                    jobs_created += 1
+                )
 
             # 3. 兜底补齐：窗口存在、当前 revision 还没完成
-            #    3a) 若同 window_id + 同 last_revision 的 nightly 任务处于 dead，则原位复位为 pending
+            #    3a) 若同 window_id + 同 last_revision 的某路 nightly 任务处于 dead，则只原位复位失败的那一路为 pending
             dead_nightly = conn.execute(
                 """
-                SELECT j.id, j.window_id, j.revision, j.last_error
+                SELECT j.id, j.job_type, j.window_id, j.revision, j.last_error
                 FROM nightly_windows nw
                 JOIN jobs j
-                  ON j.job_type = 'nightly'
+                  ON j.job_type IN ('nightly', 'nightly_work', 'nightly_diary')
                  AND j.window_id = nw.window_id
                  AND j.revision = nw.last_revision
                  AND j.status = 'dead'
@@ -926,7 +932,7 @@ class ProactiveStore:
                   AND nw.status IN ('pending', 'scheduled', 'reopened')
                   AND NOT EXISTS (
                       SELECT 1 FROM jobs j2
-                      WHERE j2.job_type = 'nightly'
+                      WHERE j2.job_type = j.job_type
                         AND j2.window_id = nw.window_id
                         AND j2.revision = nw.last_revision
                         AND j2.status != 'dead'
@@ -936,6 +942,7 @@ class ProactiveStore:
             ).fetchall()
             for drow in dead_nightly:
                 dead_job_id = int(drow["id"])
+                dead_job_type = str(drow["job_type"])
                 cur = conn.execute(
                     """
                     UPDATE jobs
@@ -962,7 +969,7 @@ class ProactiveStore:
                             job_id, client, session_id, job_type, outcome,
                             applied_count, categories_json, error_summary,
                             created_at_utc, created_at_us
-                        ) VALUES (?, 'nightly', '', 'nightly', 'retrying_after_dead', 0, '{}', ?, ?, ?)
+                        ) VALUES (?, 'nightly', '', ?, 'retrying_after_dead', 0, '{}', ?, ?, ?)
                         ON CONFLICT(job_id) DO UPDATE SET
                             client = excluded.client,
                             session_id = excluded.session_id,
@@ -977,7 +984,7 @@ class ProactiveStore:
                             delivered_to_client = NULL,
                             delivered_to_session_id = NULL
                         """,
-                        (dead_job_id, err_summary, now_utc.isoformat(), now_us),
+                        (dead_job_id, dead_job_type, err_summary, now_utc.isoformat(), now_us),
                     )
                     windows_requeued_dead += 1
 
@@ -991,7 +998,7 @@ class ProactiveStore:
                   AND nw.status IN ('pending', 'scheduled', 'reopened')
                   AND NOT EXISTS (
                       SELECT 1 FROM jobs j
-                      WHERE j.job_type = 'nightly'
+                      WHERE j.job_type IN ('nightly', 'nightly_work', 'nightly_diary')
                         AND j.window_id = nw.window_id
                         AND j.revision = nw.last_revision
                         AND j.status != 'dead'
@@ -1017,17 +1024,79 @@ class ProactiveStore:
                 cnt = int(stats["cnt"]) if stats is not None else 0
                 if cnt == 0:
                     continue
-                if self._enqueue_nightly_job(
+                jobs_created += self._enqueue_nightly_jobs_for_window(
                     conn,
                     window_id=win_id,
                     revision=rev,
+                    window_start_us=int(win["window_start_us"]),
+                    window_end_us=int(win["window_end_us"]),
                     since_event_id=0,
                     until_event_id=watermark,
                     event_count=cnt,
                     now_utc=now_utc,
                     now_us=now_us,
-                ):
-                    jobs_created += 1
+                )
+
+            #    3c) 若拆分窗口只存在两路中的一路（另一路任务行丢失），仅补插缺失的那一路（成功路靠幂等键跳过）。
+            partial_splits = conn.execute(
+                """
+                SELECT nw.window_id, nw.last_revision, nw.watermark_event_id,
+                       nw.window_start_us, nw.window_end_us
+                FROM nightly_windows nw
+                WHERE nw.last_revision > nw.completed_revision
+                  AND nw.status IN ('pending', 'scheduled', 'reopened')
+                  AND EXISTS (
+                      SELECT 1 FROM jobs j
+                      WHERE j.job_type IN ('nightly_work', 'nightly_diary')
+                        AND j.window_id = nw.window_id
+                        AND j.revision = nw.last_revision
+                  )
+                ORDER BY nw.window_end_us ASC, nw.window_id ASC
+                """
+            ).fetchall()
+            for win in partial_splits:
+                win_id = str(win["window_id"])
+                rev = int(win["last_revision"])
+                watermark = int(win["watermark_event_id"] or 0)
+                existing_types = {
+                    str(r["job_type"])
+                    for r in conn.execute(
+                        """
+                        SELECT job_type FROM jobs
+                        WHERE job_type IN ('nightly_work', 'nightly_diary')
+                          AND window_id = ? AND revision = ?
+                        """,
+                        (win_id, rev),
+                    ).fetchall()
+                }
+                missing_types = [jt for jt in ("nightly_work", "nightly_diary") if jt not in existing_types]
+                if not missing_types:
+                    continue
+                stats = conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM events
+                    WHERE qualifies_nightly = 1
+                      AND occurred_at_us >= ?
+                      AND occurred_at_us < ?
+                      AND id <= ?
+                    """,
+                    (int(win["window_start_us"]), int(win["window_end_us"]), watermark),
+                ).fetchone()
+                cnt = int(stats["cnt"]) if stats is not None else 0
+                for jt in missing_types:
+                    if self._enqueue_nightly_job(
+                        conn,
+                        window_id=win_id,
+                        revision=rev,
+                        since_event_id=0,
+                        until_event_id=watermark,
+                        event_count=cnt,
+                        now_utc=now_utc,
+                        now_us=now_us,
+                        job_type=jt,
+                    ):
+                        jobs_created += 1
 
         return TickResult(
             windows_checked=windows_checked,
@@ -1035,6 +1104,161 @@ class ProactiveStore:
             jobs_created=jobs_created,
             windows_reopened=windows_reopened,
             windows_requeued_dead=windows_requeued_dead,
+        )
+
+    def _load_window_events_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        window_start_us: int,
+        window_end_us: int,
+    ) -> list[StoredEvent]:
+        rows = conn.execute(
+            """
+            SELECT * FROM events
+            WHERE qualifies_nightly = 1
+              AND occurred_at_us >= ?
+              AND occurred_at_us < ?
+            ORDER BY occurred_at_us ASC, id ASC
+            """,
+            (window_start_us, window_end_us),
+        ).fetchall()
+        events = [self._row_to_event(r) for r in rows]
+        if not events:
+            return events
+        row_ids = [ev.row_id for ev in events]
+        placeholders = ",".join("?" for _ in row_ids)
+        chunk_rows = conn.execute(
+            f"""
+            SELECT event_row_id, content FROM event_chunks
+            WHERE event_row_id IN ({placeholders})
+            ORDER BY event_row_id ASC, chunk_index ASC
+            """,
+            row_ids,
+        ).fetchall()
+        if not chunk_rows:
+            return events
+        by_row: dict[int, list[str]] = {}
+        for cr in chunk_rows:
+            by_row.setdefault(int(cr["event_row_id"]), []).append(str(cr["content"]))
+        reassembled: list[StoredEvent] = []
+        for ev in events:
+            parts = by_row.get(ev.row_id)
+            if parts:
+                reassembled.append(
+                    StoredEvent(
+                        row_id=ev.row_id,
+                        client=ev.client,
+                        session_id=ev.session_id,
+                        event_id=ev.event_id,
+                        event_kind=ev.event_kind,
+                        countable=ev.countable,
+                        qualifies_nightly=ev.qualifies_nightly,
+                        turn_seq=ev.turn_seq,
+                        occurred_at_utc=ev.occurred_at_utc,
+                        occurred_at_us=ev.occurred_at_us,
+                        content="".join(parts),
+                        content_truncated=ev.content_truncated,
+                        meta=ev.meta,
+                    )
+                )
+            else:
+                reassembled.append(ev)
+        return reassembled
+
+    def _should_split_nightly_window(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        window_id: str,
+        window_start_us: int,
+        window_end_us: int,
+        event_count: int,
+    ) -> bool:
+        """判断夜间窗口组装后的总上下文是否超过拆分阈值（仅在过长时拆成 work + diary 两路）。"""
+        if not self.config.nightly_split_enabled or event_count <= 0:
+            return False
+        threshold = (
+            int(self.config.nightly_split_threshold_chars)
+            if int(self.config.nightly_split_threshold_chars) > 0
+            else int(self.config.model_max_context_chars * 0.85)
+        )
+        if threshold <= 0:
+            return False
+        events = self._load_window_events_tx(
+            conn,
+            window_start_us=window_start_us,
+            window_end_us=window_end_us,
+        )
+        if not events:
+            return False
+        if self._app_config is not None:
+            try:
+                from agentbrain.proactive_worker import estimate_nightly_context_chars
+
+                total_chars = estimate_nightly_context_chars(
+                    self._app_config,
+                    window_id=window_id,
+                    events=events,
+                )
+                return total_chars > threshold
+            except Exception:
+                pass
+        # 降级估算（无 app_config 的纯 Stage 1 单测场景）
+        ev_chars = sum(len(ev.content) + 120 for ev in events)
+        return (ev_chars + 2000) > threshold
+
+    def _enqueue_nightly_jobs_for_window(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        window_id: str,
+        revision: int,
+        window_start_us: int,
+        window_end_us: int,
+        since_event_id: int,
+        until_event_id: int,
+        event_count: int,
+        now_utc: dt.datetime,
+        now_us: int,
+    ) -> int:
+        """按上下文长度决定入队单任务 nightly，或并行拆分为 nightly_work + nightly_diary。"""
+        if self._should_split_nightly_window(
+            conn,
+            window_id=window_id,
+            window_start_us=window_start_us,
+            window_end_us=window_end_us,
+            event_count=event_count,
+        ):
+            created = 0
+            for jt in ("nightly_work", "nightly_diary"):
+                if self._enqueue_nightly_job(
+                    conn,
+                    window_id=window_id,
+                    revision=revision,
+                    since_event_id=since_event_id,
+                    until_event_id=until_event_id,
+                    event_count=event_count,
+                    now_utc=now_utc,
+                    now_us=now_us,
+                    job_type=jt,
+                ):
+                    created += 1
+            return created
+        return (
+            1
+            if self._enqueue_nightly_job(
+                conn,
+                window_id=window_id,
+                revision=revision,
+                since_event_id=since_event_id,
+                until_event_id=until_event_id,
+                event_count=event_count,
+                now_utc=now_utc,
+                now_us=now_us,
+                job_type="nightly",
+            )
+            else 0
         )
 
     def _enqueue_nightly_job(
@@ -1048,8 +1272,15 @@ class ProactiveStore:
         event_count: int,
         now_utc: dt.datetime,
         now_us: int,
+        job_type: str = "nightly",
     ) -> bool:
-        idem_key = f"nightly:{window_id}:rev:{revision}"
+        if job_type == "nightly_work":
+            idem_key = f"nightly:{window_id}:rev:{revision}:work"
+        elif job_type == "nightly_diary":
+            idem_key = f"nightly:{window_id}:rev:{revision}:diary"
+        else:
+            job_type = "nightly"
+            idem_key = f"nightly:{window_id}:rev:{revision}"
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO jobs (
@@ -1057,10 +1288,11 @@ class ProactiveStore:
                 window_id, revision, since_event_id, until_event_id,
                 event_count, attempts, max_attempts,
                 created_at_utc, created_at_us
-            ) VALUES (?, 'nightly', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 idem_key,
+                job_type,
                 JOB_STATUS_PENDING,
                 window_id,
                 revision,
@@ -1132,10 +1364,10 @@ class ProactiveStore:
               )
           )
           AND (
-              j.job_type != 'nightly'
+              j.job_type NOT IN ('nightly', 'nightly_work', 'nightly_diary')
               OR NOT EXISTS (
                   SELECT 1 FROM jobs prev
-                  WHERE prev.job_type = 'nightly'
+                  WHERE prev.job_type IN ('nightly', 'nightly_work', 'nightly_diary')
                     AND prev.status != 'succeeded'
                     AND (
                         prev.window_id < j.window_id
@@ -1334,22 +1566,34 @@ class ProactiveStore:
                         str(row["session_id"]),
                     ),
                 )
-            elif row["job_type"] == "nightly":
+            elif row["job_type"] in NIGHTLY_JOB_TYPES:
                 win_id = str(row["window_id"])
                 rev = int(row["revision"])
-                conn.execute(
+                # 只有该窗口该 revision 的全部 nightly 任务（按 job_type 分组）都 succeeded 才推进完成度
+                pending_row = conn.execute(
                     """
-                    UPDATE nightly_windows
-                    SET completed_revision = MAX(completed_revision, ?),
-                        status = CASE
-                            WHEN last_revision <= MAX(completed_revision, ?) THEN 'completed'
-                            ELSE status
-                        END,
-                        updated_at_utc = ?
-                    WHERE window_id = ?
+                    SELECT COUNT(*) AS cnt FROM jobs
+                    WHERE job_type IN ('nightly', 'nightly_work', 'nightly_diary')
+                      AND window_id = ?
+                      AND revision = ?
+                      AND status != 'succeeded'
                     """,
-                    (rev, rev, now_utc.isoformat(), win_id),
-                )
+                    (win_id, rev),
+                ).fetchone()
+                if pending_row is not None and int(pending_row["cnt"]) == 0:
+                    conn.execute(
+                        """
+                        UPDATE nightly_windows
+                        SET completed_revision = MAX(completed_revision, ?),
+                            status = CASE
+                                WHEN last_revision <= MAX(completed_revision, ?) THEN 'completed'
+                                ELSE status
+                            END,
+                            updated_at_utc = ?
+                        WHERE window_id = ?
+                        """,
+                        (rev, rev, now_utc.isoformat(), win_id),
+                    )
 
             cat_rows = conn.execute(
                 "SELECT op_type, COUNT(*) AS cnt FROM proactive_applied_ops WHERE job_id = ? GROUP BY op_type",
@@ -1359,7 +1603,9 @@ class ProactiveStore:
             applied_total = sum(categories.values())
             if applied_total == 0 and isinstance(summary, dict):
                 applied_total = int(summary.get("applied") or 0)
-            receipt_client = display_client_id(str(row["client"] or ("nightly" if row["job_type"] == "nightly" else "")))
+            receipt_client = display_client_id(
+                str(row["client"] or ("nightly" if row["job_type"] in NIGHTLY_JOB_TYPES else ""))
+            )
             receipt_session = str(row["session_id"] or "")
             conn.execute(
                 """
@@ -1466,7 +1712,9 @@ class ProactiveStore:
                         "DELETE FROM adapter_cursors WHERE adapter_name = 'worker_segment' AND source_key = ?",
                         (f"job_segment_progress:{job_id}",),
                     )
-                receipt_client = display_client_id(str(row["client"] or ("nightly" if row["job_type"] == "nightly" else "")))
+                receipt_client = display_client_id(
+                    str(row["client"] or ("nightly" if row["job_type"] in NIGHTLY_JOB_TYPES else ""))
+                )
                 receipt_session = str(row["session_id"] or "")
                 safe_err = redact_secrets(bounded_err)[:160]
                 conn.execute(
@@ -1525,7 +1773,7 @@ class ProactiveStore:
                 WHERE delivered_at_utc IS NULL
                   AND (
                       (job_type = 'incremental' AND client = ? AND session_id = ?)
-                      OR job_type = 'nightly'
+                      OR job_type IN ('nightly', 'nightly_work', 'nightly_diary')
                   )
                 ORDER BY id ASC
                 """,
@@ -1579,7 +1827,7 @@ class ProactiveStore:
                   AND delivered_at_utc IS NULL
                   AND (
                       (job_type = 'incremental' AND client = ? AND session_id = ?)
-                      OR job_type = 'nightly'
+                      OR job_type IN ('nightly', 'nightly_work', 'nightly_diary')
                   )
                 """,
                 (now_utc, eff_client, eff_session, *clean_ids, eff_client, eff_session),

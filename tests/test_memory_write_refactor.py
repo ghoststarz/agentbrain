@@ -521,7 +521,16 @@ def test_6_idle_nightly_always_diary_true_vs_false(tmp_path: Path) -> None:
                 {
                     "op_type": "diary_append",
                     "ledger": "private",
+                    "kind": "daily",
                     "content": "难得一整天安安静静的，没有消息打断，倒挺适合把之前没想透的架构细节慢慢复盘一遍。",
+                    "event_date": "2026-11-20",
+                    "source_refs": [],
+                },
+                {
+                    "op_type": "diary_append",
+                    "ledger": "private",
+                    "kind": "wander",
+                    "content": "忽然琢磨起一个念头：以后要不要给不同的项目笔记配一套更轻的关键词索引，翻起来会顺手很多。",
                     "event_date": "2026-11-20",
                     "source_refs": [],
                 },
@@ -534,7 +543,7 @@ def test_6_idle_nightly_always_diary_true_vs_false(tmp_path: Path) -> None:
     res = run_worker_once(cfg_on, store_on, clock=clock1, hermes_runner=fake_idle_runner)
     assert res is not None
     assert res.outcome == "applied"
-    assert res.applied_count == 2
+    assert res.applied_count == 3
     assert len(seen_prompts) == 1
     assert "严禁编造用户当天做过什么" in seen_prompts[0][0]
     assert "本窗口没有任何新对话" in seen_prompts[0][1]
@@ -630,13 +639,13 @@ def test_7_recall_audit_and_inject_noise_suppression(tmp_path: Path, monkeypatch
 
 
 def test_8_session_links_point_back_to_source_session(tmp_path: Path) -> None:
-    """非日记笔记要用 Obsidian 双链指向来源会话；会话索引不进检索。"""
+    """非日记笔记的 ## 来源直接写纯文本完整 session id，不生成 40_Sessions stub；历史 40_Sessions 仍不进索引。"""
     from agentbrain.index import reindex
 
     tz = dt.timezone(dt.timedelta(hours=8))
     clock = ManualClock(dt.datetime(2026, 11, 21, 6, 0, tzinfo=dt.timezone.utc), tz=tz)
     cfg = _make_cfg(tmp_path)
-    sid = "local-0123456789abcdef0123456789abcdef"
+    sid = "local-57579c0b1234567890abcdef1234567890abcdef1234567890abcdef12345678"
     store, job, events = _seed_claimed_job(
         cfg, clock, session_id=sid, event_ids=("ev1", "ev2", "ev3", "ev4", "ev5")
     )
@@ -654,7 +663,7 @@ def test_8_session_links_point_back_to_source_session(tmp_path: Path) -> None:
                     "op_type": "longterm_upsert",
                     "note_type": "fact",
                     "title": "会话出处可点",
-                    "content": "这条结论要能点回它来自哪次对话。",
+                    "content": "这条结论要能定位它来自哪次对话。",
                     "source_refs": [ref],
                 }
             ],
@@ -665,20 +674,45 @@ def test_8_session_links_point_back_to_source_session(tmp_path: Path) -> None:
 
     note_path = next((cfg.profile_dir / "20_LongTerm" / "Facts").glob("FACT-*-会话出处可点.md"))
     note_text = note_path.read_text(encoding="utf-8")
-    stub = cfg.profile_dir / "40_Sessions" / f"S-{sid.split('-', 1)[1][:8]}.md"
-    assert stub.exists(), "必须生成会话索引笔记"
+    assert not (cfg.profile_dir / "40_Sessions").exists(), "不应再创建 40_Sessions stub 目录"
     assert "## 来源" in note_text
-    assert f"[[{stub.stem}]]" in note_text
-    assert sid in note_text  # 完整会话号也留在正文里，方便定位
+    expected_line = f"- 来源：hermes 会话 {sid}"
+    assert expected_line in note_text
+    assert "[[S-" not in note_text
 
-    stub_text = stub.read_text(encoding="utf-8")
-    assert sid in stub_text
-    assert f"[[{note_path.stem}]]" in stub_text
+    # 幂等再写一次（同 session 新内容更新小节）不重复追加同一来源行
+    summary2 = validate_and_apply_batch(
+        cfg,
+        store,
+        job,
+        events,
+        {
+            "outcome": "operations",
+            "operations": [
+                {
+                    "op_type": "longterm_upsert",
+                    "note_type": "fact",
+                    "title": "会话出处可点",
+                    "content": "补充一句说明，来源行不能重复。",
+                    "source_refs": [f"hermes:{sid}:ev2"],
+                }
+            ],
+        },
+        clock=clock,
+    )
+    assert summary2.applied_count == 1
+    note_text_after = note_path.read_text(encoding="utf-8")
+    assert note_text_after.count(expected_line) == 1
+    assert not (cfg.profile_dir / "40_Sessions").exists()
 
+    # 若历史 40_Sessions 目录存在，仍被 NEVER_INDEX_DIRS 排除，不进入检索索引
+    legacy_dir = cfg.profile_dir / "40_Sessions"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_dir / "S-legacy01.md").write_text("# legacy\n", encoding="utf-8")
     stats = reindex(cfg)
     assert stats.total_notes > 0
     from agentbrain.index import connect_db
 
     with connect_db(cfg.broker.db_path) as conn:
         hit = conn.execute("SELECT COUNT(*) FROM notes WHERE path LIKE '40_Sessions/%'").fetchone()[0]
-    assert hit == 0, "会话索引不能进检索索引"
+    assert hit == 0, "历史 40_Sessions 目录不能进检索索引"

@@ -134,8 +134,8 @@ def create_mcp_server(config: AppConfig, client_id: str = "codex") -> MCPServer:
         )
 
     @mcp.tool(name="diary_append", description="Append an entry to public or private diary ledger", annotations=_rw_append)
-    def diary_append(ledger: str, content: str) -> str:
-        return _to_json(service.diary({"action": "append", "ledger": ledger, "content": content}, identity=identity))
+    def diary_append(ledger: str, content: str, kind: str = "daily") -> str:
+        return _to_json(service.diary({"action": "append", "ledger": ledger, "content": content, "kind": kind}, identity=identity))
 
     @mcp.tool(name="diary_read", description="Read recent days from public or private diary ledger", annotations=_ro)
     def diary_read(ledger: str = "public", recent_days: int = 3) -> str:

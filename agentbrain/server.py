@@ -743,6 +743,7 @@ class BrokerService:
                         ledger=ledger,
                         content=str(payload.get("content") or ""),
                         author=identity.display_source,
+                        kind=str(payload.get("kind") or "daily"),
                         can_casual=identity.can_casual,
                     )
                 # 日记正文不进检索、不进 boot，但「今日日记」那一行状态会写进
