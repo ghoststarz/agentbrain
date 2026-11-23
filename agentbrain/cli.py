@@ -186,6 +186,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_rrec = sub.add_parser("review-reconcile-countable", help="一次性幂等收敛历史可计数口径与轮次水位")
     p_rrec.add_argument("--force", action="store_true", help="强制重新扫描并收敛（忽略已迁移标记）")
 
+    p_rc = sub.add_parser("resolve-conflicts", help="对 git rebase 冲突后的工作树执行确定性裁决（不调用模型与 git）")
+    p_rc.add_argument("--vault", required=True, help="Vault 根目录路径")
+    p_rc.add_argument("--dry-run", action="store_true", help="试运行：仅打印裁决计划，不写盘")
+    p_rc.add_argument("--files", nargs="*", default=None, help="可选：待裁决的相对路径列表（省略时自动扫描含冲突标记的文件）")
+    p_rc.add_argument("--notices-path", default=None, help="可选：自定义 notices.jsonl 路径")
+    p_rc.add_argument("--no-notices", action="store_true", help="不写入 notices.jsonl")
+    p_rc.add_argument(
+        "--out",
+        default=None,
+        help="可选：把结果 JSON 以 UTF-8 写入该文件（PowerShell 调起时用它，绕开控制台编码）",
+    )
+
     register_serve_subparsers(sub)
     return parser
 
@@ -199,6 +211,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(args_list)
+
+    if args.command == "resolve-conflicts":
+        from agentbrain.conflicts import resolve_conflicts
+
+        res = resolve_conflicts(
+            Path(args.vault),
+            rel_paths=args.files,
+            dry_run=bool(args.dry_run),
+            profile=args.profile,
+            notices_path=Path(args.notices_path) if args.notices_path else None,
+            write_notices=not bool(args.no_notices),
+        )
+        payload = json.dumps(res, ensure_ascii=False, indent=2)
+        out_path = getattr(args, "out", None)
+        if out_path:
+            target = Path(out_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(payload + "\n", encoding="utf-8")
+            # stdout 只留 ASCII：PowerShell 侧按 UA/ANSI 解码中文会乱码
+            print(f"written {target}")
+        else:
+            print(payload)
+        return 0
+
     config = load_config(broker_path=args.config, profile=args.profile)
 
     if args.command == "init":

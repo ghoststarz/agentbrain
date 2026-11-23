@@ -743,6 +743,14 @@ class ProactiveStore:
 
     def tick(self, *, include_historical: bool = False) -> TickResult:
         """在启动或定时 tick 时按时间顺序追平已关闭夜间窗口并检测迟到数据。"""
+        if not self.config.nightly_enabled:
+            return TickResult(
+                windows_checked=0,
+                windows_skipped_empty=0,
+                jobs_created=0,
+                windows_reopened=0,
+                windows_requeued_dead=0,
+            )
         now_utc = ensure_utc(self.clock.now_utc())
         now_us = dt_to_us(now_utc)
         hour = self.config.nightly_hour

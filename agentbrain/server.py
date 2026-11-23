@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from agentbrain.acl import AuthError, AuthIdentity, authenticate_bearer, display_client_id
 from agentbrain.atomic import atomic_write_text
 from agentbrain.config import AppConfig
+from agentbrain.conflicts import ack_notices, list_pending_notices
 from agentbrain.diary import DiaryGateError, append_diary, read_diary, today_diary_status
 from agentbrain.handoff import read_handoff, upsert_handoff
 from agentbrain.index import connect_db, reindex
@@ -276,6 +277,26 @@ class BrokerService:
         except Exception as exc:  # noqa: BLE001
             _logger.debug("failed to write recall audit (ignored): %s", exc)
 
+    def _notices_path(self) -> Path:
+        return self.config.broker.state_dir / "notices.jsonl"
+
+    def _pending_notices(self, *, limit: int = 3) -> list[dict[str, Any]]:
+        try:
+            return list_pending_notices(self._notices_path(), limit=limit)
+        except Exception as exc:  # noqa: BLE001 —— fail-open
+            _logger.debug("failed to read pending notices (ignored): %s", exc)
+            return []
+
+    def notices_ack(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """标记同步/冲突回执已投递。"""
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list):
+            raise ServiceError(400, "invalid_request", "ids list is required")
+        ids = [str(x).strip() for x in raw_ids if str(x).strip()]
+        with self._write_lock:
+            acked = ack_notices(self._notices_path(), ids)
+        return {"ok": True, "acked": acked}
+
     def search(
         self,
         payload: dict[str, Any],
@@ -313,6 +334,9 @@ class BrokerService:
                 final_hits=list(result.get("hits") or []),
                 revision=revision,
             )
+            pending_notices = self._pending_notices(limit=3)
+            if pending_notices:
+                result["notices"] = pending_notices
             return result
 
         cd_key = (client_id, session_id)
@@ -360,6 +384,9 @@ class BrokerService:
             )
             if receipts:
                 result["review_receipts"] = receipts
+        pending_notices = self._pending_notices(limit=3)
+        if pending_notices:
+            result["notices"] = pending_notices
         return result
 
     def read_note(
@@ -1115,6 +1142,9 @@ class BrokerHTTPHandler(BaseHTTPRequestHandler):
                     return
                 if path == "/v1/review/receipts/ack":
                     self._send_json(200, svc.review_receipts_ack(payload, identity=identity))
+                    return
+                if path == "/v1/notices/ack":
+                    self._send_json(200, svc.notices_ack(payload))
                     return
 
             self._send_json(404, {"error": "not_found", "path": path})

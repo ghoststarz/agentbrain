@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,8 @@ class BrokerConfig:
     # （测试、第二份 vault、只读副本）都会写到真实的用户目录里，
     # 把真人格的 GEMINI.md 覆盖成测试夹具。
     agy_rules_path: Path | None = None
+    # 可选的机器本地覆盖配置路径；为 None 时默认取 broker.yaml 同目录下的 memory.local.yaml。
+    memory_local_path: Path | None = None
 
     @property
     def db_path(self) -> Path:
@@ -133,6 +135,10 @@ class ProactiveConfig:
     nightly_recent_diary_max_chars: int = 4000
     nightly_split_enabled: bool = True
     nightly_split_threshold_chars: int = 0
+    nightly_enabled: bool = True
+
+
+_KNOWN_PROACTIVE_KEYS = frozenset(f.name for f in fields(ProactiveConfig))
 
 
 _VALID_MODEL_BACKENDS = frozenset({"", "auto", "hermes", "openai_compatible"})
@@ -261,6 +267,7 @@ def load_broker_config(path: str | Path | None = None) -> tuple[BrokerConfig, Pa
 
     raw: dict[str, Any] = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     agy_raw = raw.get("agy_rules_path")
+    local_raw = raw.get("memory_local_path")
     broker = BrokerConfig(
         vault_root=_resolve_path(raw["vault_root"]),
         soul_path=_resolve_path(raw["soul_path"]),
@@ -272,17 +279,50 @@ def load_broker_config(path: str | Path | None = None) -> tuple[BrokerConfig, Pa
         audit_dir=_resolve_path(raw["audit_dir"]),
         log_dir=_resolve_path(raw["log_dir"]),
         agy_rules_path=_resolve_path(agy_raw) if agy_raw else None,
+        memory_local_path=_resolve_path(local_raw) if local_raw else None,
     )
     return broker, cfg_path
 
 
-def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryConfig, Path]:
-    """加载 vault 内指定 profile 的 memory.yaml。"""
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """深度合并两个映射：dict 逐层合并，list 与标量整体替换。"""
+    merged: dict[str, Any] = dict(base)
+    for key, val in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+            merged[key] = _deep_merge_dicts(merged[key], val)
+        else:
+            merged[key] = val
+    return merged
+
+
+def load_memory_config(
+    vault_root: Path,
+    profile: str = "lily",
+    *,
+    local_override_path: Path | None = None,
+) -> tuple[MemoryConfig, Path]:
+    """加载 vault 内指定 profile 的 memory.yaml，并可选深度合并本机覆盖层。"""
     mem_path = vault_root / "profiles" / profile / "memory.yaml"
     if not mem_path.exists():
         raise FileNotFoundError(f"找不到 memory.yaml: {mem_path}")
 
-    raw: dict[str, Any] = yaml.safe_load(mem_path.read_text(encoding="utf-8")) or {}
+    raw_loaded = yaml.safe_load(mem_path.read_text(encoding="utf-8"))
+    if raw_loaded is None:
+        raw: dict[str, Any] = {}
+    elif isinstance(raw_loaded, dict):
+        raw = raw_loaded
+    else:
+        raise ProactiveConfigError("memory.yaml 顶层必须为映射对象")
+
+    if local_override_path is not None and local_override_path.exists():
+        override_loaded = yaml.safe_load(local_override_path.read_text(encoding="utf-8"))
+        if override_loaded is not None:
+            if not isinstance(override_loaded, dict):
+                raise ProactiveConfigError(
+                    f"memory.local.yaml 顶层必须为映射对象: {local_override_path}"
+                )
+            raw = _deep_merge_dicts(raw, override_loaded)
+
     ret_raw = raw.get("retrieval") or {}
     retrieval = RetrievalConfig(
         seed_k=int(ret_raw.get("seed_k", 5)),
@@ -302,9 +342,16 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
     elif not isinstance(proactive_raw, dict):
         raise ProactiveConfigError("memory.yaml 中的 proactive 必须为映射对象")
 
+    unknown_proactive = sorted(set(proactive_raw.keys()) - _KNOWN_PROACTIVE_KEYS)
+    if unknown_proactive:
+        raise ProactiveConfigError(
+            f"proactive 包含未知配置键: {', '.join(unknown_proactive)}"
+        )
+
     enabled = _require_bool(proactive_raw, "enabled", False)
     event_capture = _require_bool(proactive_raw, "event_capture", False)
     agy_ide_enabled = _require_bool(proactive_raw, "agy_ide_enabled", False)
+    nightly_enabled = _require_bool(proactive_raw, "nightly_enabled", True)
 
     nightly_hour = int(proactive_raw.get("nightly_hour", 23))
     nightly_minute = int(proactive_raw.get("nightly_minute", 0))
@@ -390,6 +437,7 @@ def load_memory_config(vault_root: Path, profile: str = "lily") -> tuple[MemoryC
         nightly_recent_diary_max_chars=max(0, int(proactive_raw.get("nightly_recent_diary_max_chars", 4000))),
         nightly_split_enabled=_require_bool(proactive_raw, "nightly_split_enabled", True),
         nightly_split_threshold_chars=max(0, int(proactive_raw.get("nightly_split_threshold_chars", 0))),
+        nightly_enabled=nightly_enabled,
     )
     if enabled:
         validate_proactive_worker_config(proactive)
@@ -414,7 +462,16 @@ def load_config(
 ) -> AppConfig:
     """加载完整应用配置。"""
     broker, b_path = load_broker_config(broker_path)
-    memory, m_path = load_memory_config(broker.vault_root, profile=profile)
+    local_override = (
+        broker.memory_local_path
+        if broker.memory_local_path is not None
+        else (b_path.parent / "memory.local.yaml")
+    )
+    memory, m_path = load_memory_config(
+        broker.vault_root,
+        profile=profile,
+        local_override_path=local_override,
+    )
     return AppConfig(
         broker=broker,
         memory=memory,
