@@ -193,10 +193,20 @@ AGENTBRAIN_PLUGIN_PATH=integrations/hermes/agentbrain/__init__.py pytest -q  # 1
 ## 已知边界
 
 - Windows 优先：文件锁走 `msvcrt`，脚本是计划任务；POSIX 分支有实现但未实测。
-- 单人单机单 vault：没有冲突合并协议，两个 broker 同时写同一 vault 没有保护。
+- 单人单机单 vault：没有冲突合并协议，两个 broker 同时写同一 vault 没有保护。跨机目前只做到「单写者 + 私有仓镜像」（`scripts/memory-sync.ps1`），笔记本只读；远程 broker 与写门控尚未实现。
 - `integrations/hermes/agentbrain/` 只依赖 HTTP 契约，不 import broker 的包；契约变了必须两边一起改，这是唯一的耦合点。本机是通过目录联接（junction）把 profile 的 plugins 目录指到这里的，删掉仓库那份插件就会一起消失。
 - 已完成一次真实 Hermes 框架模型桥接调用（无记忆写入），并在本机启用采集、建立 IDE 历史尾随基线；真实五轮写入质量与 22:30 跨夜触发仍待持续验证。
 - Codex 侧接线已就位，但受其自身模型配置限制。
+
+## 跨机镜像（单写者）
+
+`scripts/memory-sync.ps1` 把 vault 的变更定期 `commit + push` 到私有仓库，供第二台机器只读拉取；
+`scripts/setup-memory-sync-task.ps1` 注册计划任务 `AgentBrainMemorySync`（每 10 分钟）。
+
+- 只做提交与推送，**不做自动 pull**——写者唯一，pull 只会在从机上覆盖未提交改动。
+- 推送失败只记日志，本地提交保留，下次触发补推。
+- 脚本必须存成 UTF-8 **with BOM**：Windows PowerShell 5.1 按 ANSI 读无 BOM 文件，中文注释会把语法拆坏。
+- 建任务用 `schtasks.exe`，别用 `Register-ScheduledTask`（非管理员账户会 `Access Denied 0x80070005`）。
 
 ## License
 
