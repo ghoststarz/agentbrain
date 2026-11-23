@@ -16,7 +16,12 @@ $ErrorActionPreference = "Stop"
 
 if (-not (Test-Path $ScriptPath)) { throw "找不到同步脚本：$ScriptPath" }
 
-$tr = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`""
+$vbs = Join-Path $PSScriptRoot "memory-sync-hidden.vbs"
+if (-not (Test-Path $vbs)) { throw "找不到隐藏启动器：$vbs" }
+
+# ★ 必须经 wscript + VBS 隐藏启动：Task Scheduler 直接起 powershell.exe 会弹控制台窗口，
+#   -WindowStyle Hidden 也拦不住（实测每 10 分钟闪一次黑框）。
+$tr = "wscript.exe //nologo `"$vbs`""
 
 # ★ 用 schtasks.exe 而不是 Register-ScheduledTask：
 #   本机账户不是管理员，cmdlet 走 CIM 会 Access Denied (0x80070005)，同样的任务 schtasks 却能建成。

@@ -207,6 +207,7 @@ AGENTBRAIN_PLUGIN_PATH=integrations/hermes/agentbrain/__init__.py pytest -q  # 1
 - 推送失败只记日志，本地提交保留，下次触发补推。
 - 脚本必须存成 UTF-8 **with BOM**：Windows PowerShell 5.1 按 ANSI 读无 BOM 文件，中文注释会把语法拆坏。
 - 建任务用 `schtasks.exe`，别用 `Register-ScheduledTask`（非管理员账户会 `Access Denied 0x80070005`）。
+- 任务动作要经 `wscript.exe` 跑 `memory-sync-hidden.vbs`：直接起 `powershell.exe` 时 `-WindowStyle Hidden` 拦不住控制台窗口，会每 10 分钟闪一次黑框。
 
 ## License
 
