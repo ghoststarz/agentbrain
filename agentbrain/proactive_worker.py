@@ -20,7 +20,11 @@ from agentbrain.config import (
     resolve_effective_model_backend,
     validate_proactive_worker_config,
 )
-from agentbrain.diary import collect_recent_diary_context
+from agentbrain.diary import (
+    collect_recent_diary_context,
+    collect_today_diary_entries,
+    count_diary_entries_for_date,
+)
 from agentbrain.index import touch_notes_access
 from agentbrain.proactive import ClaimedJob, LeaseMismatchError, ProactiveStore, StoredEvent
 from agentbrain.proactive_apply import (
@@ -205,6 +209,7 @@ def _missing_nightly_diary_ledgers(
     window_id: str | None,
     satisfied: set[str] | None = None,
     satisfied_counts: dict[str, int] | None = None,
+    existing_public_count: int = 0,
 ) -> list[str]:
     counts = _count_nightly_diary_ops(_extract_nightly_diary_ops_list(raw_output, window_id=window_id))
     if satisfied_counts:
@@ -217,7 +222,7 @@ def _missing_nightly_diary_ledgers(
             counts["private"] += 2
             counts["wander"] += 1
     missing: list[str] = []
-    if counts["public"] < 1:
+    if int(existing_public_count) <= 0 and counts["public"] < 1:
         missing.append("public")
     if counts["private"] < 2:
         missing.append("private")
@@ -311,6 +316,7 @@ def _merge_nightly_diary_retry(
     retry_out: dict[str, Any],
     *,
     window_id: str | None,
+    existing_public_count: int = 0,
 ) -> dict[str, Any]:
     """若重试仅补齐了缺失的部分日记，则保留首次输出中已合乎窗口日期的其余日记条目。"""
     if not isinstance(retry_out, dict):
@@ -321,7 +327,11 @@ def _merge_nightly_diary_retry(
     if not isinstance(retry_ops, list) or not retry_ops:
         return retry_out
     # 若重试输出本身已完整满足公/私/wander 要求，直接采纳重试输出
-    if not _missing_nightly_diary_ledgers(retry_out, window_id=window_id):
+    if not _missing_nightly_diary_ledgers(
+        retry_out,
+        window_id=window_id,
+        existing_public_count=existing_public_count,
+    ):
         return retry_out
 
     def _sig(op: dict[str, Any]) -> tuple[str, str, str]:
@@ -480,13 +490,35 @@ def _build_recent_diary_block(config: AppConfig, *, window_id: str | None) -> st
     return f"<recent_diary>\n{safe}\n</recent_diary>"
 
 
+def _build_today_diary_block(config: AppConfig, *, window_id: str | None) -> str:
+    """为夜间任务构建 `<today_diary>` 上下文块（本窗口当天已写下的公/私账条目）。"""
+    cfg = config.memory.proactive
+    max_chars = int(getattr(cfg, "nightly_today_diary_max_chars", 3000))
+    raw = collect_today_diary_entries(
+        config,
+        window_id=window_id,
+        max_chars=max_chars,
+    )
+    if not raw:
+        return ""
+    safe = redact_secrets(raw)
+    if len(safe) > max_chars:
+        safe = safe[:max_chars]
+    return (
+        "<today_diary>\n"
+        "今天已经写下的日记条目（不要重复叙述这些内容）：\n"
+        f"{safe}\n"
+        "</today_diary>"
+    )
+
+
 def estimate_nightly_context_chars(
     config: AppConfig,
     *,
     window_id: str | None,
     events: list[StoredEvent],
 ) -> int:
-    """估算单任务夜间复盘总上下文长度（system + 证据 + existing_memory + recent_diary）。"""
+    """估算单任务夜间复盘总上下文长度（system + 证据 + existing_memory + recent_diary + today_diary）。"""
     countable_events = sorted(
         (ev for ev in events if ev.countable),
         key=lambda e: (e.occurred_at_us, e.row_id),
@@ -501,6 +533,7 @@ def estimate_nightly_context_chars(
     context_budget = min(max_ctx // 3, 6000)
     existing_ctx, _ = _collect_existing_context(config, ordered_events, context_budget)
     recent_diary_block = _build_recent_diary_block(config, window_id=window_id)
+    today_diary_block = _build_today_diary_block(config, window_id=window_id)
     sys_prompt_len = len(
         _system_prompt("nightly", window_id=window_id, soul_path=config.broker.soul_path)
     )
@@ -508,7 +541,13 @@ def estimate_nightly_context_chars(
         len(_format_event_block(ev, notice_only=not ev.countable)) + 2
         for ev in ordered_events
     )
-    return sys_prompt_len + len(existing_ctx) + len(recent_diary_block) + evidence_len
+    return (
+        sys_prompt_len
+        + len(existing_ctx)
+        + len(recent_diary_block)
+        + len(today_diary_block)
+        + evidence_len
+    )
 
 
 def _split_oversized_block(event_id: str, block: str, event_budget: int) -> list[str]:
@@ -565,8 +604,10 @@ def segment_job_prompts_with_snapshots(
     context_budget = min(max_ctx // 3, 6000)
     existing_ctx, snapshot_hashes = _collect_existing_context(config, ordered_events, context_budget)
     recent_diary_block = ""
+    today_diary_block = ""
     if job.job_type in ("nightly", "nightly_diary"):
         recent_diary_block = _build_recent_diary_block(config, window_id=job.window_id)
+        today_diary_block = _build_today_diary_block(config, window_id=job.window_id)
 
     sys_prompt_len = len(
         _system_prompt(job.job_type, window_id=job.window_id, soul_path=config.broker.soul_path)
@@ -581,6 +622,7 @@ def segment_job_prompts_with_snapshots(
             ),
         )
     recent_diary_section = f"\n\n{recent_diary_block}" if recent_diary_block else ""
+    today_diary_section = f"\n\n{today_diary_block}" if today_diary_block else ""
     digest_section = ""
     if job.job_type == "nightly_diary" and store is not None and job.window_id and job.revision is not None:
         work_digests_cursor = store.get_adapter_cursor(
@@ -601,6 +643,7 @@ def segment_job_prompts_with_snapshots(
         + len(header)
         + len(existing_ctx)
         + len(recent_diary_section)
+        + len(today_diary_section)
         + len(digest_section)
         + 256
     )
@@ -613,7 +656,7 @@ def segment_job_prompts_with_snapshots(
     def _assemble_prompt(ev_text: str, *, extra_tail: str = "") -> str:
         return (
             f"{header}\n<existing_memory>\n{existing_ctx}\n</existing_memory>"
-            f"{recent_diary_section}{digest_section}\n\n"
+            f"{recent_diary_section}{today_diary_section}{digest_section}\n\n"
             f"<untrusted_evidence>\n{ev_text}\n</untrusted_evidence>{extra_tail}"
         )
 
@@ -1149,10 +1192,16 @@ def process_claimed_job(
             model_out, stripped_written = _strip_diary_ops(model_out, drop_ledgers=written_diary_ledgers)
             total_skipped += stripped_written
         if is_diary_nightly and is_last_seg:
+            existing_pub_count = (
+                count_diary_entries_for_date(config, ledger="public", window_id=job.window_id)
+                if job.window_id
+                else 0
+            )
             missing = _missing_nightly_diary_ledgers(
                 model_out,
                 window_id=job.window_id,
                 satisfied_counts=_effective_satisfied_counts(),
+                existing_public_count=existing_pub_count,
             )
             if missing:
                 retry_prompt = seg_prompt + _nightly_missing_retry_hint(missing, job.window_id)
@@ -1171,6 +1220,7 @@ def process_claimed_job(
                     model_out,
                     retry_out,
                     window_id=job.window_id,
+                    existing_public_count=existing_pub_count,
                 )
                 if written_diary_ledgers:
                     model_out, stripped_merged_written = _strip_diary_ops(
@@ -1182,6 +1232,7 @@ def process_claimed_job(
                     model_out,
                     window_id=job.window_id,
                     satisfied_counts=_effective_satisfied_counts(),
+                    existing_public_count=existing_pub_count,
                 )
                 if missing_after:
                     raise NightlyMissingDiaryError(missing_after)
@@ -1264,8 +1315,13 @@ def process_claimed_job(
 
     if is_diary_nightly:
         eff_counts = _effective_satisfied_counts()
+        existing_pub_final = (
+            count_diary_entries_for_date(config, ledger="public", window_id=job.window_id)
+            if job.window_id
+            else 0
+        )
         missing_final: list[str] = []
-        if eff_counts["public"] < 1:
+        if existing_pub_final <= 0 and eff_counts["public"] < 1:
             missing_final.append("public")
         if eff_counts["private"] < 2:
             missing_final.append("private")

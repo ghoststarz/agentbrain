@@ -81,7 +81,12 @@ def _is_near_duplicate(
     new_content: str,
     threshold: float = 0.60,
 ) -> bool:
-    """判断新日记正文是否与已有条目近义重复（规范化后取 CJK 二元组 Jaccard 与有序子序列相似度较大值）。"""
+    """判断新日记正文是否与已有条目近义重复（规范化后取 CJK 二元组 Jaccard 与有序子序列相似度较大值）。
+
+    注意边界：这是字符级兜底去重，只能挡近乎照抄的重复，挡不住换措辞重述（换措辞重述的
+    bigram Jaccard 常低至 0.03–0.15）。切勿把该机制当主力，也不要为挡重述而调低 0.60 阈值
+    （调低会误吞不相干条目）；防换措辞重述应靠在夜间上下文注入 `<today_diary>` 让模型看见已有条目。
+    """
     norm_new = _normalize_diary_for_dedupe(new_content)
     if not norm_new:
         return False
@@ -348,3 +353,144 @@ def collect_recent_diary_context(
     if len(joined) > eff_max:
         joined = joined[:eff_max]
     return joined
+
+
+def _resolve_window_date_str(window_id: str | dt.date | None) -> str:
+    """将窗口日期规范化为 YYYY-MM-DD；非法或为空时返回空串。"""
+    if isinstance(window_id, dt.date):
+        return window_id.isoformat()
+    if isinstance(window_id, str) and window_id.strip():
+        try:
+            return dt.date.fromisoformat(window_id.strip()[:10]).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+def count_diary_entries_for_date(
+    config: AppConfig,
+    *,
+    ledger: str,
+    window_id: str | dt.date | None,
+) -> int:
+    """直接读取指定日期的日记文件并统计有效条目数（不读索引）。"""
+    date_str = _resolve_window_date_str(window_id)
+    if not date_str:
+        return 0
+    target_dir = _ledger_dir(config, ledger)
+    if not target_dir.exists() or target_dir.is_symlink():
+        return 0
+    md = target_dir / f"{date_str}.md"
+    if not md.exists() or md.is_symlink():
+        return 0
+    try:
+        raw = md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return len(_extract_diary_entry_bodies(raw))
+
+
+def _truncate_lines_to_budget(lines: list[str], max_chars: int, *, omit_idx: int | None = None) -> str:
+    """在尽量保留所有行（含省略提示行）的前提下，将多行文本压缩到 max_chars 以内。"""
+    joined = "\n".join(lines)
+    if len(joined) <= max_chars:
+        return joined
+
+    newline_chars = max(0, len(lines) - 1)
+    omit_len = len(lines[omit_idx]) if omit_idx is not None else 0
+    entry_indices = [i for i in range(len(lines)) if i != omit_idx]
+    avail = max_chars - newline_chars - omit_len
+    if not entry_indices or avail < len(entry_indices) * 4:
+        return joined[:max_chars]
+
+    # 按剩余预算均分给需要截断的条目行，短行不浪费配额
+    lengths = {i: len(lines[i]) for i in entry_indices}
+    capped: dict[int, int] = {}
+    remaining_indices = list(entry_indices)
+    remaining_budget = avail
+    while remaining_indices:
+        share = remaining_budget // len(remaining_indices)
+        short = [i for i in remaining_indices if lengths[i] <= share]
+        if not short:
+            for idx_pos, i in enumerate(remaining_indices):
+                extra = 1 if idx_pos < (remaining_budget % len(remaining_indices)) else 0
+                capped[i] = max(1, share + extra)
+            break
+        for i in short:
+            capped[i] = lengths[i]
+            remaining_budget -= lengths[i]
+        remaining_indices = [i for i in remaining_indices if i not in capped]
+
+    out_lines: list[str] = []
+    for i, ln in enumerate(lines):
+        if i == omit_idx:
+            out_lines.append(ln)
+            continue
+        lim = capped.get(i, len(ln))
+        if len(ln) <= lim:
+            out_lines.append(ln)
+        elif lim >= 2:
+            out_lines.append(ln[: lim - 1] + "…")
+        else:
+            out_lines.append(ln[:lim])
+    result = "\n".join(out_lines)
+    if len(result) > max_chars:
+        result = result[:max_chars]
+    return result
+
+
+def collect_today_diary_entries(
+    config: AppConfig,
+    *,
+    window_id: str | dt.date | None,
+    max_chars: int = 3000,
+) -> str:
+    """收集当天（window_id）已写下的公/私账条目，按时间升序输出 `[hh:mm:ss] 公|私 <正文>`。
+
+    - 当天公/私账文件均不存在或无条目时返回空串。
+    - 总长超出 max_chars 时，优先保留最早 2 条 + 最近 2 条，中间插入 `…（省略 N 条）`；
+      若仍超限则按预算截断条目行，保证输出总长不超过 max_chars。
+    """
+    eff_max = int(max_chars)
+    date_str = _resolve_window_date_str(window_id)
+    if eff_max <= 0 or not date_str:
+        return ""
+
+    # (time_str, ledger_order, line_idx, formatted_line)
+    records: list[tuple[str, int, int, str]] = []
+    for ledger, label, order in (("public", "公", 0), ("private", "私", 1)):
+        target_dir = _ledger_dir(config, ledger)
+        if not target_dir.exists() or target_dir.is_symlink():
+            continue
+        md = target_dir / f"{date_str}.md"
+        if not md.exists() or md.is_symlink():
+            continue
+        try:
+            raw = md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for idx, raw_line in enumerate(raw.splitlines()):
+            m = _DIARY_ENTRY_LINE_RE.match(raw_line.strip())
+            if not m:
+                continue
+            time_str = m.group(1)
+            body = " ".join(m.group(2).split()).strip()
+            if not body:
+                continue
+            records.append((time_str, order, idx, f"[{time_str}] {label} {body}"))
+
+    if not records:
+        return ""
+
+    records.sort(key=lambda r: (r[0], r[1], r[2]))
+    lines = [r[3] for r in records]
+    joined = "\n".join(lines)
+    if len(joined) <= eff_max:
+        return joined
+
+    if len(lines) > 4:
+        omitted = len(lines) - 4
+        kept = lines[:2] + [f"…（省略 {omitted} 条）"] + lines[-2:]
+        return _truncate_lines_to_budget(kept, eff_max, omit_idx=2)
+
+    return _truncate_lines_to_budget(lines, eff_max)

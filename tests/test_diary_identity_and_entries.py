@@ -418,9 +418,14 @@ def test_s3_recent_diary_injected_only_for_nightly_sorted_and_trimmed(tmp_path: 
     nightly_job = store.claim_job("w-night")
     assert nightly_job is not None and nightly_job.job_type == "nightly"
     night_segs, _ = segment_job_prompts_with_snapshots(cfg, nightly_job, store.get_job_events(nightly_job.job_id))
-    assert "<recent_diary>" in night_segs[0][1]
-    assert "2026-11-19 公 [22:30:00] 昨天公账" in night_segs[0][1]
-    assert "当天公账不应出现" not in night_segs[0][1]
+    night_prompt = night_segs[0][1]
+    assert "<recent_diary>" in night_prompt
+    assert "2026-11-19 公 [22:30:00] 昨天公账" in night_prompt
+    recent_block = night_prompt.split("<recent_diary>", 1)[1].split("</recent_diary>", 1)[0]
+    assert "当天公账不应出现" not in recent_block
+    assert "<today_diary>" in night_prompt
+    today_block = night_prompt.split("<today_diary>", 1)[1].split("</today_diary>", 1)[0]
+    assert "当天公账不应出现" in today_block
 
 
 # ---------------------------------------------------------------------------
