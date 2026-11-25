@@ -325,7 +325,51 @@ def test_s2_s3_config_loads_diary_dedupe_and_limit_from_memory_yaml(tmp_path: Pa
 
 
 def test_s3_diary_max_entries_per_day_enforced_per_ledger_and_reported(tmp_path: Path) -> None:
-    assert ProactiveConfig().diary_max_entries_per_day == 10
+    assert ProactiveConfig().diary_max_entries_per_day == 0
+
+    # 未配置 diary_max_entries_per_day 时缺省为 0（不限）
+    vault_def = tmp_path / "vault_default"
+    prof_def = vault_def / "profiles" / "lily"
+    prof_def.mkdir(parents=True)
+    (prof_def / "memory.yaml").write_text("schema: 1\nprofile: lily\nproactive:\n  enabled: false\n", encoding="utf-8")
+    mem_def, _ = load_memory_config(vault_def, profile="lily")
+    assert mem_def.proactive.diary_max_entries_per_day == 0
+
+    # 上限 0（默认）时连写 12 条互不相似的日记全部落盘
+    cfg_unlimited = _make_cfg(tmp_path / "unlimited")
+    distinct_twelve = [
+        "清晨煮了一壶耶加雪菲手冲咖啡，柑橘香气满屋飘散。",
+        "上午去图书馆还掉两本关于古建筑木构榫卯的图录。",
+        "中午在巷口老面馆吃了一碗葱油拌面配紫菜蛋花汤。",
+        "下午调试三维渲染管线里的阴影贴图偏移参数顺利收敛。",
+        "傍晚骑单车沿着运河绿道吹了半小时风，晚霞像橘子汽水。",
+        "晚上给阳台的龟背竹换了透气陶盆和松鳞介质。",
+        "深夜整理唱片架，翻出一张尘封多年的爵士黑胶唱片。",
+        "周末计划去植物园温室拍一组兰花与蕨类特写镜头。",
+        "拆开旧机械键盘清理轴体灰尘并重新润滑卫星轴。",
+        "在二手书店淘到一本绝版的天文观测星图手册。",
+        "尝试用铸铁锅低温慢炖牛腩，满屋都是番茄与迷迭香味。",
+        "临睡前把行李箱里的充电线和转换插头全部归类收纳好。",
+    ]
+    for idx, text in enumerate(distinct_twelve):
+        res_u = append_diary(
+            cfg_unlimited,
+            ledger="public",
+            content=text,
+            author="hermes",
+            now=dt.datetime(2026, 11, 24, 9, idx, 0),
+        )
+        assert res_u["ok"] is True
+        assert not res_u.get("skipped_limit")
+        assert not res_u.get("skipped_duplicate")
+    unlimited_lines = [
+        ln
+        for ln in (cfg_unlimited.profile_dir / "30_Diary" / "Public" / "2026-11-24.md")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if ln.startswith("- [")
+    ]
+    assert len(unlimited_lines) == 12
 
     tz = dt.timezone(dt.timedelta(hours=8))
     clock = ManualClock(dt.datetime(2026, 11, 24, 14, 0, tzinfo=dt.timezone.utc), tz=tz)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import threading
 import urllib.error
@@ -38,6 +39,7 @@ from agentbrain.retrieve import search_notes
 from agentbrain.section_audit import run_section_audit
 
 _EXCLUDED_CONTEXT_PREFIXES = ("30_Diary/", "30_Diary\\", "SOUL.md", "USER.md", "RULES.md")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _system_prompt(
@@ -1064,6 +1066,42 @@ def process_claimed_job(
         if not dry_run:
             written_diary_ledgers.update(store.list_job_applied_diary_ledgers(job.job_id))
 
+    def _persist_segment_cursor(completed_segments: int) -> None:
+        if dry_run:
+            return
+        try:
+            store.set_adapter_cursor(
+                "worker_segment",
+                progress_key,
+                {
+                    "completed_segments": completed_segments,
+                    "total_segments": len(segments),
+                    "total_applied": total_applied,
+                    "total_skipped": total_skipped,
+                    "total_diary_rate_limited": total_diary_rate_limited,
+                    "has_applied": has_applied,
+                    "nightly_diary_counts": dict(satisfied_counts),
+                    "written_diary_ledgers": sorted(written_diary_ledgers),
+                    "earlier_digests": list(earlier_digests),
+                    "written_notes": list(written_notes),
+                    "snapshot_hashes": snapshot_hashes,
+                    "initial_snapshot_hashes": initial_snapshot_hashes,
+                    "trusted_post_write_hashes": trusted_post_write_hashes,
+                    "segment_event_keys": [
+                        [f"{e.client}:{e.session_id}:{e.event_id}" for e in evs]
+                        for evs, _ in segments
+                    ],
+                    "segments_prompts": [p for _, p in segments],
+                },
+            )
+        except Exception as cursor_exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "worker_segment 游标写入失败（job_id=%s completed_segments=%s），忽略并继续: %s",
+                job.job_id,
+                completed_segments,
+                cursor_exc,
+            )
+
     for seg_idx, (seg_events, prompt) in enumerate(segments):
         if seg_idx < start_seg:
             continue
@@ -1154,6 +1192,7 @@ def process_claimed_job(
                 job,
                 seg_events,
                 payload,
+                segment_index=seg_idx,
                 write_lock=write_lock,
                 clock=clock or SystemClock(),
                 dry_run=dry_run,
@@ -1191,13 +1230,8 @@ def process_claimed_job(
                 total_skipped += stripped_repair_written
             model_out = repaired
             summary = _apply_batch(model_out)
-        if is_diary_nightly:
-            _record_written_diary_ledgers_from_summary(summary)
-            seg_counts = _count_nightly_diary_ops(
-                _extract_nightly_diary_ops_list(model_out, window_id=job.window_id)
-            )
-            for k in ("public", "private", "wander"):
-                satisfied_counts[k] += seg_counts[k]
+
+        # apply 成功后立刻推进并持久化分段游标，再做后续的日记/digest 统计收尾
         if summary.post_write_hashes:
             snapshot_hashes.update(summary.post_write_hashes)
             trusted_post_write_hashes.update(summary.post_write_hashes)
@@ -1210,31 +1244,16 @@ def process_claimed_job(
         total_diary_rate_limited += summary.diary_rate_limited_count
         if summary.outcome == "applied" or summary.applied_count > 0:
             has_applied = True
-        if not dry_run:
-            store.set_adapter_cursor(
-                "worker_segment",
-                progress_key,
-                {
-                    "completed_segments": seg_idx + 1,
-                    "total_segments": len(segments),
-                    "total_applied": total_applied,
-                    "total_skipped": total_skipped,
-                    "total_diary_rate_limited": total_diary_rate_limited,
-                    "has_applied": has_applied,
-                    "nightly_diary_counts": dict(satisfied_counts),
-                    "written_diary_ledgers": sorted(written_diary_ledgers),
-                    "earlier_digests": list(earlier_digests),
-                    "written_notes": list(written_notes),
-                    "snapshot_hashes": snapshot_hashes,
-                    "initial_snapshot_hashes": initial_snapshot_hashes,
-                    "trusted_post_write_hashes": trusted_post_write_hashes,
-                    "segment_event_keys": [
-                        [f"{e.client}:{e.session_id}:{e.event_id}" for e in evs]
-                        for evs, _ in segments
-                    ],
-                    "segments_prompts": [p for _, p in segments],
-                },
+        _persist_segment_cursor(seg_idx + 1)
+
+        if is_diary_nightly:
+            _record_written_diary_ledgers_from_summary(summary)
+            seg_counts = _count_nightly_diary_ops(
+                _extract_nightly_diary_ops_list(model_out, window_id=job.window_id)
             )
+            for k in ("public", "private", "wander"):
+                satisfied_counts[k] += seg_counts[k]
+            _persist_segment_cursor(seg_idx + 1)
 
     if is_work_nightly and earlier_digests and not dry_run and job.window_id and job.revision is not None:
         store.set_adapter_cursor(

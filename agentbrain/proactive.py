@@ -37,7 +37,7 @@ from agentbrain.proactive_clock import (
 )
 from agentbrain.proactive_redaction import redact_secrets
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 EVENT_KIND_HUMAN_TURN = "human_turn"
 EVENT_KIND_REFERENCE_ONLY = "reference_only"
@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     lease_expires_at_us INTEGER,
     next_retry_at_us INTEGER,
     last_error TEXT,
+    last_error_at_utc TEXT,
     outcome TEXT,
     result_summary_json TEXT,
     created_at_utc TEXT NOT NULL,
@@ -460,6 +461,9 @@ class ProactiveStore:
         for col_name in ("content_hash", "route", "paired_route"):
             if col_name not in cols:
                 conn.execute(f"ALTER TABLE events ADD COLUMN {col_name} TEXT")
+        job_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "last_error_at_utc" not in job_cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN last_error_at_utc TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_cross_route "
             "ON events(client, session_id, content_hash, occurred_at_us)"
@@ -1329,6 +1333,7 @@ class ProactiveStore:
             """,
             (now_us,),
         ).fetchall()
+        now_iso = us_to_iso(now_us)
         recovered = 0
         for row in expired:
             if int(row["attempts"]) >= int(row["max_attempts"]):
@@ -1337,10 +1342,11 @@ class ProactiveStore:
                     UPDATE jobs
                     SET status = 'dead', lease_token = NULL, worker_id = NULL,
                         last_error = COALESCE(last_error, 'lease_expired'),
+                        last_error_at_utc = COALESCE(last_error_at_utc, ?),
                         finished_at_us = ?
                     WHERE id = ?
                     """,
-                    (now_us, int(row["id"])),
+                    (now_iso, now_us, int(row["id"])),
                 )
             else:
                 conn.execute(
@@ -1348,10 +1354,11 @@ class ProactiveStore:
                     UPDATE jobs
                     SET status = 'pending', lease_token = NULL, worker_id = NULL,
                         lease_expires_at_us = NULL, next_retry_at_us = NULL,
-                        last_error = 'lease_expired'
+                        last_error = 'lease_expired',
+                        last_error_at_utc = ?
                     WHERE id = ?
                     """,
-                    (int(row["id"]),),
+                    (now_iso, int(row["id"])),
                 )
             recovered += 1
         return recovered
@@ -1550,7 +1557,6 @@ class ProactiveStore:
                 SET status = 'succeeded',
                     outcome = ?,
                     result_summary_json = ?,
-                    last_error = NULL,
                     lease_token = NULL,
                     lease_expires_at_us = NULL,
                     finished_at_us = ?
@@ -1659,7 +1665,9 @@ class ProactiveStore:
         force_dead: bool = False,
     ) -> str:
         """记录任务失败并计算指数退避重试时间；绝不推进已评审进度。"""
-        now_us = dt_to_us(self.clock.now_utc())
+        now_utc = ensure_utc(self.clock.now_utc())
+        now_us = dt_to_us(now_utc)
+        now_iso = now_utc.isoformat()
         bounded_err = (error or "unknown_error")[:500]
 
         with self._tx() as conn:
@@ -1679,6 +1687,9 @@ class ProactiveStore:
             if not force_dead and attempts < max_attempts:
                 if retry_delay_seconds is not None:
                     delay_sec = max(0, int(retry_delay_seconds))
+                elif str(row["job_type"]) in NIGHTLY_JOB_TYPES:
+                    # 夜间任务指数退避：第 1 次失败 60s，第 2 次 180s，第 3 次及以上封顶 300s（5 分钟）
+                    delay_sec = min(300, 60 * (3 ** max(0, attempts - 1)))
                 else:
                     delay_sec = min(
                         self.config.max_backoff_seconds,
@@ -1691,27 +1702,28 @@ class ProactiveStore:
                     UPDATE jobs
                     SET status = ?,
                         last_error = ?,
+                        last_error_at_utc = ?,
                         next_retry_at_us = ?,
                         lease_token = NULL,
                         lease_expires_at_us = NULL
                     WHERE id = ?
                     """,
-                    (new_status, bounded_err, next_retry_us, job_id),
+                    (new_status, bounded_err, now_iso, next_retry_us, job_id),
                 )
             else:
                 new_status = JOB_STATUS_DEAD
-                now_utc = ensure_utc(self.clock.now_utc())
                 conn.execute(
                     """
                     UPDATE jobs
                     SET status = ?,
                         last_error = ?,
+                        last_error_at_utc = ?,
                         lease_token = NULL,
                         lease_expires_at_us = NULL,
                         finished_at_us = ?
                     WHERE id = ?
                     """,
-                    (new_status, bounded_err, now_us, job_id),
+                    (new_status, bounded_err, now_iso, now_us, job_id),
                 )
                 if new_status == JOB_STATUS_DEAD:
                     # 任务判死后若被重新排队，旧的进度游标会让它“跳过所有分段”直接空跑；
@@ -2051,6 +2063,7 @@ class ProactiveStore:
                     "attempts": int(r["attempts"]),
                     "max_attempts": int(r["max_attempts"]),
                     "last_error": r["last_error"],
+                    "last_error_at_utc": r["last_error_at_utc"],
                     "outcome": r["outcome"],
                     "model_route": model_route,
                     "next_retry_at_utc": (

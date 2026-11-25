@@ -1286,9 +1286,9 @@ def _allocate_unique_diary_dt(base_dt: dt.datetime, used_times: set[str]) -> dt.
     return cur
 
 
-def _derive_op_id(job: ClaimedJob, idx: int, op_type: str, dedupe_key: str) -> str:
-    digest = sha256_text(f"{op_type}:{dedupe_key}")[:12]
-    return f"{job.idempotency_key}:op:{idx}:{digest}"
+def _derive_op_id(job: ClaimedJob, segment_index: int, op_type: str, dedupe_key: str) -> str:
+    digest = sha256_text(f"{op_type}:{dedupe_key}")[:16]
+    return f"{job.idempotency_key}:{int(segment_index)}:{digest}"
 
 
 def _derive_dedupe_key(op: dict[str, Any]) -> str:
@@ -1397,6 +1397,7 @@ def validate_and_apply_batch(
     events: list[StoredEvent],
     raw_output: dict[str, Any],
     *,
+    segment_index: int = 0,
     write_lock: threading.Lock | None = None,
     clock: Clock | None = None,
     dry_run: bool = False,
@@ -1531,23 +1532,37 @@ def validate_and_apply_batch(
                     )
                 rel, proj_stem = _resolve_project_note_rel(config, project_raw)
                 target = _assert_safe_profile_subpath(config, rel)
-                req_hash = _check_hash_conflict(
-                    rel=rel,
-                    target=target,
-                    expected_hash=expected_hash,
-                    snapshot_hashes=snapshot_hashes,
-                    initial_snapshot_hashes=initial_snapshot_hashes,
-                    trusted_post_write_hashes=trusted_post_write_hashes,
-                )
-                pre_lock_checks.append((target, rel, req_hash))
                 op["_project_raw"] = project_raw
                 op["_project_stem"] = proj_stem
                 op["_needs_seq_alloc"] = False
                 op["_resolved_rel"] = rel
                 op["_resolved_target"] = target
                 op["_dedupe_slot"] = f"{rel}#{title}"
+                _preview_dk = _derive_dedupe_key(op)
+                _preview_oid = str(op.get("op_id") or "").strip() or _derive_op_id(job, segment_index, op_type, _preview_dk)
+                if not store.is_op_applied(_preview_oid):
+                    req_hash = _check_hash_conflict(
+                        rel=rel,
+                        target=target,
+                        expected_hash=expected_hash,
+                        snapshot_hashes=snapshot_hashes,
+                        initial_snapshot_hashes=initial_snapshot_hashes,
+                        trusted_post_write_hashes=trusted_post_write_hashes,
+                    )
+                    pre_lock_checks.append((target, rel, req_hash))
             else:
                 # 严格按顺序解析：1. fact_key -> 2. merge_into -> 3. 精确标题/stem -> 4. 新建
+                # 槽位键与文件是否已存在解耦，保证同一 segment 重跑时 dedupe_key/op_id 稳定一致。
+                stable_slot = (
+                    f"{note_type}:{normalize_note_title(merge_into)}#{normalize_note_title(title)}"
+                    if merge_into
+                    else f"{note_type}:{normalize_note_title(title)}"
+                )
+                op["_dedupe_slot"] = stable_slot
+                _preview_dk = _derive_dedupe_key(op)
+                _preview_oid = str(op.get("op_id") or "").strip() or _derive_op_id(job, segment_index, op_type, _preview_dk)
+                _already_applied = store.is_op_applied(_preview_oid)
+
                 existing_rel = _find_existing_fact_key_path(config, fact_key) if fact_key else None
                 if existing_rel is None and merge_into:
                     existing_rel = _find_merge_target_path(config, merge_into)
@@ -1557,21 +1572,21 @@ def validate_and_apply_batch(
                 if existing_rel is not None:
                     rel = existing_rel
                     target = _assert_safe_profile_subpath(config, rel)
-                    req_hash = _check_hash_conflict(
-                        rel=rel,
-                        target=target,
-                        expected_hash=expected_hash,
-                        snapshot_hashes=snapshot_hashes,
-                        initial_snapshot_hashes=initial_snapshot_hashes,
-                        trusted_post_write_hashes=trusted_post_write_hashes,
-                    )
-                    pre_lock_checks.append((target, rel, req_hash))
+                    if not _already_applied:
+                        req_hash = _check_hash_conflict(
+                            rel=rel,
+                            target=target,
+                            expected_hash=expected_hash,
+                            snapshot_hashes=snapshot_hashes,
+                            initial_snapshot_hashes=initial_snapshot_hashes,
+                            trusted_post_write_hashes=trusted_post_write_hashes,
+                        )
+                        pre_lock_checks.append((target, rel, req_hash))
                     op["_needs_seq_alloc"] = False
                     op["_resolved_rel"] = rel
                     op["_resolved_target"] = target
-                    op["_dedupe_slot"] = f"{rel}#{title}"
                 elif note_type in _SEQ_PREFIX_BY_TYPE:
-                    if expected_hash:
+                    if expected_hash and not _already_applied:
                         raise ConflictError(
                             f"创建冲突：新建 {note_type} 笔记 {title!r} 不存在但提供了 expected_hash={expected_hash[:12]}"
                         )
@@ -1581,24 +1596,23 @@ def validate_and_apply_batch(
                     op["_needs_seq_alloc"] = True
                     op["_resolved_rel"] = preview_rel
                     op["_resolved_target"] = config.profile_dir / preview_rel
-                    op["_dedupe_slot"] = f"new:{note_type}:{normalize_note_title(title)}"
                 else:
                     date_ymd = _resolve_note_date_compact(op, job, eff_clock)
                     rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, date_ymd)}"
                     target = _assert_safe_profile_subpath(config, rel)
-                    req_hash = _check_hash_conflict(
-                        rel=rel,
-                        target=target,
-                        expected_hash=expected_hash,
-                        snapshot_hashes=snapshot_hashes,
-                        initial_snapshot_hashes=initial_snapshot_hashes,
-                        trusted_post_write_hashes=trusted_post_write_hashes,
-                    )
-                    pre_lock_checks.append((target, rel, req_hash))
+                    if not _already_applied:
+                        req_hash = _check_hash_conflict(
+                            rel=rel,
+                            target=target,
+                            expected_hash=expected_hash,
+                            snapshot_hashes=snapshot_hashes,
+                            initial_snapshot_hashes=initial_snapshot_hashes,
+                            trusted_post_write_hashes=trusted_post_write_hashes,
+                        )
+                        pre_lock_checks.append((target, rel, req_hash))
                     op["_needs_seq_alloc"] = False
                     op["_resolved_rel"] = rel
                     op["_resolved_target"] = target
-                    op["_dedupe_slot"] = rel
 
             op["evidence_level"] = _resolve_evidence_level(op.get("evidence_level"), matched_events, idx)
             trusted_source, trusted_domain = _trusted_source_and_domain(config, matched_events)
@@ -1617,15 +1631,6 @@ def validate_and_apply_batch(
             rel, slug = _resolve_project_note_rel(config, project)
             target = _assert_safe_profile_subpath(config, rel)
             expected_hash = str(op.get("expected_hash") or "").strip()
-            req_hash = _check_hash_conflict(
-                rel=rel,
-                target=target,
-                expected_hash=expected_hash,
-                snapshot_hashes=snapshot_hashes,
-                initial_snapshot_hashes=initial_snapshot_hashes,
-                trusted_post_write_hashes=trusted_post_write_hashes,
-            )
-            pre_lock_checks.append((target, rel, req_hash))
             ev_level = _resolve_evidence_level(op.get("evidence_level"), matched_events, idx)
             op["project"] = slug
             op["_project_raw"] = project
@@ -1636,6 +1641,18 @@ def validate_and_apply_batch(
             op["_raw_managed_content"] = raw_managed
             op["_resolved_rel"] = rel
             op["_resolved_target"] = target
+            _preview_dk = _derive_dedupe_key(op)
+            _preview_oid = str(op.get("op_id") or "").strip() or _derive_op_id(job, segment_index, op_type, _preview_dk)
+            if not store.is_op_applied(_preview_oid):
+                req_hash = _check_hash_conflict(
+                    rel=rel,
+                    target=target,
+                    expected_hash=expected_hash,
+                    snapshot_hashes=snapshot_hashes,
+                    initial_snapshot_hashes=initial_snapshot_hashes,
+                    trusted_post_write_hashes=trusted_post_write_hashes,
+                )
+                pre_lock_checks.append((target, rel, req_hash))
 
         elif op_type == "hot_update":
             content = str(op.get("content") or "").strip()
@@ -1648,17 +1665,20 @@ def validate_and_apply_batch(
             rel = "10_Working/HOT.md"
             target = _assert_safe_profile_subpath(config, rel)
             expected_hash = str(op.get("expected_hash") or "").strip()
-            req_hash = _check_hash_conflict(
-                rel=rel,
-                target=target,
-                expected_hash=expected_hash,
-                snapshot_hashes=snapshot_hashes,
-                initial_snapshot_hashes=initial_snapshot_hashes,
-                trusted_post_write_hashes=trusted_post_write_hashes,
-            )
-            pre_lock_checks.append((target, rel, req_hash))
             op["_resolved_rel"] = rel
             op["_resolved_target"] = target
+            _preview_dk = _derive_dedupe_key(op)
+            _preview_oid = str(op.get("op_id") or "").strip() or _derive_op_id(job, segment_index, op_type, _preview_dk)
+            if not store.is_op_applied(_preview_oid):
+                req_hash = _check_hash_conflict(
+                    rel=rel,
+                    target=target,
+                    expected_hash=expected_hash,
+                    snapshot_hashes=snapshot_hashes,
+                    initial_snapshot_hashes=initial_snapshot_hashes,
+                    trusted_post_write_hashes=trusted_post_write_hashes,
+                )
+                pre_lock_checks.append((target, rel, req_hash))
 
         elif op_type == "handoff_upsert":
             task_key = str(op.get("task_key") or "").strip()
@@ -1705,7 +1725,7 @@ def validate_and_apply_batch(
             diary_slot_counts[slot_key] = op["_diary_slot"] + 1
 
         dedupe_key = _derive_dedupe_key(op)
-        op_id = str(op.get("op_id") or "").strip() or _derive_op_id(job, idx, op_type, dedupe_key)
+        op_id = str(op.get("op_id") or "").strip() or _derive_op_id(job, segment_index, op_type, dedupe_key)
         op["_op_id"] = op_id
         op["_dedupe_key"] = dedupe_key
         validated_ops.append(op)

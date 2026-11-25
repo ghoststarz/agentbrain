@@ -167,7 +167,7 @@ def append_diary(
             "path": str(target_file),
         }
 
-    max_entries = int(getattr(config.memory.proactive, "diary_max_entries_per_day", 10))
+    max_entries = int(getattr(config.memory.proactive, "diary_max_entries_per_day", 0))
     if max_entries > 0 and len(existing_entries) >= max_entries:
         return {
             "ok": True,

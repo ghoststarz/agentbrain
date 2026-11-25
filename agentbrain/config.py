@@ -137,7 +137,7 @@ class ProactiveConfig:
     nightly_split_threshold_chars: int = 0
     nightly_enabled: bool = True
     diary_dedupe_similarity: float = 0.60
-    diary_max_entries_per_day: int = 10
+    diary_max_entries_per_day: int = 0
 
 
 _KNOWN_PROACTIVE_KEYS = frozenset(f.name for f in fields(ProactiveConfig))
@@ -402,7 +402,8 @@ def load_memory_config(
         raise ProactiveConfigError(
             f"proactive.diary_dedupe_similarity 必须在 [0.0, 1.0] 范围内，收到: {diary_dedupe_similarity!r}"
         )
-    diary_max_entries_per_day = max(0, int(proactive_raw.get("diary_max_entries_per_day", 10)))
+    raw_diary_max = proactive_raw.get("diary_max_entries_per_day")
+    diary_max_entries_per_day = max(0, int(0 if raw_diary_max is None else raw_diary_max))
 
     proactive = ProactiveConfig(
         enabled=enabled,
