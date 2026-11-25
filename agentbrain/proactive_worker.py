@@ -224,19 +224,36 @@ def _missing_nightly_diary_ledgers(
     return missing
 
 
-def _strip_diary_ops(raw_output: Any) -> tuple[Any, int]:
-    """防御性剔除日记操作：多分段夜间前序分段与 nightly_work 不允许写日记。"""
+def _strip_diary_ops(
+    raw_output: Any,
+    *,
+    drop_ledgers: set[str] | frozenset[str] | None = None,
+    keep_ledgers: set[str] | frozenset[str] | None = None,
+) -> tuple[Any, int]:
+    """防御性剔除日记操作：支持全量剔除，或按 drop_ledgers / keep_ledgers 仅剔除指定账本。"""
     if not isinstance(raw_output, dict):
         return raw_output, 0
     ops = raw_output.get("operations")
     if not isinstance(ops, list):
         return raw_output, 0
+    norm_drop = {str(x).strip().lower() for x in drop_ledgers if str(x).strip()} if drop_ledgers is not None else None
+    norm_keep = {str(x).strip().lower() for x in keep_ledgers if str(x).strip()} if keep_ledgers is not None else None
     kept: list[Any] = []
     removed = 0
     for op in ops:
         if isinstance(op, dict) and str(op.get("op_type") or "").strip() == "diary_append":
-            removed += 1
-            continue
+            ledger = str(op.get("ledger") or "").strip().lower()
+            if norm_drop is None and norm_keep is None:
+                should_drop = True
+            else:
+                should_drop = False
+                if norm_drop is not None and ledger in norm_drop:
+                    should_drop = True
+                if norm_keep is not None and ledger not in norm_keep:
+                    should_drop = True
+            if should_drop:
+                removed += 1
+                continue
         kept.append(op)
     if removed == 0:
         return raw_output, 0
@@ -341,6 +358,7 @@ class WorkerRunResult:
     skipped_dedupe_count: int
     dry_run: bool
     model_route: dict[str, Any] | None = None
+    diary_rate_limited_count: int = 0
 
 
 def _collect_existing_context(
@@ -809,8 +827,10 @@ def process_claimed_job(
     start_seg = 0
     total_applied = 0
     total_skipped = 0
+    total_diary_rate_limited = 0
     has_applied = False
     satisfied_counts: dict[str, int] = {"public": 0, "private": 0, "wander": 0}
+    written_diary_ledgers: set[str] = set()
 
     if (
         not dry_run
@@ -843,6 +863,7 @@ def process_claimed_job(
         start_seg = max(0, int(cursor.get("completed_segments") or 0))
         total_applied = max(0, int(cursor.get("total_applied") or 0))
         total_skipped = max(0, int(cursor.get("total_skipped") or 0))
+        total_diary_rate_limited = max(0, int(cursor.get("total_diary_rate_limited") or 0))
         has_applied = bool(cursor.get("has_applied", total_applied > 0))
         raw_counts = cursor.get("nightly_diary_counts")
         if isinstance(raw_counts, dict):
@@ -856,6 +877,16 @@ def process_claimed_job(
                 if "private" in raw_ledgers:
                     satisfied_counts["private"] = max(satisfied_counts["private"], 2)
                     satisfied_counts["wander"] = max(satisfied_counts["wander"], 1)
+        raw_written_ledgers = cursor.get("written_diary_ledgers")
+        if isinstance(raw_written_ledgers, list):
+            for lg in raw_written_ledgers:
+                clean_lg = str(lg or "").strip().lower()
+                if clean_lg in ("public", "private"):
+                    written_diary_ledgers.add(clean_lg)
+        if satisfied_counts["public"] > 0:
+            written_diary_ledgers.add("public")
+        if satisfied_counts["private"] > 0:
+            written_diary_ledgers.add("private")
         raw_digests = cursor.get("earlier_digests")
         earlier_digests_state: list[str] = (
             [str(x) for x in raw_digests] if isinstance(raw_digests, list) else []
@@ -884,8 +915,10 @@ def process_claimed_job(
                     "total_segments": len(segments),
                     "total_applied": 0,
                     "total_skipped": 0,
+                    "total_diary_rate_limited": 0,
                     "has_applied": False,
                     "nightly_diary_counts": dict(satisfied_counts),
+                    "written_diary_ledgers": sorted(written_diary_ledgers),
                     "earlier_digests": [],
                     "written_notes": [],
                     "snapshot_hashes": snapshot_hashes,
@@ -1003,6 +1036,34 @@ def process_claimed_job(
     earlier_digests: list[str] = list(earlier_digests_state)
     written_notes: list[str] = list(written_notes_state)
 
+    if is_diary_nightly and not dry_run:
+        written_diary_ledgers.update(store.list_job_applied_diary_ledgers(job.job_id))
+
+    def _effective_satisfied_counts() -> dict[str, int]:
+        eff = dict(satisfied_counts)
+        if "public" in written_diary_ledgers:
+            eff["public"] = max(eff["public"], 1)
+        if "private" in written_diary_ledgers:
+            eff["private"] = max(eff["private"], 2)
+            eff["wander"] = max(eff["wander"], 1)
+        return eff
+
+    def _record_written_diary_ledgers_from_summary(summary_obj: ApplySummary) -> None:
+        for rec in summary_obj.operations:
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("op_type") != "diary_append":
+                continue
+            if rec.get("status") not in ("applied", "updated"):
+                continue
+            rel_l = str(rec.get("target_rel") or "").replace("\\", "/").lower()
+            if "/public/" in rel_l:
+                written_diary_ledgers.add("public")
+            elif "/private/" in rel_l:
+                written_diary_ledgers.add("private")
+        if not dry_run:
+            written_diary_ledgers.update(store.list_job_applied_diary_ledgers(job.job_id))
+
     for seg_idx, (seg_events, prompt) in enumerate(segments):
         if seg_idx < start_seg:
             continue
@@ -1045,11 +1106,15 @@ def process_claimed_job(
             # nightly_diary 通道只做 diary_append：代码层滤掉其它 op
             model_out, stripped_non_diary = _strip_non_diary_ops(model_out)
             total_skipped += stripped_non_diary
+        if is_diary_nightly and written_diary_ledgers:
+            # 同一 job 已写过该 ledger 的当天日记：后续分段一律剥掉，防止重复写入
+            model_out, stripped_written = _strip_diary_ops(model_out, drop_ledgers=written_diary_ledgers)
+            total_skipped += stripped_written
         if is_diary_nightly and is_last_seg:
             missing = _missing_nightly_diary_ledgers(
                 model_out,
                 window_id=job.window_id,
-                satisfied_counts=satisfied_counts,
+                satisfied_counts=_effective_satisfied_counts(),
             )
             if missing:
                 retry_prompt = seg_prompt + _nightly_missing_retry_hint(missing, job.window_id)
@@ -1058,15 +1123,27 @@ def process_claimed_job(
                 if job.job_type == "nightly_diary":
                     retry_out, stripped_retry = _strip_non_diary_ops(retry_out)
                     total_skipped += stripped_retry
+                if written_diary_ledgers:
+                    retry_out, stripped_retry_written = _strip_diary_ops(
+                        retry_out,
+                        drop_ledgers=written_diary_ledgers,
+                    )
+                    total_skipped += stripped_retry_written
                 model_out = _merge_nightly_diary_retry(
                     model_out,
                     retry_out,
                     window_id=job.window_id,
                 )
+                if written_diary_ledgers:
+                    model_out, stripped_merged_written = _strip_diary_ops(
+                        model_out,
+                        drop_ledgers=written_diary_ledgers,
+                    )
+                    total_skipped += stripped_merged_written
                 missing_after = _missing_nightly_diary_ledgers(
                     model_out,
                     window_id=job.window_id,
-                    satisfied_counts=satisfied_counts,
+                    satisfied_counts=_effective_satisfied_counts(),
                 )
                 if missing_after:
                     raise NightlyMissingDiaryError(missing_after)
@@ -1091,6 +1168,8 @@ def process_claimed_job(
         except BatchValidationError as exc:
             # 模型偶尔漏字段（最典型是某个操作没带 source_refs）。整批判死会白掉一整天证据，
             # 所以给一次「只修格式」的机会：把校验错误原文回灌，仍不合格才真失败。
+            if is_diary_nightly and not dry_run:
+                written_diary_ledgers.update(store.list_job_applied_diary_ledgers(job.job_id))
             repair_hint = load_prompt("review_repair").replace("<ERROR>", f"{type(exc).__name__}: {exc}")
             repaired = _call_model_with_heartbeat(
                 seg_prompt + "\n\n" + repair_hint,
@@ -1104,9 +1183,16 @@ def process_claimed_job(
             elif job.job_type == "nightly_diary":
                 repaired, stripped2 = _strip_non_diary_ops(repaired)
                 total_skipped += stripped2
+            if is_diary_nightly and written_diary_ledgers:
+                repaired, stripped_repair_written = _strip_diary_ops(
+                    repaired,
+                    drop_ledgers=written_diary_ledgers,
+                )
+                total_skipped += stripped_repair_written
             model_out = repaired
             summary = _apply_batch(model_out)
         if is_diary_nightly:
+            _record_written_diary_ledgers_from_summary(summary)
             seg_counts = _count_nightly_diary_ops(
                 _extract_nightly_diary_ops_list(model_out, window_id=job.window_id)
             )
@@ -1121,6 +1207,7 @@ def process_claimed_job(
                 written_notes.append(clean_rel)
         total_applied += summary.applied_count
         total_skipped += summary.skipped_dedupe_count
+        total_diary_rate_limited += summary.diary_rate_limited_count
         if summary.outcome == "applied" or summary.applied_count > 0:
             has_applied = True
         if not dry_run:
@@ -1132,8 +1219,10 @@ def process_claimed_job(
                     "total_segments": len(segments),
                     "total_applied": total_applied,
                     "total_skipped": total_skipped,
+                    "total_diary_rate_limited": total_diary_rate_limited,
                     "has_applied": has_applied,
                     "nightly_diary_counts": dict(satisfied_counts),
+                    "written_diary_ledgers": sorted(written_diary_ledgers),
                     "earlier_digests": list(earlier_digests),
                     "written_notes": list(written_notes),
                     "snapshot_hashes": snapshot_hashes,
@@ -1155,12 +1244,13 @@ def process_claimed_job(
         )
 
     if is_diary_nightly:
+        eff_counts = _effective_satisfied_counts()
         missing_final: list[str] = []
-        if satisfied_counts["public"] < 1:
+        if eff_counts["public"] < 1:
             missing_final.append("public")
-        if satisfied_counts["private"] < 2:
+        if eff_counts["private"] < 2:
             missing_final.append("private")
-        if satisfied_counts["wander"] < 1:
+        if eff_counts["wander"] < 1:
             missing_final.append("wander")
         if missing_final:
             raise NightlyMissingDiaryError(missing_final)
@@ -1195,6 +1285,7 @@ def process_claimed_job(
         skipped_dedupe_count=total_skipped,
         dry_run=dry_run,
         model_route=dict(last_model_route) if last_model_route else None,
+        diary_rate_limited_count=total_diary_rate_limited,
     )
 
 
@@ -1236,6 +1327,8 @@ def run_worker_once(
                 "applied": res.applied_count,
                 "skipped_dedupe": res.skipped_dedupe_count,
             }
+            if res.diary_rate_limited_count > 0:
+                summary_payload["diary_rate_limited"] = res.diary_rate_limited_count
             if res.model_route:
                 summary_payload["model_route"] = res.model_route
             store.ack_job_success(

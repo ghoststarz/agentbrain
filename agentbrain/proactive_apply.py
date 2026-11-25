@@ -16,7 +16,13 @@ import yaml
 from agentbrain.acl import display_client_id
 from agentbrain.atomic import atomic_write_text
 from agentbrain.config import AppConfig
-from agentbrain.diary import DiaryGateError, append_diary, normalize_diary_kind
+from agentbrain.diary import (
+    DiaryGateError,
+    append_diary,
+    normalize_diary_author,
+    normalize_diary_kind,
+    strip_wander_prefix,
+)
 from agentbrain.handoff import handoff_path, read_handoff, upsert_handoff
 from agentbrain.index import reindex
 from agentbrain.proactive import ClaimedJob, LeaseMismatchError, ProactiveStore, StoredEvent
@@ -97,6 +103,7 @@ class ApplySummary:
     reindexed: bool
     operations: list[dict[str, Any]]
     post_write_hashes: dict[str, str] = field(default_factory=dict)
+    diary_rate_limited_count: int = 0
 
 
 def sha256_text(text: str) -> str:
@@ -1192,7 +1199,7 @@ def _resolve_diary_datetime(
 
 
 def _diary_entry_body(content: str, *, kind: str = "daily") -> str:
-    clean = " ".join(str(content or "").split())
+    clean = " ".join(strip_wander_prefix(content).split())
     if kind == "wander" and clean:
         return f"[wander] {clean}"
     return clean
@@ -1231,18 +1238,23 @@ def _replace_diary_auto_entry(
     now_dt: dt.datetime,
     old_kind: str = "daily",
     new_kind: str = "daily",
+    author: str = "",
 ) -> bool:
     """在日记文件中就地更新同一证据来源的自动条目（精确匹配旧正文，绝不误改其他条目）。"""
     if not target.exists():
         return False
     norm_old = _diary_entry_body(old_content, kind=old_kind)
+    clean_new = strip_wander_prefix(new_content)
+    if not clean_new:
+        return False
+    clean_author = normalize_diary_author(author)
     lines = target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
     for idx, line in enumerate(lines):
         m = _DIARY_LINE_RE.match(line.strip())
         if m and " ".join(m.group(1).split()) == norm_old:
             time_str = now_dt.strftime("%H:%M:%S")
             kind_tag = " [wander]" if new_kind == "wander" else ""
-            lines[idx] = f"- [{time_str}] (proactive){kind_tag} {new_content.strip()}\n"
+            lines[idx] = f"- [{time_str}] ({clean_author}){kind_tag} {clean_new}\n"
             atomic_write_text(target, "".join(lines))
             return True
     return False
@@ -1667,7 +1679,7 @@ def validate_and_apply_batch(
 
         elif op_type == "diary_append":
             ledger = str(op.get("ledger") or "").strip().lower()
-            content = str(op.get("content") or "").strip()
+            content = strip_wander_prefix(str(op.get("content") or ""))
             if ledger not in ("public", "private"):
                 raise BatchValidationError(f"operation[{idx}] 非法 diary ledger: {ledger!r}")
             if not content:
@@ -1683,6 +1695,7 @@ def validate_and_apply_batch(
             rel = f"30_Diary/{'Public' if ledger == 'public' else 'Private'}/{date_str}.md"
             _assert_no_symlink_escape(config, rel)
             op["ledger"] = ledger
+            op["content"] = content
             op["_resolved_dt"] = target_dt
             op["_resolved_date"] = date_str
             op["_resolved_rel"] = rel
@@ -1718,6 +1731,7 @@ def validate_and_apply_batch(
     lock = write_lock or threading.Lock()
     applied_count = 0
     skipped_dedupe = 0
+    diary_rate_limited = 0
     touched_non_diary = False
     touched_project = False
     op_records: list[dict[str, Any]] = []
@@ -1746,50 +1760,86 @@ def validate_and_apply_batch(
                     )
 
         diary_used_times: dict[str, set[str]] = {}
-        for op in validated_ops:
-            op_id = op["_op_id"]
-            op_type = op["op_type"]
-            dedupe_key = op["_dedupe_key"]
-            rel = op["_resolved_rel"]
+        try:
+            for op in validated_ops:
+                op_id = op["_op_id"]
+                op_type = op["op_type"]
+                dedupe_key = op["_dedupe_key"]
+                rel = op["_resolved_rel"]
 
-            # 仅按 op_id 检查当前任务重放幂等；状态类不作全局历史内容去重，避免抑制 A->B->A
-            if store.is_op_applied(op_id):
-                skipped_dedupe += 1
-                op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_dedupe"})
-                continue
+                # 仅按 op_id 检查当前任务重放幂等；状态类不作全局历史内容去重，避免抑制 A->B->A
+                if store.is_op_applied(op_id):
+                    skipped_dedupe += 1
+                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_dedupe"})
+                    continue
 
-            if op_type == "diary_append":
-                op_kind = str(op.get("kind") or "daily")
-                diary_target = _assert_no_symlink_escape(config, rel)
-                if rel not in diary_used_times:
-                    diary_used_times[rel] = _existing_diary_timestamps(diary_target)
-                journal = store.get_adapter_cursor("diary_journal", dedupe_key)
-                norm_new = " ".join(op["content"].split())
-                if journal is not None:
-                    prev_content = str(journal.get("content") or "")
-                    prev_kind = str(journal.get("kind") or "daily")
-                    if " ".join(prev_content.split()) == norm_new and prev_kind == op_kind:
-                        store.record_applied_op(
-                            op_id=op_id,
-                            job_id=job.job_id,
-                            job_idempotency_key=job.idempotency_key,
-                            op_type=op_type,
-                            dedupe_key=dedupe_key,
-                            target_path=rel,
-                            target_date=op["_resolved_date"],
-                            source_refs=op["source_refs"],
-                        )
-                        skipped_dedupe += 1
-                        op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_dedupe"})
-                        continue
-                    eff_dt = _allocate_unique_diary_dt(op["_resolved_dt"], diary_used_times[rel])
-                    if _replace_diary_auto_entry(
-                        diary_target,
-                        prev_content,
+                if op_type == "diary_append":
+                    op_kind = str(op.get("kind") or "daily")
+                    diary_target = _assert_no_symlink_escape(config, rel)
+                    if rel not in diary_used_times:
+                        diary_used_times[rel] = _existing_diary_timestamps(diary_target)
+                    journal = store.get_adapter_cursor("diary_journal", dedupe_key)
+                    norm_new = " ".join(op["content"].split())
+                    if journal is not None:
+                        prev_content = str(journal.get("content") or "")
+                        prev_kind = str(journal.get("kind") or "daily")
+                        if " ".join(strip_wander_prefix(prev_content).split()) == norm_new and prev_kind == op_kind:
+                            store.record_applied_op(
+                                op_id=op_id,
+                                job_id=job.job_id,
+                                job_idempotency_key=job.idempotency_key,
+                                op_type=op_type,
+                                dedupe_key=dedupe_key,
+                                target_path=rel,
+                                target_date=op["_resolved_date"],
+                                source_refs=op["source_refs"],
+                            )
+                            skipped_dedupe += 1
+                            op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_dedupe"})
+                            continue
+                        eff_dt = _allocate_unique_diary_dt(op["_resolved_dt"], diary_used_times[rel])
+                        if _replace_diary_auto_entry(
+                            diary_target,
+                            prev_content,
+                            op["content"],
+                            now_dt=eff_dt,
+                            old_kind=prev_kind,
+                            new_kind=op_kind,
+                            author=job.client or "",
+                        ):
+                            store.set_adapter_cursor(
+                                "diary_journal",
+                                dedupe_key,
+                                {
+                                    "target_path": rel,
+                                    "target_date": op["_resolved_date"],
+                                    "content": op["content"],
+                                    "kind": op_kind,
+                                    "op_id": op_id,
+                                },
+                            )
+                            store.record_applied_op(
+                                op_id=op_id,
+                                job_id=job.job_id,
+                                job_idempotency_key=job.idempotency_key,
+                                op_type=op_type,
+                                dedupe_key=dedupe_key,
+                                target_path=rel,
+                                target_date=op["_resolved_date"],
+                                source_refs=op["source_refs"],
+                            )
+                            applied_count += 1
+                            op_records.append(
+                                {"op_id": op_id, "op_type": op_type, "status": "updated", "target_rel": rel}
+                            )
+                            continue
+
+                    if _diary_contains_exact_entry(
+                        config,
+                        op["ledger"],
+                        op["_resolved_date"],
                         op["content"],
-                        now_dt=eff_dt,
-                        old_kind=prev_kind,
-                        new_kind=op_kind,
+                        kind=op_kind,
                     ):
                         store.set_adapter_cursor(
                             "diary_journal",
@@ -1812,19 +1862,33 @@ def validate_and_apply_batch(
                             target_date=op["_resolved_date"],
                             source_refs=op["source_refs"],
                         )
-                        applied_count += 1
-                        op_records.append(
-                            {"op_id": op_id, "op_type": op_type, "status": "updated", "target_rel": rel}
-                        )
+                        skipped_dedupe += 1
+                        op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_crash_idempotent"})
                         continue
 
-                if _diary_contains_exact_entry(
-                    config,
-                    op["ledger"],
-                    op["_resolved_date"],
-                    op["content"],
-                    kind=op_kind,
-                ):
+                    eff_dt = _allocate_unique_diary_dt(op["_resolved_dt"], diary_used_times[rel])
+                    diary_res = append_diary(
+                        config,
+                        ledger=op["ledger"],
+                        content=op["content"],
+                        author=normalize_diary_author(job.client or ""),
+                        kind=op_kind,
+                        can_casual=False,
+                        now=eff_dt,
+                    )
+                    if diary_res.get("skipped_duplicate"):
+                        skipped_dedupe += 1
+                        op_records.append(
+                            {"op_id": op_id, "op_type": op_type, "status": "skipped_duplicate", "target_rel": rel}
+                        )
+                        continue
+                    if diary_res.get("skipped_limit"):
+                        skipped_dedupe += 1
+                        diary_rate_limited += 1
+                        op_records.append(
+                            {"op_id": op_id, "op_type": op_type, "status": "skipped_limit", "target_rel": rel}
+                        )
+                        continue
                     store.set_adapter_cursor(
                         "diary_journal",
                         dedupe_key,
@@ -1836,136 +1900,123 @@ def validate_and_apply_batch(
                             "op_id": op_id,
                         },
                     )
-                    store.record_applied_op(
-                        op_id=op_id,
-                        job_id=job.job_id,
-                        job_idempotency_key=job.idempotency_key,
-                        op_type=op_type,
-                        dedupe_key=dedupe_key,
-                        target_path=rel,
-                        target_date=op["_resolved_date"],
-                        source_refs=op["source_refs"],
-                    )
-                    skipped_dedupe += 1
-                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_crash_idempotent"})
-                    continue
 
-                eff_dt = _allocate_unique_diary_dt(op["_resolved_dt"], diary_used_times[rel])
-                append_diary(
-                    config,
-                    ledger=op["ledger"],
-                    content=op["content"],
-                    author=("antigravity" if str(job.client or "").startswith(("agy", "antigravity")) else "hermes"),
-                    kind=op_kind,
-                    can_casual=False,
-                    now=eff_dt,
-                )
-                store.set_adapter_cursor(
-                    "diary_journal",
-                    dedupe_key,
-                    {
-                        "target_path": rel,
-                        "target_date": op["_resolved_date"],
-                        "content": op["content"],
-                        "kind": op_kind,
-                        "op_id": op_id,
-                    },
-                )
+                elif op_type == "longterm_upsert":
+                    note_type = str(op["note_type"]).strip().lower()
+                    title = str(op["title"]).strip()
+                    content = str(op["content"]).strip()
+                    scope = str(op.get("scope") or "global").strip().lower()
+                    fact_key = str(op.get("fact_key") or "").strip() or None
+                    merge_into = op.get("_merge_into")
 
-            elif op_type == "longterm_upsert":
-                note_type = str(op["note_type"]).strip().lower()
-                title = str(op["title"]).strip()
-                content = str(op["content"]).strip()
-                scope = str(op.get("scope") or "global").strip().lower()
-                fact_key = str(op.get("fact_key") or "").strip() or None
-                merge_into = op.get("_merge_into")
-
-                if op.get("_needs_seq_alloc"):
-                    # 写锁内重新解析（避免同批次前序 op 已新建同名/同键文件，并在锁内单调分配序号）
-                    locked_rel = _find_existing_fact_key_path(config, fact_key) if fact_key else None
-                    if locked_rel is None and merge_into:
-                        locked_rel = _find_merge_target_path(config, merge_into)
-                    if locked_rel is None:
-                        locked_rel = _find_exact_title_target_path(config, note_type, title)
-                    if locked_rel is not None:
-                        rel = locked_rel
+                    if op.get("_needs_seq_alloc"):
+                        # 写锁内重新解析（避免同批次前序 op 已新建同名/同键文件，并在锁内单调分配序号）
+                        locked_rel = _find_existing_fact_key_path(config, fact_key) if fact_key else None
+                        if locked_rel is None and merge_into:
+                            locked_rel = _find_merge_target_path(config, merge_into)
+                        if locked_rel is None:
+                            locked_rel = _find_exact_title_target_path(config, note_type, title)
+                        if locked_rel is not None:
+                            rel = locked_rel
+                        else:
+                            seq = _allocate_next_seq(config, note_type)
+                            rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, seq=seq)}"
+                        target = _assert_safe_profile_subpath(config, rel)
+                        op["_resolved_rel"] = rel
+                        op["_resolved_target"] = target
                     else:
-                        seq = _allocate_next_seq(config, note_type)
-                        rel = f"{_LONGTERM_DIRS[note_type]}/{_build_new_note_filename(note_type, title, seq=seq)}"
-                    target = _assert_safe_profile_subpath(config, rel)
-                    op["_resolved_rel"] = rel
-                    op["_resolved_target"] = target
-                else:
-                    target = op["_resolved_target"]
+                        target = op["_resolved_target"]
 
-                existing = target.read_text(encoding="utf-8") if target.exists() else None
-                session_sources = _extract_session_sources(op["source_refs"])
-                if not session_sources:
-                    # source_refs 可能是「短事件 id」（如 turn:12），抽不出会话标识；
-                    # 这时从命中的事件本身取 session_id，别让「来源」整节凭空消失。
-                    seen_sids: set[str] = set()
-                    for _ev in op.get("_matched_events") or []:
-                        _sid = str(getattr(_ev, "session_id", "") or "").strip()
-                        if not _sid or _sid in seen_sids:
-                            continue
-                        seen_sids.add(_sid)
-                        session_sources.append(
-                            (display_client_id(str(getattr(_ev, "client", ""))) or "hermes", _sid)
-                        )
-                extra_excludes: set[str] = set()
-                if scope == "project":
-                    extra_excludes.add(str(op.get("_project_raw") or ""))
-                    extra_excludes.add(str(op.get("_project_stem") or ""))
-                candidate_links, exclude_names = _collect_candidate_links(
-                    config,
-                    op_links=list(op.get("links") or []),
-                    title=title,
-                    content=content,
-                    self_rel=rel,
-                    self_stem=target.stem,
-                    extra_excludes=extra_excludes,
-                )
+                    existing = target.read_text(encoding="utf-8") if target.exists() else None
+                    session_sources = _extract_session_sources(op["source_refs"])
+                    if not session_sources:
+                        # source_refs 可能是「短事件 id」（如 turn:12），抽不出会话标识；
+                        # 这时从命中的事件本身取 session_id，别让「来源」整节凭空消失。
+                        seen_sids: set[str] = set()
+                        for _ev in op.get("_matched_events") or []:
+                            _sid = str(getattr(_ev, "session_id", "") or "").strip()
+                            if not _sid or _sid in seen_sids:
+                                continue
+                            seen_sids.add(_sid)
+                            session_sources.append(
+                                (display_client_id(str(getattr(_ev, "client", ""))) or "hermes", _sid)
+                            )
+                    extra_excludes: set[str] = set()
+                    if scope == "project":
+                        extra_excludes.add(str(op.get("_project_raw") or ""))
+                        extra_excludes.add(str(op.get("_project_stem") or ""))
+                    candidate_links, exclude_names = _collect_candidate_links(
+                        config,
+                        op_links=list(op.get("links") or []),
+                        title=title,
+                        content=content,
+                        self_rel=rel,
+                        self_stem=target.stem,
+                        extra_excludes=extra_excludes,
+                    )
 
-                if scope == "project":
-                    proj_title = str(op.get("_project_raw") or op.get("_project_stem") or title)
-                    if existing is None:
-                        fm_proj: dict[str, Any] = {
-                            "type": "project",
-                            "title": proj_title,
-                            "summary": op.get("summary") or _derive_note_summary(content),
-                            "proactive_owned": True,
-                            "created": today_str,
-                            "updated": today_str,
-                            "source": op["_trusted_source"],
-                            "domain": op["_trusted_domain"],
-                            "status": "active",
-                            "evidence_level": op["evidence_level"],
-                        }
-                        if fact_key:
-                            fm_proj["fact_key"] = fact_key
-                        proj_keys = _merge_str_list_ordered([], _normalize_str_list(op.get("keys")))
-                        if proj_keys:
-                            fm_proj["keys"] = proj_keys
-                        proj_tags = _merge_str_list_ordered([], _normalize_str_list(op.get("tags")))
-                        if proj_tags:
-                            fm_proj["tags"] = proj_tags
-                        proj_refs = _merge_str_list_ordered([], op["source_refs"], limit=MAX_SOURCE_REFS)
-                        if proj_refs:
-                            fm_proj["source_refs"] = proj_refs
-                        link_lines = _merge_link_lines([], candidate_links, exclude_names=exclude_names)
-                        source_lines = _format_source_lines(session_sources)
-                        managed_body = _render_managed_sections(
-                            "",
-                            [_ManagedSection(heading=title, body=content, section_key=op.get("section_key"))],
-                            link_lines,
-                            source_lines,
-                        )
-                        header = f"{_dump_frontmatter(fm_proj)}\n# {proj_title}\n\n"
-                        rendered = _merge_managed_block(None, default_header=header, managed_body=managed_body)
+                    if scope == "project":
+                        proj_title = str(op.get("_project_raw") or op.get("_project_stem") or title)
+                        if existing is None:
+                            fm_proj: dict[str, Any] = {
+                                "type": "project",
+                                "title": proj_title,
+                                "summary": op.get("summary") or _derive_note_summary(content),
+                                "proactive_owned": True,
+                                "created": today_str,
+                                "updated": today_str,
+                                "source": op["_trusted_source"],
+                                "domain": op["_trusted_domain"],
+                                "status": "active",
+                                "evidence_level": op["evidence_level"],
+                            }
+                            if fact_key:
+                                fm_proj["fact_key"] = fact_key
+                            proj_keys = _merge_str_list_ordered([], _normalize_str_list(op.get("keys")))
+                            if proj_keys:
+                                fm_proj["keys"] = proj_keys
+                            proj_tags = _merge_str_list_ordered([], _normalize_str_list(op.get("tags")))
+                            if proj_tags:
+                                fm_proj["tags"] = proj_tags
+                            proj_refs = _merge_str_list_ordered([], op["source_refs"], limit=MAX_SOURCE_REFS)
+                            if proj_refs:
+                                fm_proj["source_refs"] = proj_refs
+                            link_lines = _merge_link_lines([], candidate_links, exclude_names=exclude_names)
+                            source_lines = _format_source_lines(session_sources)
+                            managed_body = _render_managed_sections(
+                                "",
+                                [_ManagedSection(heading=title, body=content, section_key=op.get("section_key"))],
+                                link_lines,
+                                source_lines,
+                            )
+                            header = f"{_dump_frontmatter(fm_proj)}\n# {proj_title}\n\n"
+                            rendered = _merge_managed_block(None, default_header=header, managed_body=managed_body)
+                        else:
+                            rendered = _format_longterm_note_content(
+                                existing_text=existing,
+                                note_type="project",
+                                title=title,
+                                content=content,
+                                keys=_normalize_str_list(op.get("keys")),
+                                tags=_normalize_str_list(op.get("tags")),
+                                fact_key=fact_key,
+                                evidence_level=op["evidence_level"],
+                                source_refs=op["source_refs"],
+                                trusted_source=op["_trusted_source"],
+                                trusted_domain=op["_trusted_domain"],
+                                today_str=today_str,
+                                candidate_links=candidate_links,
+                                exclude_link_names=exclude_names,
+                                session_sources=session_sources,
+                                as_section=True,
+                                section_key=op.get("section_key"),
+                                summary=op.get("summary"),
+                            )
+                        touched_project = True
                     else:
                         rendered = _format_longterm_note_content(
                             existing_text=existing,
-                            note_type="project",
+                            note_type=note_type,
                             title=title,
                             content=content,
                             keys=_normalize_str_list(op.get("keys")),
@@ -1979,180 +2030,166 @@ def validate_and_apply_batch(
                             candidate_links=candidate_links,
                             exclude_link_names=exclude_names,
                             session_sources=session_sources,
-                            as_section=True,
                             section_key=op.get("section_key"),
                             summary=op.get("summary"),
                         )
-                    touched_project = True
-                else:
-                    rendered = _format_longterm_note_content(
-                        existing_text=existing,
-                        note_type=note_type,
+
+                    if existing is not None and existing == rendered:
+                        skipped_dedupe += 1
+                        op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(target, rendered)
+                    post_write_hashes[rel] = sha256_text(rendered)
+                    touched_non_diary = True
+
+                elif op_type == "project_update":
+                    target = op["_resolved_target"]
+                    existing = target.read_text(encoding="utf-8") if target.exists() else None
+                    title = str(op.get("title") or op.get("_project_raw") or op["project"])
+                    candidate_links, exclude_names = _collect_candidate_links(
+                        config,
+                        op_links=list(op.get("links") or []),
                         title=title,
-                        content=content,
-                        keys=_normalize_str_list(op.get("keys")),
-                        tags=_normalize_str_list(op.get("tags")),
-                        fact_key=fact_key,
-                        evidence_level=op["evidence_level"],
-                        source_refs=op["source_refs"],
-                        trusted_source=op["_trusted_source"],
-                        trusted_domain=op["_trusted_domain"],
-                        today_str=today_str,
-                        candidate_links=candidate_links,
-                        exclude_link_names=exclude_names,
-                        session_sources=session_sources,
-                        section_key=op.get("section_key"),
-                        summary=op.get("summary"),
+                        content=op["managed_content"],
+                        self_rel=rel,
+                        self_stem=target.stem,
+                        extra_excludes={str(op.get("project") or ""), str(op.get("_project_raw") or "")},
                     )
+                    existing_managed = _extract_managed_block(existing) if existing is not None else None
+                    _, existing_sections, existing_links = _parse_managed_sections(existing_managed)
+                    link_lines = _merge_link_lines(existing_links, candidate_links, exclude_names=exclude_names)
+                    managed_body = _render_managed_sections(op["managed_content"], existing_sections, link_lines)
 
-                if existing is not None and existing == rendered:
-                    skipped_dedupe += 1
-                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(target, rendered)
-                post_write_hashes[rel] = sha256_text(rendered)
-                touched_non_diary = True
-
-            elif op_type == "project_update":
-                target = op["_resolved_target"]
-                existing = target.read_text(encoding="utf-8") if target.exists() else None
-                title = str(op.get("title") or op.get("_project_raw") or op["project"])
-                candidate_links, exclude_names = _collect_candidate_links(
-                    config,
-                    op_links=list(op.get("links") or []),
-                    title=title,
-                    content=op["managed_content"],
-                    self_rel=rel,
-                    self_stem=target.stem,
-                    extra_excludes={str(op.get("project") or ""), str(op.get("_project_raw") or "")},
-                )
-                existing_managed = _extract_managed_block(existing) if existing is not None else None
-                _, existing_sections, existing_links = _parse_managed_sections(existing_managed)
-                link_lines = _merge_link_lines(existing_links, candidate_links, exclude_names=exclude_names)
-                managed_body = _render_managed_sections(op["managed_content"], existing_sections, link_lines)
-
-                explicit_summary = op.get("summary")
-                derived_summary = _derive_note_summary(op["managed_content"])
-                if existing is None:
-                    fm_new: dict[str, Any] = {
-                        "type": "project",
-                        "title": title,
-                        "summary": explicit_summary or derived_summary,
-                        "proactive_owned": True,
-                        "status": "active",
-                    }
-                    default_header = f"{_dump_frontmatter(fm_new)}\n# {title}\n\n"
-                    merged = _merge_managed_block(
-                        None,
-                        default_header=default_header,
-                        managed_body=managed_body,
-                    )
-                else:
-                    fm_cur, body_cur = _parse_frontmatter_and_body(existing)
-                    fm_changed = False
-                    if explicit_summary and str(fm_cur.get("summary") or "").strip() != explicit_summary:
-                        fm_cur["summary"] = explicit_summary
-                        fm_changed = True
-                    elif not str(fm_cur.get("summary") or "").strip() and derived_summary:
-                        fm_cur["summary"] = derived_summary
-                        fm_changed = True
-                    if fm_changed:
-                        if not fm_cur.get("type"):
-                            fm_cur["type"] = "project"
-                        if not fm_cur.get("title"):
-                            fm_cur["title"] = title
-                        merged_body = _merge_managed_block(
-                            body_cur.lstrip("\r\n"),
-                            default_header=f"# {fm_cur.get('title') or title}\n\n",
-                            managed_body=managed_body,
-                        )
-                        merged = f"{_dump_frontmatter(fm_cur)}\n{merged_body}"
-                    else:
-                        default_header = (
-                            f"---\ntype: project\ntitle: {json.dumps(title, ensure_ascii=False)}\n"
-                            f"proactive_owned: true\nstatus: active\n---\n\n# {title}\n\n"
-                        )
+                    explicit_summary = op.get("summary")
+                    derived_summary = _derive_note_summary(op["managed_content"])
+                    if existing is None:
+                        fm_new: dict[str, Any] = {
+                            "type": "project",
+                            "title": title,
+                            "summary": explicit_summary or derived_summary,
+                            "proactive_owned": True,
+                            "status": "active",
+                        }
+                        default_header = f"{_dump_frontmatter(fm_new)}\n# {title}\n\n"
                         merged = _merge_managed_block(
-                            existing,
+                            None,
                             default_header=default_header,
                             managed_body=managed_body,
                         )
-                if existing is not None and existing == merged:
-                    skipped_dedupe += 1
-                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(target, merged)
-                post_write_hashes[rel] = sha256_text(merged)
-                touched_non_diary = True
-                touched_project = True
+                    else:
+                        fm_cur, body_cur = _parse_frontmatter_and_body(existing)
+                        fm_changed = False
+                        if explicit_summary and str(fm_cur.get("summary") or "").strip() != explicit_summary:
+                            fm_cur["summary"] = explicit_summary
+                            fm_changed = True
+                        elif not str(fm_cur.get("summary") or "").strip() and derived_summary:
+                            fm_cur["summary"] = derived_summary
+                            fm_changed = True
+                        if fm_changed:
+                            if not fm_cur.get("type"):
+                                fm_cur["type"] = "project"
+                            if not fm_cur.get("title"):
+                                fm_cur["title"] = title
+                            merged_body = _merge_managed_block(
+                                body_cur.lstrip("\r\n"),
+                                default_header=f"# {fm_cur.get('title') or title}\n\n",
+                                managed_body=managed_body,
+                            )
+                            merged = f"{_dump_frontmatter(fm_cur)}\n{merged_body}"
+                        else:
+                            default_header = (
+                                f"---\ntype: project\ntitle: {json.dumps(title, ensure_ascii=False)}\n"
+                                f"proactive_owned: true\nstatus: active\n---\n\n# {title}\n\n"
+                            )
+                            merged = _merge_managed_block(
+                                existing,
+                                default_header=default_header,
+                                managed_body=managed_body,
+                            )
+                    if existing is not None and existing == merged:
+                        skipped_dedupe += 1
+                        op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(target, merged)
+                    post_write_hashes[rel] = sha256_text(merged)
+                    touched_non_diary = True
+                    touched_project = True
 
-            elif op_type == "hot_update":
-                target = op["_resolved_target"]
-                desired_hot = str(op["content"]).strip() + "\n"
-                if target.exists() and target.read_text(encoding="utf-8") == desired_hot:
-                    skipped_dedupe += 1
-                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(target, desired_hot)
-                post_write_hashes[rel] = sha256_text(desired_hot)
-                touched_non_diary = True
+                elif op_type == "hot_update":
+                    target = op["_resolved_target"]
+                    desired_hot = str(op["content"]).strip() + "\n"
+                    if target.exists() and target.read_text(encoding="utf-8") == desired_hot:
+                        skipped_dedupe += 1
+                        op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(target, desired_hot)
+                    post_write_hashes[rel] = sha256_text(desired_hot)
+                    touched_non_diary = True
 
-            elif op_type == "handoff_upsert":
-                h_data = read_handoff(config)
-                existing_task = next(
-                    (
-                        t
-                        for t in (h_data.get("tasks") or [])
-                        if isinstance(t, dict) and str(t.get("task_key") or "") == op["task_key"]
-                    ),
-                    None,
+                elif op_type == "handoff_upsert":
+                    h_data = read_handoff(config)
+                    existing_task = next(
+                        (
+                            t
+                            for t in (h_data.get("tasks") or [])
+                            if isinstance(t, dict) and str(t.get("task_key") or "") == op["task_key"]
+                        ),
+                        None,
+                    )
+                    desired_steps = list(op.get("next_steps") or [])
+                    desired_files = list(op.get("touched_files") or [])
+                    if (
+                        existing_task is not None
+                        and str(existing_task.get("status") or "") == op["status"]
+                        and str(existing_task.get("summary") or "") == op["summary"]
+                        and list(existing_task.get("next_steps") or []) == desired_steps
+                        and list(existing_task.get("touched_files") or []) == desired_files
+                    ):
+                        skipped_dedupe += 1
+                        op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
+                        continue
+                    upsert_handoff(
+                        config,
+                        task_key=op["task_key"],
+                        status=op["status"],
+                        summary=op["summary"],
+                        next_steps=op.get("next_steps"),
+                        touched_files=op.get("touched_files"),
+                        updated_by="proactive",
+                    )
+                    touched_non_diary = True
+
+                store.record_applied_op(
+                    op_id=op_id,
+                    job_id=job.job_id,
+                    job_idempotency_key=job.idempotency_key,
+                    op_type=op_type,
+                    dedupe_key=dedupe_key,
+                    target_path=rel,
+                    target_date=op.get("_resolved_date"),
+                    source_refs=op["source_refs"],
                 )
-                desired_steps = list(op.get("next_steps") or [])
-                desired_files = list(op.get("touched_files") or [])
-                if (
-                    existing_task is not None
-                    and str(existing_task.get("status") or "") == op["status"]
-                    and str(existing_task.get("summary") or "") == op["summary"]
-                    and list(existing_task.get("next_steps") or []) == desired_steps
-                    and list(existing_task.get("touched_files") or []) == desired_files
-                ):
-                    skipped_dedupe += 1
-                    op_records.append({"op_id": op_id, "op_type": op_type, "status": "skipped_no_change"})
-                    continue
-                upsert_handoff(
-                    config,
-                    task_key=op["task_key"],
-                    status=op["status"],
-                    summary=op["summary"],
-                    next_steps=op.get("next_steps"),
-                    touched_files=op.get("touched_files"),
-                    updated_by="proactive",
+                applied_count += 1
+                op_records.append({"op_id": op_id, "op_type": op_type, "status": "applied", "target_rel": rel})
+
+            if touched_project:
+                _regenerate_project_overview(config)
+
+            reindexed = False
+            if touched_non_diary:
+                reindex(config)
+                reindexed = True
+        except OSError as exc:
+            if applied_count > 0:
+                msg = (
+                    f"批量写入中途发生 I/O 异常（部分已写：{applied_count} 条已记入 "
+                    f"proactive_applied_ops）：{exc}"
                 )
-                touched_non_diary = True
-
-            store.record_applied_op(
-                op_id=op_id,
-                job_id=job.job_id,
-                job_idempotency_key=job.idempotency_key,
-                op_type=op_type,
-                dedupe_key=dedupe_key,
-                target_path=rel,
-                target_date=op.get("_resolved_date"),
-                source_refs=op["source_refs"],
-            )
-            applied_count += 1
-            op_records.append({"op_id": op_id, "op_type": op_type, "status": "applied", "target_rel": rel})
-
-        if touched_project:
-            _regenerate_project_overview(config)
-
-        reindexed = False
-        if touched_non_diary:
-            reindex(config)
-            reindexed = True
+                raise OSError(msg) from exc
+            raise
 
     if applied_count > 0:
         try:
@@ -2170,4 +2207,5 @@ def validate_and_apply_batch(
         reindexed=reindexed,
         operations=op_records,
         post_write_hashes=post_write_hashes,
+        diary_rate_limited_count=diary_rate_limited,
     )

@@ -136,6 +136,8 @@ class ProactiveConfig:
     nightly_split_enabled: bool = True
     nightly_split_threshold_chars: int = 0
     nightly_enabled: bool = True
+    diary_dedupe_similarity: float = 0.60
+    diary_max_entries_per_day: int = 10
 
 
 _KNOWN_PROACTIVE_KEYS = frozenset(f.name for f in fields(ProactiveConfig))
@@ -395,6 +397,12 @@ def load_memory_config(
             f"proactive.section_audit_min_similarity 必须在 [0.0, 1.0] 范围内，收到: {section_audit_min_similarity!r}"
         )
     section_audit_max_files = max(1, int(proactive_raw.get("section_audit_max_files", 3)))
+    diary_dedupe_similarity = float(proactive_raw.get("diary_dedupe_similarity", 0.60))
+    if not (0.0 <= diary_dedupe_similarity <= 1.0):
+        raise ProactiveConfigError(
+            f"proactive.diary_dedupe_similarity 必须在 [0.0, 1.0] 范围内，收到: {diary_dedupe_similarity!r}"
+        )
+    diary_max_entries_per_day = max(0, int(proactive_raw.get("diary_max_entries_per_day", 10)))
 
     proactive = ProactiveConfig(
         enabled=enabled,
@@ -438,6 +446,8 @@ def load_memory_config(
         nightly_split_enabled=_require_bool(proactive_raw, "nightly_split_enabled", True),
         nightly_split_threshold_chars=max(0, int(proactive_raw.get("nightly_split_threshold_chars", 0))),
         nightly_enabled=nightly_enabled,
+        diary_dedupe_similarity=diary_dedupe_similarity,
+        diary_max_entries_per_day=diary_max_entries_per_day,
     )
     if enabled:
         validate_proactive_worker_config(proactive)

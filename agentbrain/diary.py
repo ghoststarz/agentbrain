@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import difflib
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,69 @@ def _check_gate(config: AppConfig, ledger: str, *, can_casual: bool = False) -> 
 
 VALID_DIARY_KINDS = frozenset({"daily", "wander"})
 _DIARY_ENTRY_LINE_RE = re.compile(r"^-\s*\[(\d{2}:\d{2}:\d{2})\]\s*(?:\([^)]*\))?\s*(.*)$")
+_WANDER_PREFIX_RE = re.compile(r"^(?:\[wander\]\s*)+", re.IGNORECASE)
+_WANDER_ANY_RE = re.compile(r"\[wander\]", re.IGNORECASE)
+_DEDUPE_STRIP_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]+")
+
+
+def strip_wander_prefix(content: str) -> str:
+    """剥离正文开头已有的 [wander] 标记（含多层），避免落盘产生重复标记。"""
+    return _WANDER_PREFIX_RE.sub("", str(content or "").strip()).strip()
+
+
+def _normalize_diary_for_dedupe(text: str) -> str:
+    """去 [wander] 标记、空白与标点，仅保留 CJK 字符与 ASCII 字母数字（小写）。"""
+    no_wander = _WANDER_ANY_RE.sub("", str(text or ""))
+    return _DEDUPE_STRIP_RE.sub("", no_wander).lower()
+
+
+def _cjk_bigram_jaccard(norm_a: str, norm_b: str) -> float:
+    """计算规范化文本的二元组 Jaccard 相似度。"""
+    if not norm_a or not norm_b:
+        return 0.0
+    grams_a = {norm_a[i : i + 2] for i in range(len(norm_a) - 1)} if len(norm_a) >= 2 else {norm_a}
+    grams_b = {norm_b[i : i + 2] for i in range(len(norm_b) - 1)} if len(norm_b) >= 2 else {norm_b}
+    union = grams_a | grams_b
+    if not union:
+        return 0.0
+    return len(grams_a & grams_b) / len(union)
+
+
+def _is_near_duplicate(
+    existing_entries: Iterable[str],
+    new_content: str,
+    threshold: float = 0.60,
+) -> bool:
+    """判断新日记正文是否与已有条目近义重复（规范化后取 CJK 二元组 Jaccard 与有序子序列相似度较大值）。"""
+    norm_new = _normalize_diary_for_dedupe(new_content)
+    if not norm_new:
+        return False
+    for existing in existing_entries:
+        norm_existing = _normalize_diary_for_dedupe(existing)
+        if not norm_existing:
+            continue
+        if norm_existing == norm_new:
+            return True
+        sim = max(
+            _cjk_bigram_jaccard(norm_existing, norm_new),
+            difflib.SequenceMatcher(None, norm_existing, norm_new).ratio(),
+        )
+        if sim >= threshold:
+            return True
+    return False
+
+
+def _extract_diary_entry_bodies(raw_text: str) -> list[str]:
+    """从单日日记全文中提取所有条目正文（不含时间戳与署名）。"""
+    bodies: list[str] = []
+    for line in raw_text.splitlines():
+        m = _DIARY_ENTRY_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        body = m.group(2).strip()
+        if body:
+            bodies.append(body)
+    return bodies
 
 
 def normalize_diary_kind(raw: str | None) -> str:
@@ -73,7 +138,7 @@ def append_diary(
     _check_gate(config, clean_ledger, can_casual=can_casual)
     clean_kind = normalize_diary_kind(kind)
 
-    clean_content = str(content or "").strip()
+    clean_content = strip_wander_prefix(content)
     if not clean_content:
         raise ValueError("diary content 不能为空")
 
@@ -85,13 +150,40 @@ def append_diary(
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / f"{date_str}.md"
 
+    existing: str | None = None
+    existing_entries: list[str] = []
+    if target_file.exists():
+        existing = target_file.read_text(encoding="utf-8")
+        existing_entries = _extract_diary_entry_bodies(existing)
+
+    dedupe_threshold = float(getattr(config.memory.proactive, "diary_dedupe_similarity", 0.60))
+    if existing_entries and _is_near_duplicate(existing_entries, clean_content, threshold=dedupe_threshold):
+        return {
+            "ok": True,
+            "skipped_duplicate": True,
+            "ledger": clean_ledger,
+            "kind": clean_kind,
+            "date": date_str,
+            "path": str(target_file),
+        }
+
+    max_entries = int(getattr(config.memory.proactive, "diary_max_entries_per_day", 10))
+    if max_entries > 0 and len(existing_entries) >= max_entries:
+        return {
+            "ok": True,
+            "skipped_limit": True,
+            "ledger": clean_ledger,
+            "kind": clean_kind,
+            "date": date_str,
+            "path": str(target_file),
+        }
+
     clean_author = normalize_diary_author(author)
     tag = f" ({clean_author})" if clean_author else ""
     kind_tag = " [wander]" if clean_kind == "wander" else ""
     line = f"- [{time_str}]{tag}{kind_tag} {clean_content}\n"
 
-    if target_file.exists():
-        existing = target_file.read_text(encoding="utf-8")
+    if existing is not None:
         if existing and not existing.endswith("\n"):
             existing += "\n"
         new_text = existing + line

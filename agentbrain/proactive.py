@@ -2276,6 +2276,27 @@ class ProactiveStore:
                 ).fetchone()
             return row is not None
 
+    def list_job_applied_diary_ledgers(self, job_id: int) -> set[str]:
+        """返回指定任务在 proactive_applied_ops 中已写入过日记的 ledger 集合（public / private）。"""
+        ledgers: set[str] = set()
+        with self._read() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT target_path, dedupe_key
+                FROM proactive_applied_ops
+                WHERE job_id = ? AND op_type = 'diary_append'
+                """,
+                (job_id,),
+            ).fetchall()
+        for row in rows:
+            path_l = str(row["target_path"] or "").replace("\\", "/").lower()
+            key_l = str(row["dedupe_key"] or "").lower()
+            if "/public/" in path_l or key_l.startswith("diary:public:"):
+                ledgers.add("public")
+            elif "/private/" in path_l or key_l.startswith("diary:private:"):
+                ledgers.add("private")
+        return ledgers
+
     def record_applied_op(
         self,
         *,
