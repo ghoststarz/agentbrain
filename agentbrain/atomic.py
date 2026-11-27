@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -13,6 +14,29 @@ if os.name == "nt":
     import msvcrt
 else:
     import fcntl
+
+# Windows 上 os.replace 会因目标被短暂占用（git 同步/杀软/Obsidian 编辑器）抛 WinError 5/32，
+# 实测一次批量写入因此中途失败。这类占用通常几十毫秒内释放，重试比让整批作废划算。
+_REPLACE_RETRIES = 6
+_REPLACE_BACKOFF_SECONDS = 0.05
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """os.replace，遇到权限类错误时指数退避重试。"""
+    last: OSError | None = None
+    for attempt in range(_REPLACE_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            # WinError 5 (拒绝访问) / 32 (共享冲突) 与 errno EACCES/EPERM 都是「被别人短暂持有」
+            winerror = getattr(exc, "winerror", None)
+            if winerror not in (5, 32) and exc.errno not in (13, 1):  # 13=EACCES, 1=EPERM
+                raise
+            last = exc
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (2**attempt))
+    assert last is not None
+    raise last
 
 
 @contextmanager
@@ -55,7 +79,7 @@ def atomic_write_bytes(path: str | Path, data: bytes) -> Path:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
-        os.replace(tmp_path, target)
+        _replace_with_retry(tmp_path, target)
     except Exception:
         if tmp_path.exists():
             try:

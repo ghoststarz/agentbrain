@@ -28,6 +28,31 @@ def test_atomic_write_json_roundtrip(tmp_path: Path) -> None:
     assert loaded == payload
 
 
+def test_atomic_write_retries_when_target_briefly_locked(tmp_path: Path, monkeypatch) -> None:
+    """WinError 5/32（git 同步、杀软、编辑器短暂占用目标）不应让整批写入作废。"""
+    import agentbrain.atomic as atomic_mod
+
+    target = tmp_path / "STATE.md"
+    atomic_write_text(target, "旧内容\n")
+
+    real_replace = atomic_mod.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise PermissionError(13, "拒绝访问")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(atomic_mod.os, "replace", flaky_replace)
+    monkeypatch.setattr(atomic_mod, "_REPLACE_BACKOFF_SECONDS", 0.0)
+    atomic_write_text(target, "新内容\n")
+    assert calls["n"] == 4
+    assert target.read_text(encoding="utf-8") == "新内容\n"
+    # 临时文件不残留
+    assert [p.name for p in target.parent.iterdir()] == ["STATE.md"]
+
+
 def test_config_paths_with_spaces_and_chinese(isolated_env: AppConfig) -> None:
     assert "Asteria Lily" in str(isolated_env.broker.vault_root)
     assert isolated_env.memory.profile == "lily"

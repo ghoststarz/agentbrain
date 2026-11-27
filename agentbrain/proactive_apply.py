@@ -1021,7 +1021,11 @@ def _format_longterm_note_content(
         fm["type"] = note_type
     if not fm.get("title"):
         fm["title"] = title
-    if clean_summary:
+    # 多小节笔记（大类事实页 / 项目页）的 summary 是「这一页是干什么的」，不能被某一个小节
+    # 的摘要顶掉——实测每写一节就把页摘要换成那一节的内容，MEMORY_INDEX 里整页描述就丢了。
+    # 单小节或零小节的笔记才允许随内容刷新。
+    existing_section_count = len(re.findall(r"<!--\s*section_key:", existing_text))
+    if clean_summary and (existing_section_count <= 1 or not str(fm.get("summary") or "").strip()):
         fm["summary"] = clean_summary
     elif not str(fm.get("summary") or "").strip():
         fm["summary"] = _derive_note_summary(content)
