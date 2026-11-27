@@ -255,10 +255,13 @@ def test_handwritten_write_still_creates_new_file(isolated_env: AppConfig) -> No
 
 
 def test_prompt_assets_cover_fact_pages_and_state_slots() -> None:
-    """提示词覆盖三本大类 FACT 页、四类 note_type、状态槽位且不含 no_change。"""
+    """提示词覆盖三本大类 FACT 页（按页标题寻址，不绑文件名）、可扩充新页、四类 note_type、状态槽位且不含 no_change。"""
     sys_text = load_prompt("review_system")
-    for token in ("FACT-15-工作", "FACT-16-日常", "FACT-17-创意", "状态.现在", "状态.这几天"):
+    # 用页标题寻址：vault 里的文件名带序号，序号会变（用户手改过 15/16/17 → 01/02/03），
+    # 提示词里写死文件名就会在下一次重排后指向不存在的页。
+    for token in ("`工作`", "`日常`", "`创意`", "merge_into", "状态.现在", "状态.这几天"):
         assert token in sys_text
+    assert "新开一本" in sys_text
     assert "no_change" not in sys_text
     for nt in ('"fact"', '"decision"', '"entity"', '"state"'):
         assert nt in sys_text
