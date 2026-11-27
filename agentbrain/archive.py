@@ -17,6 +17,16 @@ if TYPE_CHECKING:
 
 ARCHIVE_VERSION = 1
 _SCAN_ROOTS = ("10_Working", "20_LongTerm")
+# 排除 STATE*.md（如 20_LongTerm/Entities/STATE.md）：state 页是日常刷新状态页，永不归档；
+# 不按整个 Entities 目录排除，以免影响其他长期未访问实体页的正常归档。
+_NEVER_ARCHIVE_NAME_PREFIXES = ("STATE",)
+
+
+def _is_never_archive(file_path: Path) -> bool:
+    if file_path.suffix.lower() != ".md":
+        return False
+    stem_upper = file_path.stem.upper()
+    return any(stem_upper.startswith(prefix) for prefix in _NEVER_ARCHIVE_NAME_PREFIXES)
 
 
 @dataclass(frozen=True)
@@ -77,6 +87,8 @@ def plan_archive(
             continue
         for file_path in sorted(root.rglob("*")):
             if file_path.is_symlink() or not file_path.is_file():
+                continue
+            if _is_never_archive(file_path):
                 continue
             rel_path = file_path.relative_to(profile_dir).as_posix()
             try:

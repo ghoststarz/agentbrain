@@ -630,7 +630,6 @@ class BrokerService:
 
         today_str = dt.date.today().isoformat()
         target_dir = self.config.profile_dir / target_subdir
-        target_dir.mkdir(parents=True, exist_ok=True)
 
         safe_stem = _sanitize_filename(title_raw)
         upsert = bool(payload.get("upsert"))
@@ -640,6 +639,17 @@ class BrokerService:
         existing_target: Path | None = None
         if upsert:
             existing_target = _find_upsert_target(target_dir, safe_stem, previous_content, tags)
+        if upsert and "hermes-mirror" in tags and existing_target is None:
+            return {
+                "ok": True,
+                "path": None,
+                "title": title_raw,
+                "revision": get_current_revision(self.config),
+                "orphan_warning": False,
+                "suggested_links": [],
+                "skipped": "mirror_no_target",
+            }
+        target_dir.mkdir(parents=True, exist_ok=True)
         if existing_target is not None:
             # 镜像/更新语义：原地覆盖，保留原文件路径与 created，不再另存带时间戳的副本
             target_file = existing_target

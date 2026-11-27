@@ -44,6 +44,7 @@ _LONGTERM_DIRS: dict[str, str] = {
     "fact": "20_LongTerm/Facts",
     "decision": "20_LongTerm/Decisions",
     "entity": "20_LongTerm/Entities",
+    "state": "20_LongTerm/Entities",
     "moc": "20_LongTerm/MOC",
 }
 
@@ -193,9 +194,11 @@ def _build_new_note_filename(
     *,
     seq: int | None = None,
 ) -> str:
-    """按统一命名规范构造新建文件名（fact/decision 使用序号，project 保留中文与空格）。"""
-    norm = normalize_note_title(title)
+    """按统一命名规范构造新建文件名（fact/decision 使用序号，state 固定 STATE.md，project 保留中文与空格）。"""
     nt = str(note_type or "").strip().lower()
+    if nt == "state":
+        return "STATE.md"
+    norm = normalize_note_title(title)
     if nt == "fact":
         return f"FACT-{_format_seq(seq if seq is not None else 1)}-{norm}.md"
     if nt == "decision":
@@ -502,7 +505,7 @@ def _find_merge_target_path(config: AppConfig, merge_into: str) -> str | None:
 
 
 def _find_exact_title_target_path(config: AppConfig, note_type: str, title: str) -> str | None:
-    """按标题/stem 精确匹配同目录下的既有笔记（entity/moc 亦匹配目标标准文件名）。"""
+    """按标题/stem 精确匹配同目录下的既有笔记（entity/moc/state 亦匹配目标标准文件名）。"""
     clean_title = str(title or "").strip()
     if not clean_title:
         return None
@@ -512,7 +515,7 @@ def _find_exact_title_target_path(config: AppConfig, note_type: str, title: str)
     sanitized = _sanitize_filename(clean_title)
     expected_name = (
         _build_new_note_filename(note_type, clean_title)
-        if note_type in ("entity", "moc")
+        if note_type in ("entity", "moc", "state")
         else None
     )
     for md in sorted(sub_dir.glob("*.md")):
@@ -1462,11 +1465,18 @@ def validate_and_apply_batch(
                 raise BatchValidationError(f"operation[{idx}] {exc}") from exc
             op["kind"] = diary_kind
 
-        if (
+        allow_empty_refs = (
             job.job_type in ("nightly", "nightly_diary")
-            and op_type == "diary_append"
-            and (not events or diary_kind == "wander")
-        ):
+            and (
+                (op_type == "diary_append" and (not events or diary_kind == "wander"))
+                or (
+                    op_type == "longterm_upsert"
+                    and str(op.get("note_type") or "").strip().lower() == "state"
+                    and not events
+                )
+            )
+        )
+        if allow_empty_refs:
             raw_refs = _normalize_str_list(op.get("source_refs"))
             if raw_refs:
                 source_refs, canonical_refs, matched_events = _resolve_source_refs(

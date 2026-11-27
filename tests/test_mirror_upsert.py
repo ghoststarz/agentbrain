@@ -41,7 +41,8 @@ def test_mirror_write_upserts_in_place_instead_of_suffixing(isolated_env: AppCon
             "type": "fact",
             "tags": MIRROR_TAGS,
             "title": "记忆条目 A",
-            "upsert": True,
+            # 2026-11-27 口径：镜像默认只更新不新建，首次落库必须显式 upsert=False
+            "upsert": False,
         },
         identity=IDENT,
     )
@@ -88,7 +89,8 @@ def test_mirror_write_upserts_in_place_instead_of_suffixing(isolated_env: AppCon
 def test_mirror_write_matches_by_hash_even_without_previous_content(isolated_env: AppConfig) -> None:
     svc = BrokerService(isolated_env)
     first = svc.write_note(
-        {"content": "哈希命中探针正文。", "type": "fact", "tags": MIRROR_TAGS, "title": "哈希探针", "upsert": True},
+        # 2026-11-27 口径：镜像默认只更新不新建，首次落库必须显式 upsert=False
+        {"content": "哈希命中探针正文。", "type": "fact", "tags": MIRROR_TAGS, "title": "哈希探针", "upsert": False},
         identity=IDENT,
     )
     # 模拟「只有旧正文、标题完全不同」的第二轮：靠 mirror_hash 找回来

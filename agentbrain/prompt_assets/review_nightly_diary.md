@@ -2,7 +2,7 @@
 
 ## 本次是夜间复盘「日记」通道：只写 diary_append，禁止 no_change
 
-- 今天证据较长，夜间复盘拆成两路并行；本路**只输出 `diary_append`**，**不要**输出 `longterm_upsert` / `project_update` / `hot_update` / `handoff_upsert`（会被过滤）。
+- 今天证据较长，夜间复盘拆成两路并行；本路主要写 `diary_append`，顺带更新 `state` 的 `状态.现在` 与 `状态.这几天`，**不要**输出其他 `fact`/`decision`/`entity` 或 `project_update` / `hot_update` / `handoff_upsert`（会被过滤）。
 - `outcome` 必须是 `"operations"`，**必须**满足：
   - 若上下文里有 `<today_diary>`：**凡是那里已经写过的事，一律不要再叙述一遍**（换措辞也不行）。
   - 公账只写**今天还没被覆盖的事**，**0–2 条**（每条 60–220 字）；若当天公账已经覆盖了全天，**可以不写公账**，改为写 1 条 ≤80 字的收束句，或者干脆不写（当天公账尚无条目时至少写 1 条）：

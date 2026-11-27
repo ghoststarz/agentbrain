@@ -1,4 +1,9 @@
-"""Targeted regression tests for Stage 2 independent-review fixes (Items 1-7)."""
+"""Targeted regression tests for Stage 2 independent-review fixes (Items 1-7).
+
+预算常量说明：`model_max_context_chars` 由 3600 上调到 4200。review_system.md 扩容后
+（含四类 note_type 判据与样例，约 3.0k 字）系统段不再给窄预算留出足够 event_budget，
+3600 会直接抛 ContextBudgetExceeded，改的是预算假设而不是断言。
+"""
 
 from __future__ import annotations
 
@@ -528,7 +533,7 @@ def test_immutable_segmentation_accumulates_applied_and_dry_run_and_stop_alive(t
                 enabled=True,
                 model_endpoint=srv.endpoint,
                 model_name="fake",
-                model_max_context_chars=3600,
+                model_max_context_chars=4200,
             ),
         )
         store = ProactiveStore.from_app_config(cfg, clock=clock)
@@ -558,7 +563,7 @@ def test_immutable_segmentation_accumulates_applied_and_dry_run_and_stop_alive(t
                 enabled=True,
                 model_endpoint=srv2.endpoint,
                 model_name="fake",
-                model_max_context_chars=3600,
+                model_max_context_chars=4200,
             ),
         )
         store2 = ProactiveStore.from_app_config(cfg2, clock=clock)
@@ -829,7 +834,7 @@ def test_two_segment_same_project_uses_trusted_post_write_hashes_and_rejects_ext
             enabled=True,
             model_endpoint="http://127.0.0.1:9999/v1",
             model_name="fake",
-            model_max_context_chars=3600,
+            model_max_context_chars=4200,
         ),
     )
     alpha_path = cfg.profile_dir / "20_LongTerm" / "Projects" / "Alpha.md"
@@ -904,7 +909,7 @@ def test_two_segment_same_project_uses_trusted_post_write_hashes_and_rejects_ext
             enabled=True,
             model_endpoint="http://127.0.0.1:9999/v1",
             model_name="fake",
-            model_max_context_chars=3600,
+            model_max_context_chars=4200,
         ),
     )
     alpha2 = cfg2.profile_dir / "20_LongTerm" / "Projects" / "Alpha.md"

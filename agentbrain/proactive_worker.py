@@ -550,6 +550,22 @@ def estimate_nightly_context_chars(
     )
 
 
+def _shift_cut_out_of_token(block: str, start: int, end: int) -> int:
+    """切点落在 `[xxx]` 这种方括号 token 中间时，挪到 token 结束之后。
+
+    实测标记被劈成两半时模型只看到半截 id，溯源就断了；这里只做小挪动（≤64 字）。
+    """
+    if end >= len(block) or end <= start:
+        return end
+    open_idx = block.rfind("[", start, end)
+    close_idx = block.rfind("]", start, end)
+    if open_idx > close_idx:  # 切点之前有一段没闭合的 [
+        close_after = block.find("]", end)
+        if 0 <= close_after - end < 64:
+            return close_after + 1
+    return end
+
+
 def _split_oversized_block(event_id: str, block: str, event_budget: int) -> list[str]:
     """当单条事件 block 超出 event_budget 时，确定性按字符切为 N 段，不丢内容、不重复、顺序不变。"""
     if len(block) <= event_budget:
@@ -570,7 +586,12 @@ def _split_oversized_block(event_id: str, block: str, event_budget: int) -> list
 
     max_prefix = f"[part {total_parts}/{total_parts} of event_id={event_id}]\n"
     body_budget = event_budget - len(max_prefix)
-    chunks = [block[i : i + body_budget] for i in range(0, len(block), body_budget)]
+    chunks: list[str] = []
+    pos = 0
+    while pos < len(block):
+        end = _shift_cut_out_of_token(block, pos, pos + body_budget)
+        chunks.append(block[pos:end])
+        pos = end
     actual_n = len(chunks)
     return [
         f"[part {idx}/{actual_n} of event_id={event_id}]\n{chunk}"
